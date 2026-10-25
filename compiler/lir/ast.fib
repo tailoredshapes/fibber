@@ -238,6 +238,9 @@
 ;; `(target (cpu "..") (features ".."))` (spec/lir.md 4.5).
 (defstruct LTarget (cpu: str features: str pos: i64))
 
+;; `(dependent-library "NAME")` (spec/lir.md 4.9): LLVM's `!llvm.dependent-libraries`, a native library the module's code needs linked.
+(defstruct LDependentLibrary (name: str pos: i64))
+
 ;; ast.rs `Item`.
 (defenum LItem
   (ItStruct def: LStructDef)
@@ -246,10 +249,19 @@
   (ItDeclare decl: LDeclare)
   (ItDefine func: LFunction)
   (ItTarget decl: LTarget)
-  (ItOwnership decl: LOwnership))
+  (ItOwnership decl: LOwnership)
+  (ItDependentLibrary decl: LDependentLibrary))
 
 ;; A whole module, items in source order (ast.rs `Module`).
 (defstruct LModule (items: (Vec LItem)))
+
+;; The names of the module's `dependent-library` forms, each once, in the order first written (spec/lir.md 4.9).
+(defun module-dependent-libraries (m: LModule) -> (Vec str)
+  (reduce (fn (out: (Vec str) it: LItem)
+            (match it
+              ((ItDependentLibrary d) (if (includes? (. d name) out) out (conj out (. d name))))
+              (_ out)))
+          [] (. m items)))
 
 ;; The module's `ownership` form, nil when it has none (the checker allows one).
 (defun module-ownership (m: LModule) -> (Option LOwnership)

@@ -6,7 +6,7 @@
 ;; LD_LIBRARY_PATH.
 ;; `run` calls `main` on the stack of the driver's thread through `call-i64`, as the Rust calls it on its own.
 (ns driver.native
-  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [fib.os.native :as os] [lir.ast :as la] [native.libraries :as libraries]))
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [fib.os.native :as os] [lir.ast :as la]))
 
 (extern getenv :private (ptr) -> ptr)
 (extern setenv :private (ptr ptr i32) -> i32)
@@ -132,20 +132,17 @@
 (defun emit-lir (lir: str out: str opt: i64 kind: str) -> (Result unit str)
   (jit/emit-file lir out opt kind))
 
-;; The native libraries the program declares (`links`, emit.compile `Emitted`: `:lib "NAME"` on an extern it reaches) loaded into this process, so that the
-;; JIT finds their functions as an executable's loader would (native.libraries `load-for-jit`); the module that needs one that cannot be loaded, otherwise.
-(defun load-libs (links: (Vec (Pair str str))) -> (Result unit str)
-  (libraries/load-for-jit (libraries/from-notes links)))
-
-(defun run-module (file: str ast: la/LModule links: (Vec (Pair str str)) opt: i64 args: (Vec str)) -> (Result i64 str)
-  (try-let ((_ (load-libs links))
-            (j (if (= opt 0) (jit/jit-new-fast-codegen opt) (jit/jit-new opt)))
+;; The module run by the JIT: lair loads the native libraries its `dependent-library` forms name (`:lib "NAME"` on an extern the program reaches) into
+;; this process as it adds the module, so that the JIT finds their functions as an executable's loader would (native.libraries `load-for-jit`).
+(defun run-module (file: str ast: la/LModule opt: i64 args: (Vec str)) -> (Result i64 str)
+  (try-let ((j (if (= opt 0) (jit/jit-new-fast-codegen opt) (jit/jit-new opt)))
             (_ (jit/jit-add-module j file ast)) (addr (jit/jit-c-entry j "main"))
             (r (call-main addr (into [file] args))))
     (Ok (bit-and r 255))))
 
+;; The executable `out` of the module: linked with the command line's `libs` and the libraries the module's own forms name (native.api).
 (defun build-module (ast: la/LModule out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
   (jit/build-executable-module ast out opt libs dirs))
 
-(defun emit-module (ast: la/LModule out: str opt: i64 kind: str libs: (Vec str)) -> (Result unit str)
-  (jit/emit-module ast out opt kind libs))
+(defun emit-module (ast: la/LModule out: str opt: i64 kind: str) -> (Result unit str)
+  (jit/emit-module ast out opt kind))

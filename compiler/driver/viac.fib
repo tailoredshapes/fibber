@@ -11,9 +11,9 @@
 ;; and whether between functions of different prototypes (c.policy); the answer is cached in $TMPDIR by the compiler's name.
 (ns driver.viac
   (:use lir.diag expand.roots)
-  (:require [lir :as front] [lir.check :as check] [c.module :as cm] [c.cx :as cx] [c.policy :as policy] [native.link :as link]
+  (:require [lir :as front] [lir.ast :as la] [lir.check :as check] [c.module :as cm] [c.cx :as cx] [c.policy :as policy] [native.link :as link]
             [native.linkstatic :as ls] [native.target :as target] [native.error :as ne] [types.targets :as tt] [llvm.target :as lt] [driver.native :as native] [driver.proc :as p]
-            [driver.front :as dfront] [driver.linkdecl :as ld] [expand.maker :as mk]))
+            [driver.front :as dfront] [native.libraries :as ld] [expand.maker :as mk]))
 
 (extern getpid :private () -> i32)
 
@@ -53,13 +53,18 @@
 
 ;; ---------------------------------------------------------------- the C
 
-;; The C of the lIR module `lir` (named `file` in diagnostics); the warnings are printed, an error is the result.
-(defun c-text (lir: str file: str opts: cx/COpts) -> (Result str str)
+;; The lIR module of the text `lir` (named `file` in diagnostics), parsed and checked.
+(defun checked (lir: str file: str) -> (Result la/LModule str)
   (match (front/parse-and-check lir)
     ((Err ds) (Err (str-join-with "\n" (vec (map (fn (d: Diagnostic) (diag-in-file d file)) ds)))))
-    ((Ok m) (let ((c (cm/cx-new m file opts)) (text (cm/module-c c m)))
-              (do (doseq [l (cm/diag-lines c)] (eprintln l))
-                  (if (cx/has-errors? c) (Err "the C printer reported errors (above): nothing was written") (Ok text)))))))
+    ((Ok m) (Ok m))))
+
+;; The C of the checked module `m` (named `file` in diagnostics); the warnings are printed, an error is the result. The module's
+;; `dependent-library` forms print nothing: the C route links from them (`build-via-c`).
+(defun c-text (m: la/LModule file: str opts: cx/COpts) -> (Result str str)
+  (let ((c (cm/cx-new m file opts)) (text (cm/module-c c m)))
+    (do (doseq [l (cm/diag-lines c)] (eprintln l))
+        (if (cx/has-errors? c) (Err "the C printer reported errors (above): nothing was written") (Ok text)))))
 
 (defun str-join-with :private (sep: str items: (Vec str)) -> str
   (loop ((i 0) (acc ""))
@@ -67,7 +72,7 @@
 
 ;; `fibc build --emit c`: the C written to `out`.
 (defun emit-c (lir: str file: str out: str) -> (Result unit str)
-  (try-let [text (c-text lir file (probe (cc-name)))]
+  (try-let [m (checked lir file) text (c-text m file (probe (cc-name)))]
     (if (write-file out text) (Ok ()) (Err (str "cannot write " out)))))
 
 ;; ---------------------------------------------------------------- the compiler
@@ -114,12 +119,15 @@
 
 (defun native-error :private (e: ne/LairError) -> str (ne/lair-error-str e))
 
-;; `fibc build --via c`: the C of `lir` compiled by the C compiler into `out`.
+;; `fibc build --via c`: the C of `lir` compiled by the C compiler into `out`, linked with `libs` and the module's own `dependent-library` forms
+;; (native.libraries); a link that fails for one of them says what needs it.
 (defun build-via-c (lir: str file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
   (let ((src (str out ".c")))
-    (try-let ((text (c-text lir file (probe (cc-name))))
+    (try-let ((m (checked lir file))
+              (words (ld/link-words m libs dirs))
+              (text (c-text m file (probe (cc-name))))
               (_ (if (write-file src text) (Ok ()) (Err (str "cannot write " src))))
-              (_ (compile-c src out opt dirs libs)))
+              (_ (match (compile-c src out opt dirs words) ((Err e) (Err (ld/explain-failure e (ld/module-libs m)))) ((Ok _) (Ok ())))))
       (do (when (not (= (env "FIB_CC_KEEP") "1")) (p/remove-file src)) (Ok ())))))
 
 ;; ---------------------------------------------------------------- run
@@ -136,15 +144,12 @@
 ;; Builds `lir` through C into `dir` and runs it, with FIB_TRACE=1 only for `run --trace` (what the case harness passes: the audit it reads is the executable's own, as driver.staticrun's);
 ;; without it the trace lines (`A 1 o`, `F 2`) were printed on the standard error of every `FIB_VIA=c fibc run` (DARWIN-3).
 (defun build-and-run :private (lir: str file: str dir: str opt: i64 args: (Vec str) trace: bool) -> i64
-  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/declared-libs lir)))
-    (match (ld/lib-words declared)
-      ((Err m) (do (eprintln m) 2))
-      ((Ok words)
-       (match (build-via-c lir file exe opt [] words)
-         ((Err m) (do (eprintln (str "compile failed: " m)) 5))
-         ((Ok _) (do (when trace (native/setenv-set "FIB_TRACE" "1"))
-                     (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
-                       (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
+  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")))
+    (match (build-via-c lir file exe opt [] [])
+      ((Err m) (do (eprintln (str "compile failed: " m)) 5))
+      ((Ok _) (do (when trace (native/setenv-set "FIB_TRACE" "1"))
+                  (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
+                    (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))
 
 ;; `FIB_VIA=c fibc run FILE`. The C is compiled at -O1 at least: at -O0 gcc keeps every C local in its own stack slot (the printer makes one per
 ;; instruction), so a frame is several times LLVM's and a program that recurses two million frames deep (case 8353) overflows its stack.

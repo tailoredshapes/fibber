@@ -33,8 +33,19 @@
              (= head "define") (define rest pos)
              (= head "target") (target-form rest pos)
              (= head "ownership") (ownership-form rest pos)
+             (= head "dependent-library") (dependent-library-form rest pos)
              :else (err pos (str top-text ", found " (sexp-describe form))))))
     (_ (err (sexp-pos form) (str top-text ", found " (sexp-describe form))))))
+
+;; `(dependent-library "NAME")` (spec/lir.md 4.9): one non-empty string, the library's name as the linker's `-l` takes it.
+(defun dependent-library-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (if (not (= (count rest) 1))
+      (err pos "dependent-library expects one string")
+      (match (nth rest 0)
+        ((SxStr bs _) (if (= (array-len bs) 0)
+                          (err (sexp-pos (nth rest 0)) "dependent-library: the name must not be empty")
+                          (Ok (ItDependentLibrary (LDependentLibrary (str-from-bytes bs) pos)))))
+        (other (err (sexp-pos other) (str "dependent-library expects one string, found " (sexp-describe other)))))))
 
 ;; `(ownership (retain @f) .. (header %struct.NAME))` (spec/lir.md 6.14.6): every field once, each a list of the field's word and one atom;
 ;; the names are kept without their `@` and `%struct.`.

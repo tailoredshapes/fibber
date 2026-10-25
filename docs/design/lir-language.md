@@ -102,7 +102,7 @@ The sizes are estimates from reading the code, not measurements. An agent-week i
 2. `-slow` names mean `noinline` (`compiler/native/lower.fib:192-197`). This becomes LLVM's `noinline`/`cold` attributes in
    lIR, with `:noinline`/`:cold` on fibber's `defun`; *in progress on a branch*.
 3. `;; link-lib:` comments (emit/assemble.fib:31, native/libraries.fib:12-25) and the separate `links` argument become LLVM's
-   `!llvm.dependent-libraries`, as `(dependent-library "curl")`.
+   `!llvm.dependent-libraries`, as `(dependent-library "curl")`; *landed 2026-10-25* (spec/lir.md 4.9, cases/lir/link).
 4. `FIB_EXPORTS` and the `exports` argument (native/target.fib:63-65, linkwasm.fib:68-92, driver/shared.fib:81):
    - exports are already `external` and not `hidden` in the text;
    - wasm gets LLVM's `"wasm-export-name"` as `(export-name "x")`;

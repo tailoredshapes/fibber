@@ -1185,7 +1185,7 @@ parameter the calls pass, and the lIR `declare` has the first N then `...`, so t
 Apple arm64, which passes variadic arguments on the stack but fixed ones in registers: `fcntl(fd, F_SETFL, flags)` declared with all three fixed
 read a garbage third argument there (docs/design/aarch64.md 7). Without `:fixed` every declared parameter is fixed, as before. x86-64 is the same either way.
 `:lib "NAME"` (stage 2) says which native library the C function lives in. It changes nothing about the call. When the program reaches the extern (a call that
-survives to the emitted code), the emitter notes the library and the module that declared it in the lIR (`;; link-lib: NAME MODULE`) and `fibc build` links it:
+survives to the emitted code), the emitter writes `(dependent-library "NAME")` in the lIR module (spec/lir.md 4.9, LLVM's `!llvm.dependent-libraries`) and lair links it from that form:
 dynamically (`-lNAME`) or bundled (the archive `libNAME.a`) by the mode of the build (`--link NAME=static|dynamic`, `--link-mode`, `--static`:
 docs/design/static-linking.md 3). `fibc run` (the JIT, also `run --live` and `repl`) loads the library into its process before the program's code, as an
 executable's loader would. Dynamically, the development link `libNAME.so` is taken first; where only the versioned file is installed (`libNAME.so.7`), the

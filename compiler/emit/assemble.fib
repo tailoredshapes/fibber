@@ -23,23 +23,29 @@
 (defun parts-pending () -> Parts
   (Parts (data/read-runtime (runtime-text)) [] [] [] [] [] [] [] []))
 
-;; The pieces one after the other. Rust: compile.rs:226 Parts::text
+;; The pieces one after the other, the `dependent-library` forms first. Rust: compile.rs:226 Parts::text
 (defun parts-items (parts: Parts) -> (Vec la/LItem)
-  (into (into (into (into (into (into (into (. parts runtime) (. parts externs)) (. parts types)) (. parts statics))
+  (into (into (into (into (into (into (into (into (link-items (. parts links)) (. parts runtime)) (. parts externs)) (. parts types)) (. parts statics))
                                 (. parts keywords)) (. parts defs)) (. parts quotes)) (. parts fns)))
 
-(defun link-text (links: (Vec (Pair str str))) -> str
-  (str-join (mapv (fn (l: (Pair str str)) (str ";; link-lib: " (. l fst) " " (. l snd) "\n")) links)))
+;; The native libraries the program reaches (`:lib "NAME"` on an extern, noted with the module that wrote it) as lIR's `(dependent-library "NAME")`
+;; (spec/lir.md 4.9), each once: lair links them and the JIT loads them from the form, and reads nothing beside the module.
+(defun link-items (links: (Vec (Pair str str))) -> (Vec la/LItem)
+  (reduce (fn (out: (Vec la/LItem) l: (Pair str str))
+            (if (some? (first (filter (fn (it: la/LItem) (match it ((la/ItDependentLibrary d) (= (. d name) (. l fst))) (_ false))) out)))
+                out
+                (conj out (la/ItDependentLibrary (la/LDependentLibrary (. l fst) 0)))))
+          [] links))
 
 (defun parts-text (parts: Parts) -> str
-  (str (link-text (. parts links)) (print/print-module (la/LModule (parts-items parts)))))
+  (print/print-module (la/LModule (parts-items parts))))
 
 ;; The text `fibc emit` prints. Rust: compile.rs:253 Module::text
 (defun module-ast (m: Module) -> la/LModule
   (la/LModule (into (parts-items (. m parts)) (. m main))))
 
 (defun module-text (m: Module) -> str
-  (str (link-text (. (. m parts) links)) (print/print-module (module-ast m))))
+  (print/print-module (module-ast m)))
 
 ;; The runtime, the tables, the static data and every function: what a program and a macro module share, and what `emit_defs`
 ;; assembles again for every `def` it runs, so the program's functions and quoted constants are copied and left in place.

@@ -40,8 +40,8 @@ Licence: MIT, kept as `MUSL-LICENSE` beside the pieces.
 ## 3. Native libraries: link declarations and modes
 
 An `extern` may name the native library it lives in: `(extern curl_easy_init :private () -> i64 :lib "curl")` (spec/syntax.md 3.15). Under ADR 0011 only a platform module or a driver writes it.
-- **Per module, per reachable extern.** The emitter notes `;; link-lib: curl fib.http.client.ffi` in the lIR when an extern with `:lib` is *reached* (the emitter already declares an extern only where it is called), and `fibc build`
-  links the libraries it finds. A program that requires `fib.http.client` and never calls it links with no libcurl present; one that calls it gets `-lcurl` with no flag from the user: the break
+- **Per module, per reachable extern.** The emitter writes `(dependent-library "curl")` in the lIR module (spec/lir.md 4.9: LLVM's `!llvm.dependent-libraries`) when an extern with `:lib` is *reached* (the emitter already declares an extern only where it is called), and lair
+  links the libraries the module names (until 2026-10-25 the note was a comment `;; link-lib: curl fib.http.client.ffi` that lair scanned the text for). A program that requires `fib.http.client` and never calls it links with no libcurl present; one that calls it gets `-lcurl` with no flag from the user: the break
   that a program using `fib.http.client` needed `-l curl` is fixed. (An unused module never forced a link: the emitter drops unreachable definitions, so `--gc-sections` is not needed; the static link passes it anyway.)
 - **The mode of the build decides.** `dynamic` links `-lNAME` (resolved when the program starts: with `cc`, an rpath for each `-L`); `static` bundles the archive `libNAME.a` (`-l:libNAME.a`: the "uberjar" option).
   `fibc build --link curl=static|dynamic` sets one library; `--link-mode static|dynamic` all; the default is dynamic, and static under `--static` (a static executable has nothing to resolve a dynamic library with:

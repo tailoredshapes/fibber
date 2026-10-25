@@ -70,18 +70,11 @@
        ((Err m) (do (eprintln (str "fibc: " m)) front/exit-usage))
        ((Ok _) (link-library lir file out dirs libs opt))))))
 
+;; The library linked by lair from the module (native.api `build-shared-module`: the object, the exports, the `-l` of the command line and the
+;; module's own `dependent-library` forms), then the header.
 (defun link-library :private (lir: ec/Emitted file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64) -> i64
-  (let ((obj (link/object-path out)))
-    (match (ld/lib-words-in (ld/from-notes (. lir links)) dirs)
-      ((Err m) (do (eprintln m) front/exit-usage))
-      ((Ok words)
-       (match (native/emit-module (. lir ast) obj opt "obj" words)
-         ((Err m) (failed m))
-         ((Ok _)
-          (let ((r (api/link-shared [obj] out (mapv (fn (s: ex/ExSig) (. s symbol)) (. lir exports)) (mac?) (into libs words) dirs)))
-            (do (link/remove-path obj)
-                (match r
-                  ((Err m) (failed (ld/explain-failure m (ld/from-notes (. lir links)))))
-                  ((Ok _) (match (write-header lir file)
-                            ((Err m) (do (eprintln (str "fibc: " m)) front/exit-usage))
-                            ((Ok _) 0))))))))))))
+  (match (api/build-shared-module (. lir ast) out opt (mapv (fn (s: ex/ExSig) (. s symbol)) (. lir exports)) (mac?) libs dirs)
+    ((Err m) (failed (ld/name-modules m (. lir declared))))
+    ((Ok _) (match (write-header lir file)
+              ((Err m) (do (eprintln (str "fibc: " m)) front/exit-usage))
+              ((Ok _) 0)))))

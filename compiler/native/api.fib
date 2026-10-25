@@ -136,15 +136,21 @@
         (= kind "liro") (try-let [_ (level-check opt)
                                    _ (if (target/cross-target?) (Err "--emit liro initially supports the native host") (Ok ()))
                                    m (match (pipe/check-source src) ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e))))
-                                   libs (libraries/lib-words (libraries/declared-libs src))]
+                                   libs (libraries/lib-words (libraries/module-libs m))]
                          (unit-result (liro-file/export-file m path opt libs)))
         :else (emit-llvm-file src path opt kind)))
 
-;; The shared library `out` from the object files `objects`, exporting `symbols` only (native.link `link-shared`).
-(defun link-shared (objects: (Vec str) out: str symbols: (Vec str) mac: bool libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
-  (try-let [_ (if (target/cross-target?) (Err "a shared library is linked for the host only; use --emit obj and link where the target runs") (Ok ()))
-            ds (match (library-dirs dirs) ((Err e) (Err (lair-error-str e))) ((Ok d) (Ok d)))]
-    (unit-result (link/link-shared objects out symbols mac ds libs))))
+;; The shared library `out` of the module `ast` (lIR trees), exporting `symbols` only (native.link `link-shared`): its object is written beside `out`
+;; and removed; the link adds the module's `dependent-library` forms after `libs`.
+(defun build-shared-module (ast: LModule out: str opt: i64 symbols: (Vec str) mac: bool libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+  (let ((obj (link/object-path out)))
+    (try-let [_ (if (target/cross-target?) (Err "a shared library is linked for the host only; use --emit obj and link where the target runs") (Ok ()))
+              ds (match (library-dirs dirs) ((Err e) (Err (lair-error-str e))) ((Ok d) (Ok d)))
+              words (libraries/link-words ast libs dirs)
+              _ (emit-llvm-module ast obj opt "obj")]
+      (let ((r (link/link-shared [obj] out symbols mac ds words)))
+        (do (link/remove-path obj)
+            (match r ((Err e) (Err (libraries/explain-failure (lair-error-str e) (libraries/module-libs ast)))) ((Ok _) (Ok ()))))))))
 
 (defun link-objects (objects: (Vec str) out: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
   (try-let [_ (level-check opt)
@@ -169,18 +175,23 @@
   (let ((t (timing/started)) (r (pipe/for-executable-module ast)))
     (do (timing/report "lir.check" t) r)))
 
+;; The executable `path` of the module `ast`: linked with `libs` (the command line's `-l`) and the module's own `dependent-library` forms; a link that
+;; fails for one of those says what needs it (native.libraries `explain-failure`).
 (defun build-executable-module (ast: LModule path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
   (try-let ((l (level-check opt))
             (_ (if (= path "") (Err "path is empty") (Ok ())))
             (m (match (checked-executable-module ast) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))))
-    (unit-result (liro/build-executable m path path (AotOptions l libs dirs)))))
+    (match (liro/build-executable m path path (AotOptions l libs dirs))
+      ((Err e) (Err (libraries/explain-failure (lair-error-str e) (libraries/module-libs m))))
+      ((Ok _) (Ok ())))))
 
-(defun emit-module (ast: LModule path: str opt: i64 kind: str libs: (Vec str)) -> (Result unit str)
+(defun emit-module (ast: LModule path: str opt: i64 kind: str) -> (Result unit str)
   (try-let ((_ (level-check opt)))
     (cond (= kind "wgsl") (emit-wgsl-module ast path)
           (= kind "liro")
           (try-let ((_ (if (target/cross-target?) (Err "--emit liro initially supports the native host") (Ok ())))
-                    (m (match (pipe/check-module ast) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))))
+                    (m (match (pipe/check-module ast) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m))))
+                    (libs (libraries/lib-words (libraries/module-libs m))))
             (unit-result (liro-file/export-file m path opt libs)))
           :else (emit-llvm-module ast path opt kind))))
 

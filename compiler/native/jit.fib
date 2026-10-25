@@ -8,7 +8,7 @@
 (ns native.jit
   (:use lir.diag lir.types lir.lit lir.ast native.error native.jit.names native.jit.prune native.jit.trampoline)
   (:require [lir.check :as check] [lir :as front] [native.lower :as nl] [native.owned :as owned] [native.passes :as passes]
-            [native.target :as target] [llvm.orc :as orc] [llvm.support :as support]))
+            [native.target :as target] [llvm.orc :as orc] [llvm.support :as support] [native.libraries :as libraries]))
 
 
 (defstruct JitSession
@@ -72,9 +72,16 @@
 (defun session-add-module-live (s: JitSession name: str m: LModule) -> (Result unit LairError)
   (session-add-module s name (dead-internals m)))
 
-;; The names rules, prune, lower, optimise and hand-over of a module the checker accepted.
+;; The module's `dependent-library` forms (spec/lir.md 4.9) loaded into the process, as a link would add them (native.libraries `load-for-jit`),
+;; before the names rules look for their symbols.
+(defun load-libraries (m: LModule) -> (Result unit LairError)
+  (match (libraries/load-for-jit (libraries/module-libs m))
+    ((Err msg) (Err (ErrBackend msg)))
+    ((Ok _) (Ok ()))))
+
+;; The libraries, the names rules, prune, lower, optimise and hand-over of a module the checker accepted.
 (defun add-checked :private (s: JitSession name: str m: LModule) -> (Result unit LairError)
-  (match (names-check @(. s names) m support/process-defines?)
+  (match (try-let ((_ (load-libraries m))) (names-check @(. s names) m support/process-defines?))
     ((Err e) (Err e))
     ((Ok _) (match (target/target-runnable m)
      ((Err e) (Err e))

@@ -156,6 +156,7 @@ item   ::= (defstruct mutable? NAME (type*))       ; mutable: its fields may be 
          | (declare hidden? cc? NAME rtype (ptype* ...?))  ; a function defined elsewhere
          | (define mod* cc? (NAME rtype) (param*) block+)
          | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
+         | (dependent-library STRING)                      ; a native library the code needs linked: LLVM's !llvm.dependent-libraries (§4.9)
          | (ownership (retain @f) (release @f) (unique @f) (alloc @f) (stack-init @f) (stack-end @f) (header %struct.NAME))
                                                    ; what the ownership forms lower to (§6.14.6)
          | (define-macro NAME (PNAME* ...?) block+)        ; a compile-time macro (§4.6)
@@ -587,6 +588,32 @@ stream; what `quote` and `vector` mean is then the module's, by `define-macro`. 
 functions are an lIR module of lair's (`compiler/native/macros/readlib.fib`) compiled into the macro session beside the form library;
 the reader (`compiler/lir/sexp.fib`) consults the table per form and hands a bound character to the runner
 (`compiler/native/macros/readers.fib`).
+
+### 4.9 Dependent libraries
+
+**Decided** (owner, 2026-10-25: the text is the contract; nothing lair does follows from a comment, a name convention, an environment
+variable or an argument beside the module; §14 item 19). A module names a native library its code needs linked:
+
+```
+(dependent-library "z")
+```
+
+It is LLVM's named metadata `!llvm.dependent-libraries = !{!{!"z"}}`, what clang's `#pragma comment(lib, "z")` makes and what an ELF
+`.deplibs` section carries, written as an s-expression. `STRING` is the name as the linker's `-l` takes it (`z` for `libz`; `:FILE`
+names a file, as `-l:FILE` does). Any number of forms, anywhere among the items; a name written twice is one library. Semantics: the
+library's symbols satisfy the module's `declare`s, so lair lowers the form to that metadata on every path and links from it:
+`lair build` adds `-lNAME` after the `-l` of its command line (static or dynamic by the build's options, `FIB_LINK`, `FIB_LINK_MODE`,
+`FIB_STATIC`, docs/design/static-linking.md 3; `c m pthread dl rt util` are the C library's own and never a link word), `lair run`,
+the JIT and a live session load the library into the process before the names rules look for its symbols (§11), a liro object records it
+for `lair link`, and `(import "FILE")` (§4.7) keeps the imported module's forms in the union, as `llvm-link` concatenates the metadata.
+A library that cannot be found or loaded is an error naming it, on the path that needed it. A `declare` the library would satisfy but
+no form names is as before: undefined at link, or found in the process by the JIT.
+
+Rules, checked by the parser: `dependent-library expects one string` (none, two, or a form that is not a string, `found X`);
+`dependent-library: the name must not be empty`. The C backend prints nothing for the form (the C route of `fibc` links from it); the JS
+and WGSL backends have no linker and ignore it; the printer writes it back as read, and `dump-ast` shows it as `dependent-library`.
+Until 2026-10-25 lair read the library list out of comments `;; link-lib: NAME MODULE` before the module, and from an argument beside
+the tree on the in-memory path; a comment is lexically nothing (§1) and now carries nothing. Cases: `cases/lir/link`.
 
 ## 5. Functions, blocks and names
 
@@ -1799,3 +1826,4 @@ one the passes used.
 | 16 | `(import "FILE")`: a program is the union of its modules as `llvm-link` joins LLVM modules; the importer sees the imported module's exported functions as `declare`s, its exported globals as `declare-global`s, its structs, and the macros of its own file; loaded once per program in dependency order, cycles refused, errors at the import with the module's file and position; exported names defined once, declarations agree in type, internal names renamed `NAME.N` on collision; no transitive export, no search root (a path, as `require-macros`); fibber's numbered ids (ADR 0024) are met by the duplicate rule (an emitted program is imported by nothing) | **Accepted by default** (gloss item 3, 2026-10-25; the owner may override) | §4, §4.7, cases/lir/imports |
 | 17 | reader macros: a per-module readtable in Lisp's shape (`define-reader-macro` on a character, `define-dispatch-macro` on the character after `#`, `define-token-reader` after every atom), each an lIR function of the stream (`lir.read.*`) returning a form or no form, run at read time through the macro session; `(`, `)`, `;` and whitespace cannot be bound, everything else can and the module then reads under its table; a required library's bindings are the requiring module's, an import's are not (each module of a program reads under its own table); lIR's own syntax unchanged and a module with no bindings reads as before; `lib/lir/readers.lir` (`'x`, `[a b]`) the first library. The owner's direction of 2026-10-25: lIR as thin as possible, a language brings its own syntax as reader macros | **Proposed** (the lead, 2026-10-25) | §4, §4.8, cases/lir/readers |
 | 18 | ownership in lIR: the managed type `(ptr 1)` (LLVM's `ptr addrspace(1)`), kinds on SSA values and parameters, SIL's forms `alloc-object alloc-stack dealloc-stack copy-value destroy-value is-unique`, `load copy|borrow|take`, `store init|assign|borrow`, `addrspacecast` inside `(define unsafe ..)`, the `ownership` form naming what the forms lower to (one per program, in the interface of the module that carries it), a verifier of ten rules inside `lir.check` on every path (`FIB_LIR_OWN`, `report` the default until the emitter emits the forms), erasure as the last pass before LLVM or a printer after an optimisation slot on the explicit forms; MIR's words weighed and recorded | **Decided** (owner, 2026-10-25: lIR is the language, lair the only compiler; docs/design/lir-language.md stage 2, D4 to D10 as recommended) | §2, §4, §4.7, §6.10, §6.14, §10, §12, §13, cases/lir/own |
+| 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
