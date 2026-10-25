@@ -3,15 +3,18 @@
 
 (ns native.pipeline
   (:use lir.diag lir.ast native.error native.owned native.target)
-  (:require [native.macros :as macros] [lir.check :as check] [native.lower :as nl]))
+  (:require [native.imports :as imports] [lir.check :as check] [native.lower :as nl]))
 
 
-;; Reads, expands, parses and checks the module `src`, the text of `file` ("" when it has none: `require-macros` is then relative to the
-;; working directory). (pipeline.rs `check_source`, with the expansion of spec/lir.md 4.6 between reading and parsing)
+;; Reads, expands, parses and checks the module `src`, the text of `file` ("" when it has none: `require-macros` and `import` are then
+;; relative to the working directory), with the modules it imports (spec/lir.md 4.7): the program. (pipeline.rs `check_source`, with the
+;; expansion of spec/lir.md 4.6 between reading and parsing)
 (defun check-file (src: str file: str) -> (Result LModule LairError)
-  (match (macros/parse-source src file)
+  (match (imports/load-program src file)
     ((Err d) (Err (ErrInvalid [d])))
-    ((Ok m) (check-module m))))
+    ((Ok p) (match (check/check (. p module))
+              ((Err ds) (Err (ErrInvalid (mapv (fn (d: Diagnostic) (imports/explain-hidden (. p hidden) d)) ds))))
+              ((Ok _) (Ok (. p module)))))))
 
 ;; `check-file` of a text with no file.
 (defun check-source (src: str) -> (Result LModule LairError)
