@@ -2,7 +2,13 @@
 
 (ns native.lower
   (:use lir.diag lir.types lir.lit lir.ast lir.facts native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
-  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [types.targets :as tt]))
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [types.targets :as tt]
+            [lir.own.opt :as opt] [lir.own.erase :as erase]))
+
+;; The ownership section (spec/lir.md 6.14) leaves the tree last, immediately before LLVM: the slot of lIR-to-lIR rewrites on the explicit
+;; forms (lir.own.opt), then erasure to the calls the module's `ownership` form names (lir.own.erase), for pointers of the target's width.
+(defun finish-ownership :private (m: LModule pointer-bits: i64) -> LModule
+  (erase/erase-module (opt/optimise-module m) (quot pointer-bits 8)))
 
 
 ;; Lowers a module `lir.check/check` accepted, for the given triple and data layout, and runs the LLVM verifier on the result (`Internal` if it rejects). Declares structs, then every function and global, then initialisers, then bodies. (mod.rs `lower`)
@@ -22,7 +28,8 @@
                   (. (tt/target-row-of-triple triple) arch) (facts-mode)))
           (r (if (< (. lx facts) 0)
                  (Err (ErrBackend (str "FIB_LIR_FACTS must be use, trap or ignore, found " (unwrap-or (sys-getenv "FIB_LIR_FACTS") ""))))
-                 (module-items lx (if (= (. lx facts) facts-ignore) (strip-module m) m)))))
+                 (let ((m1 (finish-ownership m (. (tt/target-row-of-triple triple) pointer-bits))))
+                   (module-items lx (if (= (. lx facts) facts-ignore) (strip-module m1) m1))))))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
             ((Err x) (do (owned-dispose owned) (Err x)))
@@ -56,7 +63,8 @@
             ((ItGlobal g) (if (. g shared) (add-shared-global lx (. g name) (. g ty)) (add-global lx (. g name) (. g ty) (. g mods))))
             ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
             ((ItStruct _) ())
-            ((ItTarget _) ())))
+            ((ItTarget _) ())
+            ((ItOwnership _) ())))
         (match (init-globals lx items)
           ((Err x) (Err x))
           ((Ok _) (lower-bodies lx items))))))
@@ -195,4 +203,4 @@
       (if (. mods hidden) (unsafe (core/LLVMSetVisibility v 1i32)) ())))
 
 (defun hidden-mods :private (hidden: bool) -> LModifiers
-  (LModifiers lk-external hidden false false false))
+  (LModifiers lk-external hidden false false false false))

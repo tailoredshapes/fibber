@@ -1,0 +1,50 @@
+;; compiler/lir/own/layout.fib: the size of a struct as LLVM lays it out for the target, for the erasure of `alloc-object` (spec/lir.md
+;; 6.14.7): each field at the natural alignment of its type, the whole rounded up to the largest alignment, pointers `pb` bytes wide. The
+;; same rules as emit.layout `size-align-pb` and `struct-size-of`, over lIR's own types (the emitter computes over fibber's), so that the
+;; literal the erasure writes is the literal the emitter writes today.
+
+(ns lir.own.layout
+  (:use lir.types))
+
+
+;; The size and alignment of `t`, in bytes, over the module's struct table.
+(defun size-align (structs: (Map str (Vec LType)) pb: i64 t: LType) -> (Pair i64 i64)
+  (match t
+    ((TInt n) (let ((b (max 1 (quot n 8)))) (Pair b b)))
+    ((TFloat) (Pair 4 4))
+    ((TDouble) (Pair 8 8))
+    ((TPtr) (Pair pb pb))
+    ((TManaged) (Pair pb pb))
+    ((TOwned) (Pair pb pb))
+    ((TVector n e) (let ((s (* n (. (size-align structs pb e) fst)))) (Pair s (pow2-above s))))
+    ((TArray n e) (let ((sa (size-align structs pb e))) (Pair (* n (. sa fst)) (. sa snd))))
+    ((TNamed s) (fields-layout structs pb (match (get structs s) ((some fs) fs) (nil (vec-empty)))))
+    ((TAnon fs) (fields-layout structs pb fs))))
+
+;; The size and alignment of a struct of these fields.
+(defun fields-layout (structs: (Map str (Vec LType)) pb: i64 fs: (Vec LType)) -> (Pair i64 i64)
+  (let ((sas (mapv (fn (f: LType) (size-align structs pb f)) fs))
+        (end (reduce (fn (off: i64 sa: (Pair i64 i64)) (+ (round-up off (. sa snd)) (. sa fst))) 0 sas))
+        (align (reduce (fn (m: i64 sa: (Pair i64 i64)) (max m (. sa snd))) 1 sas)))
+    (Pair (round-up end align) align)))
+
+;; The size of the struct `name`.
+(defun struct-size (structs: (Map str (Vec LType)) pb: i64 name: str) -> i64
+  (. (size-align structs pb (TNamed name)) fst))
+
+;; The size of the element of the struct's trailing `[0 x E]`, 0 when it has none.
+(defun trailing-elem-size (structs: (Map str (Vec LType)) pb: i64 name: str) -> i64
+  (match (get structs name)
+    ((some fs) (if (= (count fs) 0)
+                   0
+                   (match (nth fs (- (count fs) 1))
+                     ((TArray 0 e) (. (size-align structs pb e) fst))
+                     (_ 0))))
+    (nil 0)))
+
+(defun round-up (off: i64 a: i64) -> i64
+  (if (<= a 1) off (* (quot (+ off (- a 1)) a) a)))
+
+;; The smallest power of two that is at least `n` (LLVM's default alignment of a vector type), 1 for 0.
+(defun pow2-above (n: i64) -> i64
+  (loop ((p 1)) (if (>= p n) p (recur (* p 2)))))

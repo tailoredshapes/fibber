@@ -4,7 +4,7 @@
 ;; the globals, the functions, and the call of `main`.
 (ns js.module
   (:use lir.types lir.lit lir.ast js.jx js.ty js.mem js.expr js.func)
-  (:require [lir.facts :as facts]))
+  (:require [lir.facts :as facts] [lir.own.opt :as opt] [lir.own.erase :as erase]))
 
 ;; The runtime's files, in the order they are concatenated.
 (def runtime-files: (Vec str) ["core.js" "int.js" "float.js" "mem.js" "fmt.js" "libc.js" "stdio.js"])
@@ -52,7 +52,7 @@
 
 ;; A context for expressions outside any function (the initialisers).
 (defun init-fx :private (jx: Jx) -> Fx
-  (Fx jx (LFunction "" (LFnType cc-c nil [] false) [] [] (LModifiers lk-external false false false false) 0) {} {} (cell {}) false expr-js))
+  (Fx jx (LFunction "" (LFnType cc-c nil [] false) [] [] (LModifiers lk-external false false false false false) 0) {} {} (cell {}) false expr-js))
 
 (defun init-line :private (fx: Fx it: LItem) -> str
   (match it
@@ -63,9 +63,9 @@
   (reduce (fn (acc: i64 f: LFunction) (if (= (. f name) "main") (count (. f params)) acc)) 0 (defines m)))
 
 ;; The translated module after the runtime text `rt`.
-;; The facts of lIR (spec/lir.md 6.13) are dropped first: JS has no use for them.
+;; The ownership section (spec/lir.md 6.14) is erased first, last of lIR's passes, and the facts (6.13) dropped: JS has no use for them.
 (defun module-js (m0: LModule rt: str) -> str
-  (let ((m (facts/strip-module m0))
+  (let ((m (facts/strip-module (erase/erase-module (opt/optimise-module m0) 8)))
         (jx (jx-new m))
         (fns (str-join (vec (map (fn (f: LFunction) (function-js jx f)) (defines m)))))
         (fx (init-fx jx))
