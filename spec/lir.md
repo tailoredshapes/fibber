@@ -428,7 +428,17 @@ directions that bring a file: `require-macros` brings macros (and reader macros)
 the program and its interface to the importer; `macro-import` brings a module into the macro session only: it is neither linked into the
 program nor exported, and a library may hold it beside `define-macro`.
 
-
+**module-macro.** `(module-macro NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
+parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
+of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
+`define-macro` or `module-macro` written there is data the macro sees); at the end of the text `NAME` is applied to them as its `...`
+argument and its result is one top-level form, expanded as any is, a `begin` splice usually, whose spliced directions then take effect in
+order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that is no top-level form is the parser's error at the direction
+(`reject-module-result.lir`). A library may hold the direction, so a `require-macros` arms it and the text after is the macro's
+(`module-library.lir`); a library that arms one when one is armed already (a library required by the library that armed) is
+`module-macro: the module has a module macro already` at its direction (`reject-module-twice.lir`), and once one is armed a direction in the
+module's own text is data the macro sees. A `module-macro` the result splices arms again and takes the rest of the splice, applied in turn.
+Each module of a program (§4.7) has its own.
 
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a

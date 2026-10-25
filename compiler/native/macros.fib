@@ -37,23 +37,24 @@
 ;; and the same as a C string for the objects (null for none), the macros so far, the session, the libraries loaded (once each) and being
 ;; loaded (a cycle), the nanoseconds spent in macros, the reader macros (the readtable and its runner, spec/lir.md 4.8: a module's own, which
 ;; an import neither takes from nor gives to it) and the count of reader macros compiled (each is a function of its own name in the session).
+;; `hook`: the module macro `(module-macro NAME)` armed, with the direction's position; `collected`: the forms read since, for it.
 (defstruct Env (file: str cfile: ptr macros: (Cell (Map str Macro)) session: (Cell (Option Session)) loaded: (Cell (Set str)) loading: (Cell (Set str)) ns: (Cell i64)
-                readers: readers/Readers seq: (Cell i64)))
+                readers: readers/Readers seq: (Cell i64) hook: (Cell (Option (Pair Macro i64))) collected: (Cell (Vec Sexp))))
 
 (def max-params: i64 8)
 (def max-steps: i64 512)
 ;; The directions and forms a macro may not be named as: the one list of lIR's directions beside the parser's items (lir.parse.items `item`).
 (def form-names: (Set str) #{"define" "declare" "declare-global" "defstruct" "global" "constant" "target" "define-macro" "require-macros" "import" "begin" "block" "let"
-                             "define-reader-macro" "define-dispatch-macro" "define-token-reader" "macro-import"})
+                             "define-reader-macro" "define-dispatch-macro" "define-token-reader" "macro-import" "module-macro"})
 
 ;; The module's own file counts as being loaded: a library that requires it is a cycle.
 (defun env-new :private (file: str) -> Env
   (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{(canonical file)})) (cell 0)
-       (readers/readers-new) (cell 0)))
+       (readers/readers-new) (cell 0) (cell nil) (cell [])))
 
 ;; The environment of a file read for the module of `env` (a library): the file's own name, everything else the module's.
 (defun env-sub :private (env: Env path: str) -> Env
-  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq)))
+  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq) (. env hook) (. env collected)))
 
 ;; The file as the objects carry it: a C string that lives as long as they do, null for none.
 (defun file-cstr :private (file: str) -> ptr
@@ -64,7 +65,9 @@
 ;; its macros any more (native.imports, at the end of the program).
 (defun parse-module (src: str file: str importer: Importer) -> (Result Parsed Diagnostic)
   (let ((env (env-new file)) (items (cell (vec-empty))))
-    (match (readers/read-with (. env readers) src file (fn (form: Sexp) (top-form env items importer form)))
+    (match (match (readers/read-with (. env readers) src file (fn (form: Sexp) (top-form env items importer form)))
+             ((some d) (some d))
+             (nil (apply-hook env items importer)))
       ((some d) (do (env-close env) (Err d)))
       (nil (Ok (Parsed env (LModule @items)))))))
 
@@ -82,14 +85,22 @@
     ((SxList its _) (if (empty? its) "" (names/atom-or-empty (nth its 0))))
     (_ "")))
 
-;; One top-level form: a macro's definition, a library of them, an import, a macro-import, a splice, or a form expanded and parsed. A macro
-;; use is applied first (`top-result`, the children untouched), so that a result that is a splice is seen before anything in it is expanded.
+;; One top-level form: collected for the module macro once one is armed (spec/lir.md 4.6: read, not expanded, directions included); else a
+;; direction (a macro's definition, a library of them, an import, a macro-import, the module macro, an include), a splice, or a form expanded
+;; and parsed. A macro use is applied first (`top-result`, the children untouched), so that a result that is a splice is seen before
+;; anything in it is expanded.
 (defun top-form :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
+  (match @(. env hook)
+    ((some _) (do (set! (. env collected) (conj @(. env collected) form)) nil))
+    (nil (top-direction env items importer form))))
+
+(defun top-direction :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
   (let ((head (head-of form)))
     (cond (= head "define-macro") (define-macro env form)
           (= head "require-macros") (require-macros env form)
           (= head "import") (import-form env importer form)
           (= head "macro-import") (macro-import env form)
+          (= head "module-macro") (module-macro env form)
           (reader-form? head) (define-reader env head form)
           :else (match (top-result env form)
                   ((Err d) (some d))
@@ -520,6 +531,7 @@
     (cond (= head "define-macro") (define-macro env form)
           (= head "require-macros") (require-macros env form)
           (= head "macro-import") (macro-import env form)
+          (= head "module-macro") (module-macro env form)
           (reader-form? head) (define-reader env head form)
           :else (some (Diagnostic (sexp-pos form) (str "expected define-macro or require-macros, found " (sexp-describe form)))))))
 
@@ -587,3 +599,38 @@
                                    (conj out (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) (. (. g mods) hidden) (. g pos))))
                                    out))
                  (_ out))))))
+
+;; ---------------------------------------------------------------- module-macro (spec/lir.md 4.6)
+
+;; `(module-macro NAME)`: from here to the end of the text the forms are collected, read and not expanded; at the end NAME, a macro with a
+;; `...` parameter, is applied to them and its result is a top-level form.
+(defun module-macro :private (env: Env form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (cond (not (= (count its) 2)) (some (Diagnostic pos "module-macro expects one name, the macro"))
+           (some? @(. env hook)) (some (Diagnostic pos "module-macro: the module has a module macro already"))
+           :else (match (nth its 1)
+                   ((SxAtom n _) (match (get @(. env macros) n)
+                                   (nil (some (Diagnostic (sexp-pos (nth its 1)) (str "module-macro: " n " is not a macro"))))
+                                   ((some m) (if (. m rest)
+                                                 (do (set! (. env hook) (some (Pair m pos))) nil)
+                                                 (some (Diagnostic (sexp-pos (nth its 1)) (str "module-macro: " n " takes no ... parameter")))))))
+                   (other (some (Diagnostic (sexp-pos other) (str "module-macro expects a name, found " (sexp-describe other))))))))
+    (_ (some (Diagnostic (sexp-pos form) "module-macro expects one name, the macro")))))
+
+;; At the end of the text: the module macro applied to the forms collected, disarmed first; its result a top-level form (a splice, usually).
+;; A `module-macro` the result splices arms again and takes the rest of the splice: it is applied in turn, until none is armed.
+(defun apply-hook :private (env: Env items: (Cell (Vec LItem)) importer: Importer) -> (Option Diagnostic)
+  (loop ((steps 0))
+    (match @(. env hook)
+      (nil nil)
+      ((some h)
+       (let ((m (. h fst)) (pos (. h snd)) (forms @(. env collected)))
+         (do (set! (. env hook) nil)
+             (set! (. env collected) [])
+             (cond (>= steps max-steps) (some (Diagnostic pos (str "module-macro: " max-steps " module macros in a row")))
+                   :else (match (apply-macro env m (into [(SxAtom (. m name) pos)] forms) pos)
+                           ((Err d) (some d))
+                           ((Ok r) (match (top-form env items importer r)
+                                     ((some d) (some d))
+                                     (nil (recur (+ steps 1)))))))))))))
