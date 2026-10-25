@@ -58,9 +58,10 @@ more, a constant out-of-range vector index, a store to a `constant`).
   parentheses, braces, brackets, `"` or `;`. `@name` names a global or function,
   `%struct.name` a struct type; any other atom is a keyword, a number or
   a local name.
-- Nesting deeper than **512** lists is an error `nesting deeper than
-  512` (liar's parser overflowed its stack at a nesting of about 200000,
-  `lir-audit/deepadd.txt`).
+- Nesting deeper than **1024** forms is an error `nesting deeper than
+  1024` (liar's parser overflowed its stack at a nesting of about 200000,
+  `lir-audit/deepadd.txt`); a module's readtable may set the depth,
+  and its reader macros' runs count as levels (§4.8).
 
 Integer tokens are decimal, `0x` hex or `0b` binary, with an optional
 leading `-`. Float tokens are decimal with an optional fraction and
@@ -163,9 +164,9 @@ item   ::= (defstruct mutable? NAME (type*))       ; mutable: its fields may be 
          | (import STRING)                                 ; another module of the program (§4.7)
          | (define-reader-macro STRING (PNAME) block+)     ; a reader macro on a character (§4.8)
          | (define-dispatch-macro STRING (PNAME) block+)   ; a reader macro on the character after # (§4.8)
-         | (define-token-reader (PNAME PNAME) block+)      ; the module's token reader (§4.8)
          | (define-reader-class STRING CLASS)              ; a character's class: whitespace | constituent | terminating (§4.8)
          | (define-reader-depth N)                         ; the nesting the reader allows (§4.8)
+         | (define-token-reader (PNAME PNAME) block+)      ; the module's token reader (§4.8)
 param  ::= (type PNAME) | ((ptr 1) owned PNAME)    ; a parameter; `owned` is its ownership kind (§6.14.2)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
@@ -400,8 +401,8 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.tag s) : i64`, `(lir.sexp.line s) : i64`, `(lir.sexp.column s) : i64`, `(lir.sexp.file s) : ptr` | the tag and the position of any object |
 | `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(string "define")`), copied |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
-| `(lir.sexp.list bracket) : ptr` | an empty list with that bracket |
 | `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
+| `(lir.sexp.list bracket) : ptr` | an empty list with that bracket |
 | `(lir.sexp.push l x) : ptr` | `x` appended to the list `l`, which grows; `l` |
 | `(lir.sexp.count l) : i64`, `(lir.sexp.nth l i) : ptr`, `(lir.sexp.bracket l) : i64` | a list's count, its `i`th item (null out of range), its bracket |
 | `(lir.sexp.text s) : ptr`, `(lir.sexp.len s) : i64` | a symbol's or a string's bytes (NUL-terminated) and count |
@@ -524,8 +525,6 @@ forms on without consulting anything.
 (define-reader-depth N)                        ; forms nest N deep at most (1024 unless set; at most 4096)
 ```
 
-**Definition.** Each body is compiled as a macro's is (§4.6: blocks only, checked when read, the `lir.sexp.*` functions and the
-stream's below declared in it, errors prefixed `reader macro C:`, `dispatch macro #C:` or `token reader:`), under a name of its own in
 **Character classes.** lIR's own whitespace (§1: space, tab, the other ASCII controls 9 to 13, comma, Unicode's White_Space) and its
 own atom delimiters (whitespace, the brackets, `"`, `;`) are a choice of lIR's, and a language's choice may differ: fibber refuses the
 Unicode spaces and ends a symbol at `'`. So the readtable holds **classes**: `(define-reader-class "C" whitespace)` makes the character
@@ -545,6 +544,8 @@ list is a level, and so is a reader macro's or a dispatch macro's run (it reads 
 as fibber counts them); the token reader's run is not. fibber's 1000 (`TooDeep` at the 1001st frame) is `(define-reader-depth 1000)`,
 which gloss's layer 2 sets; a comparison harness that wraps a module in one more form sets one more.
 
+**Definition.** Each body is compiled as a macro's is (§4.6: blocks only, checked when read, the `lir.sexp.*` functions and the
+stream's below declared in it, errors prefixed `reader macro C:`, `dispatch macro #C:` or `token reader:`), under a name of its own in
 the module's macro session; a reader macro may call an earlier `@lir.macro.NAME`. `"C"` is a string of one printable ASCII character
 (`define-reader-macro: the character must be a string of one printable ASCII character`). A reader macro may not be bound to `(`, `)`
 or `;`, and whitespace is not printable (`define-reader-macro: cannot bind (, which is lIR's own`): those are the reader's own, so that a
@@ -604,8 +605,10 @@ every macro's body:
 
 The reader's cursor is the stream's: the macro runs with the stream where the reader was, and when it returns the reader goes on from
 where the macro left the stream. The text is UTF-8 bytes; a macro that wants characters reads their bytes. `lir.read.form` and
-`lir.read.skip` are the reader's own code run on the macro's behalf (through the mailbox of §11's call bridge, so a macro may read a form
-that runs another macro), which is why they, and not the macro, know what whitespace and a form are.
+`lir.read.skip` are the reader's own code run on the macro's behalf (through the mailbox of §11's call bridge), which is why they, and
+not the macro, know what whitespace and a form are. A form that runs another macro runs it on the same worker thread, inside the hook
+that asked for the form (`call-nest`, §11): one thread per module whatever the nesting, its 64 MiB stack holding every level, so the
+depth above is the only limit on how deep macros read through macros.
 
 **Hygiene.** None, as §4.6: a reader macro's result is read as if written in place.
 

@@ -26,7 +26,7 @@
     ((SxList _ p) p) ((SxBrace _ p) p) ((SxBracket _ p) p)
     ((SxAtom _ p) p) ((SxSymbol _ p) p) ((SxStr _ p) p) ((SxVecType _ _ p) p)))
 
-;; The atom's text, if this is an atom (sexp/mod.rs `Sexp::atom`).
+;; The atom's text, if this is an atom or a symbol (sexp/mod.rs `Sexp::atom`).
 (defun sexp-atom (s: Sexp) -> (Option str)
   (match s ((SxAtom a _) (some a)) ((SxSymbol a _) (some a)) (_ nil)))
 
@@ -129,7 +129,7 @@
     (let ((lx (. rd lx)) (b (lex-peek lx)))
       (cond (< b 0) nil
             (>= (closer-code b) 0) (some (Diagnostic (lex-pos lx) (str "unexpected " (byte-text b))))
-            :else (match (read-form rd 0 run)
+            :else (match (read-form rd run)
                     (nil (do (hand-over rd f held) (recur)))
                     ((some d) (some d)))))))
 
@@ -150,7 +150,7 @@
     (let ((lx (. rd lx)) (b (lex-peek lx)))
       (cond (< b 0) nil
             (>= (closer-code b) 0) (some (Diagnostic (lex-pos lx) (str "unexpected " (byte-text b))))
-            :else (match (read-form rd 0 run)
+            :else (match (read-form rd run)
                     (nil (recur))
                     ((some d) (some d)))))))
 
@@ -161,7 +161,7 @@
     (let ((lx (. rd lx)) (b (lex-peek lx)) (base @(. rd top)))
       (cond (< b 0) (err (lex-pos lx) "unexpected end of input")
             (>= (closer-code b) 0) (err (lex-pos lx) (str "unexpected " (byte-text b)))
-            :else (match (read-form rd 0 run)
+            :else (match (read-form rd run)
                     ((some d) (Err d))
                     (nil (if (> @(. rd top) base) (Ok (pop-form rd)) (recur))))))))
 
@@ -213,13 +213,13 @@
 
 ;; Reads the form that starts at the cursor (a byte that is not a closer) and pushes it; the error that stops it, nil if none. With no
 ;; readtable bindings this is the whole of the reader's dispatch, one load away; with any, the table is consulted first (`read-form-with`).
-(defun read-form :private (rd: Reader depth: i64 run: Runner) -> (Option Diagnostic)
+(defun read-form :private (rd: Reader run: Runner) -> (Option Diagnostic)
   (if @(. (. rd table) active)
-      (read-form-with rd depth run)
+      (read-form-with rd run)
       (let ((lx (. rd lx)) (pos (lex-pos lx)) (b (lex-byte lx)))
-        (cond (= b 40) (read-list rd depth pos 0 run)
-              (= b 123) (read-list rd depth pos 1 run)
-              (= b 91) (read-list rd depth pos 2 run)
+        (cond (= b 40) (read-list rd pos 0 run)
+              (= b 123) (read-list rd pos 1 run)
+              (= b 91) (read-list rd pos 2 run)
               (or (= b 34) (= b 60)) (read-token rd)
               :else (do (push rd (SxAtom (lex-atom-text lx) pos)) nil)))))
 
@@ -231,9 +231,9 @@
     (match (get @(. t chars) b)
       ((some e) (do (bump lx) (run-entry rd run e pos nil)))
       (nil (cond (and (= b 35) (not (empty? @(. t dispatch)))) (read-dispatch rd run pos)
-                 (= b 40) (read-list rd depth pos 0 run)
-                 (= b 123) (read-list rd depth pos 1 run)
-                 (= b 91) (read-list rd depth pos 2 run)
+                 (= b 40) (read-list rd pos 0 run)
+                 (= b 123) (read-list rd pos 1 run)
+                 (= b 91) (read-list rd pos 2 run)
                  (or (= b 34) (= b 60)) (read-token rd)
                  :else (let ((atom (SxAtom (lex-atom-text lx) pos)))
                          (match @(. t token)
@@ -249,12 +249,24 @@
             ((some e) (do (bump lx) (run-entry rd run e pos nil)))
             (nil (some (Diagnostic pos (if (< c 0) "unexpected end of input after #" (str "no dispatch macro for #" (byte-text c)))))))))))
 
-;; The entry run by the host: its form pushed, nothing for no form.
+;; The entry run by the host: its form pushed, nothing for no form. A reader macro's or a dispatch macro's run is a level of nesting, as a
+;; list is (it reads what is inside it); the token reader's, called after an atom, is not.
 (defun run-entry :private (rd: Reader run: Runner e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Option Diagnostic)
-  (match ((. run run) rd e pos tok)
-    ((Err d) (some d))
-    ((Ok nil) nil)
-    ((Ok (some f)) (do (push rd f) nil))))
+  (match (if (some? tok) nil (enter rd pos))
+    ((some d) (some d))
+    (nil (let ((r ((. run run) rd e pos tok)))
+           (do (if (some? tok) () (set! (. rd depth) (- @(. rd depth) 1)))
+               (match r
+                 ((Err d) (some d))
+                 ((Ok nil) nil)
+                 ((Ok (some f)) (do (push rd f) nil))))))))
+
+;; One level deeper, or the error at `open` when the table's depth is reached.
+(defun enter :private (rd: Reader open: i64) -> (Option Diagnostic)
+  (let ((max @(. (. rd table) depth)))
+    (if (>= @(. rd depth) max)
+        (some (Diagnostic open (str "nesting deeper than " max)))
+        (do (set! (. rd depth) (+ @(. rd depth) 1)) nil))))
 
 ;; A string or a vector type, through the token path (they are rare, and own the lexical errors).
 (defun read-token :private (rd: Reader) -> (Option Diagnostic)
@@ -268,26 +280,27 @@
        (_ nil)))))
 
 ;; The list that opens at the cursor, read to its closer and pushed; `kind` 0 is (), 1 is {} and 2 is [].
-(defun read-list :private (rd: Reader depth: i64 open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
-  (if (> (+ depth 1) max-depth)
-      (some (Diagnostic open (str "nesting deeper than " max-depth)))
-      (do (bump (. rd lx))
-          (let ((base @(. rd top)))
-            (match (read-items rd (+ depth 1) open kind run)
-              ((some d) (some d))
-              (nil (let ((items (take-items rd base)))
-                     (do (push rd (cond (= kind 0) (SxList items open)
-                                        (= kind 1) (SxBrace items open)
-                                        :else (SxBracket items open)))
-                         nil))))))))
+(defun read-list :private (rd: Reader open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
+  (match (enter rd open)
+    ((some d) (some d))
+    (nil (do (bump (. rd lx))
+             (let ((base @(. rd top)) (r (read-items rd open kind run)))
+               (do (set! (. rd depth) (- @(. rd depth) 1))
+                   (match r
+                     ((some d) (some d))
+                     (nil (let ((items (take-items rd base)))
+                            (do (push rd (cond (= kind 0) (SxList items open)
+                                               (= kind 1) (SxBrace items open)
+                                               :else (SxBracket items open)))
+                                nil))))))))))
 
 ;; The forms up to the closer of `kind`, which is consumed; the error, nil if none.
-(defun read-items :private (rd: Reader depth: i64 open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
+(defun read-items :private (rd: Reader open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
   (loop ()
     (let ((lx (. rd lx)) (b (lex-peek lx)) (c (closer-code b)))
       (cond (< b 0) (some (Diagnostic open "unexpected end of input: unclosed list"))
             (= c kind) (do (bump lx) nil)
             (>= c 0) (some (Diagnostic (lex-pos lx) "mismatched closing bracket"))
-            :else (match (read-form rd depth run)
+            :else (match (read-form rd run)
                     (nil (recur))
                     ((some d) (some d)))))))
