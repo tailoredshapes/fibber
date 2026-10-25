@@ -62,8 +62,21 @@ one() {
   if [ $ns -eq 124 ]; then echo "skip $name: the native run timed out"; return; fi
   # `fatal signal N at 0x..` is written by lairf's own runtime (rt/thread.lir, the JIT shares its process), not by the program
   grep -v '^fatal signal [0-9]* at 0x' "$d/n.err0" > "$d/n.err"
-  if grep -q '^;; expect: reject' "$f"; then
+  reject=0; grep -q '^;; expect: reject' "$f" && reject=1
+  # A file that defines or requires macros (spec/lir.md 4.6), imports (4.7) or defines reader macros (4.8): lir2c has no compile-time runtime, so it
+  # reads the expanded lIR `lairf expand` prints; an expansion lairf refuses is the verdict lir2c is compared with (the backend never sees such a
+  # module). A file with none goes to lir2c as it is, so that a diagnostic's position is the file's.
+  if grep -qE '^\((define-macro|require-macros|import|define-reader-macro|define-dispatch-macro|define-token-reader) ' "$f"; then
+    "$LAIRF" expand "$f" > "$d/x.lir" 2> "$d/x.err"; xs=$?
+    if [ $xs -ne 0 ]; then
+      if [ $reject -eq 1 ] && [ $xs -eq $ns ] && cmp -s "$d/n.err" "$d/x.err"; then echo "pass $name"; else echo "differ $name: lairf expand failed with exit $xs, native $ns: $(head -c 150 "$d/x.err")"; fi
+      return
+    fi
+    orig=$f; f=$d/x.lir
+  fi
+  if [ $reject -eq 1 ]; then
     "$LIR2C" "$f" -o "$d/p.c" > /dev/null 2> "$d/t.err"; ts=$?
+    [ "$f" = "$d/x.lir" ] && sed -i "s|$d/x.lir|$orig|g" "$d/t.err"   # a diagnostic of the expanded text names the file it came from
     if [ $ts -eq $ns ] && cmp -s "$d/n.err" "$d/t.err"; then echo "pass $name"; else echo "differ $name: rejected with exit $ts, native $ns: $(head -c 150 "$d/t.err")"; fi
     return
   fi

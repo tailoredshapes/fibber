@@ -1,0 +1,137 @@
+;; compiler/native/imports/program.fib: the program a set of lIR modules makes (spec/lir.md 4.7): its name tables, the rules a module meets
+;; when it is admitted (an exported name is defined once; a declared name agrees in type with the program's definition or declaration of it;
+;; an internal or private name the program already has is renamed `NAME.N` throughout the module, as `llvm-link` renames; one `target`
+;; form), and the union of the admitted modules, in which a `declare` of a name the program defines, or a second `declare` of one name, is
+;; dropped.
+(ns native.imports.program
+  (:use lir.diag lir.types lir.ast)
+  (:require [lir.rewrite :as rw] [native.macros :as macros]))
+
+;; A name of the program: the file that has it, whether as a definition (a `declare` otherwise) and its type as text.
+(defstruct Owner (file: str defined: bool ty: str))
+
+;; A module admitted to the program: its own items, renamed where the program had the name.
+(defstruct Loaded (file: str items: (Vec LItem)))
+
+;; What an importer gets of a module: its interface items (at position 0: an importer puts them at its import), the names it keeps
+;; internal, and the macros of its own file.
+(defstruct Export (iface: (Vec LItem) hidden: (Vec str) macros: (Vec macros/Macro)))
+
+;; The program being loaded: the modules admitted in order, the files being loaded (a cycle), the exports by file, the program's names and
+;; structs, the file whose `target` form the program has, and every module's environment (closed together: an importer may use a module's
+;; macros until the program is read).
+(defstruct State (loaded: (Cell (Vec Loaded)) loading: (Cell (Set str)) exports: (Cell (Map str Export)) names: (Cell (Map str Owner))
+                  structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec macros/Env))))
+
+(defun state-new () -> State
+  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell [])))
+
+;; ---------------------------------------------------------------- admission
+
+(defun exported? :private (m: LModifiers) -> bool (linkage-exported? (. m linkage)))
+
+;; The names a module defines or declares itself (a fresh name must not be one of them).
+(defun own-names :private (items: (Vec LItem)) -> (Set str)
+  (reduce (fn (acc: (Set str) it: LItem)
+            (match it
+              ((ItDefine f) (conj acc (. f name))) ((ItGlobal g) (conj acc (. g name)))
+              ((ItDeclare d) (conj acc (. d name))) ((ItDeclareGlobal g) (conj acc (. g name)))
+              (_ acc)))
+          (set-empty) items))
+
+;; The items of the module of `file` as the program takes them: each name under the rules, the renames applied; the tables updated.
+(defun admit (st: State file: str items: (Vec LItem)) -> (Result (Vec LItem) Diagnostic)
+  (let ((own (own-names items)))
+    (loop ((i 0) (renames {}))
+      (if (>= i (count items))
+          (Ok (if (empty? renames) items (mapv (fn (it: LItem) (rename-item it renames)) items)))
+          (match (admit-item st file own (nth items i) renames)
+            ((Err d) (Err d))
+            ((Ok r) (recur (+ i 1) r)))))))
+
+(defun admit-item :private (st: State file: str own: (Set str) it: LItem renames: (Map str str)) -> (Result (Map str str) Diagnostic)
+  (match it
+    ((ItStruct s) (admit-struct st file s renames))
+    ((ItTarget t) (admit-target st file t renames))
+    ((ItDefine f) (admit-symbol st file own (. f name) (fn-type-str (. f ty)) true (exported? (. f mods)) (. f pos) renames))
+    ((ItGlobal g) (admit-symbol st file own (. g name) (type-str (. g ty)) true (exported? (. g mods)) (. g pos) renames))
+    ((ItDeclare d) (admit-symbol st file own (. d name) (fn-type-str (. d ty)) false true (. d pos) renames))
+    ((ItDeclareGlobal g) (admit-symbol st file own (. g name) (type-str (. g ty)) false true (. g pos) renames))))
+
+(defun admit-struct :private (st: State file: str s: LStructDef renames: (Map str str)) -> (Result (Map str str) Diagnostic)
+  (match (get @(. st structs) (. s name))
+    ((some other) (err (. s pos) (str "%struct." (. s name) " is also defined in " other)))
+    (nil (do (set! (. st structs) (assoc @(. st structs) (. s name) file)) (Ok renames)))))
+
+(defun admit-target :private (st: State file: str t: LTarget renames: (Map str str)) -> (Result (Map str str) Diagnostic)
+  (match @(. st target)
+    ((some other) (err (. t pos) (str "target: " other " also has a target form")))
+    (nil (do (set! (. st target) (some file)) (Ok renames)))))
+
+(defun record :private (st: State name: str o: Owner) -> unit
+  (set! (. st names) (assoc @(. st names) name o)))
+
+;; One function or global name of the module: new to the program, it is recorded; an internal one the program has is renamed; an exported
+;; definition of a defined name, or a type that disagrees, is refused; a definition replaces a declaration; a second declaration is nothing.
+(defun admit-symbol :private (st: State file: str own: (Set str) name: str ty: str defined: bool exported: bool pos: i64 renames: (Map str str))
+  -> (Result (Map str str) Diagnostic)
+  (match (get @(. st names) name)
+    (nil (do (record st name (Owner file defined ty)) (Ok renames)))
+    ((some o)
+     (cond (not exported) (let ((fresh (fresh-name st own name)))
+                            (do (record st fresh (Owner file true ty)) (Ok (assoc renames name fresh))))
+           (and defined (. o defined)) (err pos (str "@" name " is also defined in " (. o file)))
+           (not (= ty (. o ty))) (err pos (str "@" name " is " (if (. o defined) "defined" "declared") " as " (. o ty) " in " (. o file)))
+           defined (do (record st name (Owner file true ty)) (Ok renames))
+           :else (Ok renames)))))
+
+;; `NAME.N`, the smallest N from 1 that neither the program nor the module has.
+(defun fresh-name :private (st: State own: (Set str) name: str) -> str
+  (loop ((n 1))
+    (let ((candidate (str name "." n)))
+      (if (or (contains? @(. st names) candidate) (set-contains? own candidate))
+          (recur (+ n 1))
+          candidate))))
+
+;; ---------------------------------------------------------------- renaming
+
+(defun renamed :private (names: (Map str str) n: str) -> str (unwrap-or (get names n) n))
+
+;; Every `@name` and direct callee of the expression renamed.
+(defun rename-expr :private (e: LExpr names: (Map str str)) -> LExpr
+  (match (. e kind)
+    ((KGlobal n) (LExpr (KGlobal (renamed names n)) (. e pos)))
+    ((KCall (CalDirect n) args tail)
+     (LExpr (KCall (CalDirect (renamed names n)) (mapv (fn (a: LExpr) (rename-expr a names)) args) tail) (. e pos)))
+    (_ (rw/map-children e (fn (c: LExpr) (rename-expr c names))))))
+
+(defun rename-block :private (b: LBlock names: (Map str str)) -> LBlock
+  (LBlock (. b label) (mapv (fn (e: LExpr) (rename-expr e names)) (. b body)) (. b pos)))
+
+(defun rename-item :private (it: LItem names: (Map str str)) -> LItem
+  (match it
+    ((ItDefine f) (ItDefine (with f (name (renamed names (. f name))) (blocks (mapv (fn (b: LBlock) (rename-block b names)) (. f blocks))))))
+    ((ItGlobal g) (ItGlobal (with g (name (renamed names (. g name))) (init (rename-expr (. g init) names)))))
+    (_ it)))
+
+;; ---------------------------------------------------------------- the union
+
+;; The items of the program: every admitted module's in order, then `main`'s (the named module's, admitted last); a `declare` or
+;; `declare-global` of a name the program defines, or one the union has already, is left out.
+(defun union-items (st: State main: (Vec LItem)) -> (Vec LItem)
+  (let ((all (into (reduce (fn (acc: (Vec LItem) l: Loaded) (into acc (. l items))) [] @(. st loaded)) main)))
+    (loop ((i 0) (seen (set-empty)) (out []))
+      (if (>= i (count all))
+          out
+          (let ((it (nth all i)))
+            (match (declared-name it)
+              (nil (recur (+ i 1) seen (conj out it)))
+              ((some n) (if (or (set-contains? seen n) (defined? st n))
+                            (recur (+ i 1) seen out)
+                            (recur (+ i 1) (conj seen n) (conj out it))))))))))
+
+(defun declared-name :private (it: LItem) -> (Option str)
+  (match it ((ItDeclare d) (some (. d name))) ((ItDeclareGlobal g) (some (. g name))) (_ nil)))
+
+(defun defined? :private (st: State n: str) -> bool
+  (match (get @(. st names) n) ((some o) (. o defined)) (nil false)))
