@@ -36,6 +36,7 @@ earlier plan where they differ.
 - [The AST dump of lIR (`lair dump-ast`)](lair-ast-dump.md)
 - [lair in fibber](lair-in-fibber.md)
 - [lair in fibber: the shared interfaces (package S1)](lair-interfaces.md)
+- [lIR is the language; fibber is macros and functions on it (proposed)](lir-language.md)
 - [A C backend for lIR](lir2c.md)
 - [Live sessions: emit only what changed, and swap any module](live-incremental.md)
 - [A live REPL: change a running program without restarting it](live-repl.md)
