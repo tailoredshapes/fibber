@@ -2,7 +2,7 @@
 ;; Errors are the Rust's strings (the caller prints them on standard error and exits 1). `fuzz` is package F's (native.fuzz).
 
 (ns native.cli
-  (:require [fib.string :as s] [llvm.ffi :as ffi] [native.macros :as macros] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
+  (:require [fib.string :as s] [llvm.ffi :as ffi] [native.macros :as macros] [lir.dump :as dump] [lir.print :as lprint] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
             [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
@@ -20,6 +20,7 @@
   lair link FILE.liro.. -o OUT [-O n] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
+  lair expand FILE.lir            ; the module with its macros expanded, as lIR text (for a backend with no compile-time runtime)
   lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
   lair fuzz-one [-O n] FILE.lir")
@@ -54,6 +55,17 @@
         (do (print text) (Ok 0)))))
 
 ;; The canonical text of the parsed module (docs/design/lair-ast-dump.md), its macros expanded; it parses but does not check.
+;; The module read, its macros expanded and parsed (spec/lir.md 4.6), printed as lIR text (lir.print: one top-level form per line, which
+;; reads back to the same module; no `define-macro` or `require-macros` remains, and a module with no macros prints as parsed). It
+;; parses but does not check: what lir2js and lir2c, which have no compile-time runtime, consume in place of the text.
+(defun expand-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (= (count rest) 1))
+      (Err usage)
+      (try-let [src (read-src (nth rest 0))]
+        (match (macros/parse-source src (nth rest 0))
+          ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
+          ((Ok m) (do (print-raw (lprint/print-module m)) (Ok 0)))))))
+
 (defun dump-ast-cmd :private (rest: (Vec str)) -> (Result i64 str)
   (if (not (= (count rest) 1))
       (Err usage)
@@ -270,6 +282,7 @@
               (= cmd "link") (link-cmd rest)
               (= cmd "emit-llvm") (emit-llvm-cmd rest)
               (= cmd "dump-ast") (dump-ast-cmd rest)
+              (= cmd "expand") (expand-cmd rest)
               (= cmd "cases") (cases-cmd rest)
               (= cmd "fuzz-one") (fuzz-one-cmd rest)
               (= cmd "fuzz") (fuzz/fuzz-cmd rest)

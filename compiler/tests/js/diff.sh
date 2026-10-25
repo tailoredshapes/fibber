@@ -56,7 +56,19 @@ one() {
   fi
   (timeout "$TMO" "$LAIRF" run "$f" > "$d/n.out" 2> "$d/n.err") 2> /dev/null; ns=$?
   if [ $ns -eq 124 ]; then echo "skip $name: the native run timed out"; return; fi
-  if grep -q '^;; expect: reject' "$f"; then   # both must refuse it with the same diagnostics: lir2js reads it with lair's reader and checker
+  reject=0; grep -q '^;; expect: reject' "$f" && reject=1
+  # A file that defines or requires macros (spec/lir.md 4.6): lir2js has no compile-time runtime, so it reads the expanded lIR `lairf expand`
+  # prints; an expansion lairf refuses is the verdict lir2js is compared with (the backend never sees such a module). A file with no macros goes
+  # to lir2js as it is, so that a diagnostic's position is the file's.
+  if grep -qE '^\((define-macro|require-macros) ' "$f"; then
+    "$LAIRF" expand "$f" > "$d/x.lir" 2> "$d/x.err"; xs=$?
+    if [ $xs -ne 0 ]; then
+      if [ $reject -eq 1 ] && [ $xs -eq $ns ] && cmp -s "$d/n.err" "$d/x.err"; then echo "pass $name"; else echo "differ $name: lairf expand failed with exit $xs, native $ns: $(head -c 150 "$d/x.err")"; fi
+      return
+    fi
+    f=$d/x.lir
+  fi
+  if [ $reject -eq 1 ]; then   # both must refuse it with the same diagnostics: lir2js reads it with lair's reader and checker
     "$LIR2JS" "$f" -o "$d/p.mjs" --rt "$RT" > /dev/null 2> "$d/t.err"; ts=$?
     if [ $ts -eq $ns ] && cmp -s "$d/n.err" "$d/t.err"; then echo "pass $name"; else echo "differ $name: rejected with exit $ts, native $ns: $(head -c 150 "$d/t.err")"; fi
     return
