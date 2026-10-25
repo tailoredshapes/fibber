@@ -37,20 +37,51 @@
     ((SxStr _ _) "a string")
     ((SxVecType n e _) (str "<" n " x " e ">"))))
 
-;; The reader: the lexer, whether it has failed (a lexical error is final; a structural one waits for the rest of the text to be lexed), and
-;; the stack of forms read and not yet in a list: `stack[0..top)`. A list's items are the forms above its base; closing the list moves them,
-;; by `array-take!`, into an array of exactly their count (no object counts a form again, and no 32-slot tail is made for a list of three).
-(defstruct Reader (lx: Lexer failed: (Cell bool) stack: (Cell (Array Sexp)) top: (Cell i64)))
+;; The readtable of a module (spec/lir.md 4.7): what the reader does at a byte besides its own syntax. A reader macro by its byte, a dispatch
+;; macro by the byte after `#`, and the token reader; `active` once anything is bound, so a reader with no bindings pays one load per form.
+;; An entry is the address of the macro's compiled function and the name its errors carry (`reader macro [`, `dispatch macro #(`,
+;; `token reader`). The host (native.macros.readers) runs an entry: the reader is the stream, and the runner answers the form, nil for no
+;; form (a discard), or the error.
+(defstruct ReaderEntry (addr: i64 name: str))
+(defstruct Readtable (chars: (Cell (Map i64 ReaderEntry)) dispatch: (Cell (Map i64 ReaderEntry)) token: (Cell (Option ReaderEntry)) active: (Cell bool)))
+(defstruct Runner (run: (fn (Reader ReaderEntry i64 (Option Sexp)) (Result (Option Sexp) Diagnostic))))
+
+(defun readtable-new () -> Readtable
+  (Readtable (cell (map-empty)) (cell (map-empty)) (cell nil) (cell false)))
+
+;; Binds byte `b` to a reader macro, a later binding replacing an earlier; `readtable-bind-dispatch!` the byte after `#`;
+;; `readtable-token!` the token reader.
+(defun readtable-bind! (t: Readtable b: i64 e: ReaderEntry) -> unit
+  (do (set! (. t chars) (assoc @(. t chars) b e)) (set! (. t active) true)))
+
+(defun readtable-bind-dispatch! (t: Readtable b: i64 e: ReaderEntry) -> unit
+  (do (set! (. t dispatch) (assoc @(. t dispatch) b e)) (set! (. t active) true)))
+
+(defun readtable-token! (t: Readtable e: ReaderEntry) -> unit
+  (do (set! (. t token) (some e)) (set! (. t active) true)))
+
+;; The runner of a reader with no bindings: never called, since nothing is bound.
+(defun no-runner () -> Runner
+  (Runner (fn (rd: Reader e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic) (err pos "no reader macros"))))
+
+;; The reader: the lexer, whether it has failed (a lexical error is final; a structural one waits for the rest of the text to be lexed),
+;; the stack of forms read and not yet in a list: `stack[0..top)`, and the readtable. A list's items are the forms above its base; closing
+;; the list moves them, by `array-take!`, into an array of exactly their count (no object counts a form again, and no 32-slot tail is made
+;; for a list of three).
+(defstruct Reader (lx: Lexer failed: (Cell bool) stack: (Cell (Array Sexp)) top: (Cell i64) table: Readtable))
 
 ;; The filler of an unused slot of the stack.
 (def filler: Sexp (SxList [] 0))
+
+(defun reader-new :private (src: str table: Readtable) -> Reader
+  (Reader (lexer-new src) (cell false) (cell (array 64 filler)) (cell 0) table))
 
 ;; Reads every form of `src`; the first lexical or structural error (sexp/reader.rs `read`). A lexical error found anywhere in the text
 ;; wins over a parse error, because lir::parse reads all forms before it parses any, and over a structural error, because the Rust
 ;; lexes the whole text before it reads: so a structural error is held while the rest of the text is lexed (`settle`).
 (defun read (src: str) -> (Result (Vec Sexp) Diagnostic)
-  (let ((rd (Reader (lexer-new src) (cell false) (cell (array 64 filler)) (cell 0))))
-    (match (read-forms rd)
+  (let ((rd (reader-new src (readtable-new))))
+    (match (read-forms rd (no-runner))
       (nil (Ok (take-items rd 0)))
       ((some d) (settle rd d)))))
 
@@ -59,43 +90,67 @@
 ;; Rust reads all forms before it parses any (`read`). The forms are not kept, so a parser that frees each form as it goes never holds the
 ;; whole tree of a 19 MB text. Answers nil, or the error that wins.
 (defun read-each (src: str f: (fn (Sexp) (Option Diagnostic)) :borrow) -> (Option Diagnostic)
-  (let ((rd (Reader (lexer-new src) (cell false) (cell (array 64 filler)) (cell 0)))
+  (read-each-with src (readtable-new) (no-runner) f))
+
+;; `read-each` with a readtable, which `f` may add to as it goes (a binding applies to the forms after the one that made it), and the host's
+;; runner of its entries.
+(defun read-each-with (src: str table: Readtable run: Runner f: (fn (Sexp) (Option Diagnostic)) :borrow) -> (Option Diagnostic)
+  (let ((rd (reader-new src table))
         (held (cell nil)))
-    (match (read-forms-each rd f held)
+    (match (read-forms-each rd run f held)
       (nil @held)
       ((some d) (match (settle rd d) ((Err e) (some e)) ((Ok _) nil))))))
 
-(defun read-forms-each :private (rd: Reader f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> (Option Diagnostic)
+(defun read-forms-each :private (rd: Reader run: Runner f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> (Option Diagnostic)
   (loop ()
     (let ((lx (. rd lx)) (b (lex-peek lx)))
       (cond (< b 0) nil
-            (= b 41) (some (Diagnostic (lex-pos lx) "unexpected )"))
-            (= b 125) (some (Diagnostic (lex-pos lx) "unexpected }"))
-            (= b 93) (some (Diagnostic (lex-pos lx) "unexpected ]"))
-            :else (match (read-form rd 0)
+            (>= (closer-code b) 0) (some (Diagnostic (lex-pos lx) (str "unexpected " (byte-text b))))
+            :else (match (read-form rd 0 run)
                     (nil (do (hand-over rd f held) (recur)))
                     ((some d) (some d)))))))
 
-;; The form just read, taken off the stack and given to `f` unless an earlier one failed.
+;; The form just read, taken off the stack and given to `f` unless an earlier one failed; nothing when a reader macro read no form.
 (defun hand-over :private (rd: Reader f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> unit
   (let ((stk (. rd stack)))
-    (do (set! (. rd top) 0)
-        (let ((form (array-take! &stk 0)))
-          (match @held
-            (nil (match (f form) (nil ()) ((some d) (set! held (some d)))))
-            (_ ()))))))
+    (if (= @(. rd top) 0)
+        ()
+        (do (set! (. rd top) 0)
+            (let ((form (array-take! &stk 0)))
+              (match @held
+                (nil (match (f form) (nil ()) ((some d) (set! held (some d)))))
+                (_ ())))))))
 
 ;; The forms to the end of the text, on the stack; the error that stops them, nil if none.
-(defun read-forms :private (rd: Reader) -> (Option Diagnostic)
+(defun read-forms :private (rd: Reader run: Runner) -> (Option Diagnostic)
   (loop ()
     (let ((lx (. rd lx)) (b (lex-peek lx)))
       (cond (< b 0) nil
-            (= b 41) (some (Diagnostic (lex-pos lx) "unexpected )"))
-            (= b 125) (some (Diagnostic (lex-pos lx) "unexpected }"))
-            (= b 93) (some (Diagnostic (lex-pos lx) "unexpected ]"))
-            :else (match (read-form rd 0)
+            (>= (closer-code b) 0) (some (Diagnostic (lex-pos lx) (str "unexpected " (byte-text b))))
+            :else (match (read-form rd 0 run)
                     (nil (recur))
                     ((some d) (some d)))))))
+
+;; The next form of the text, for a reader macro that reads what follows it (`lir.read.form`, spec/lir.md 4.7): read through the table, a
+;; discard passed over; the end of the text or a closer is an error where it stands.
+(defun read-next-form (rd: Reader run: Runner) -> (Result Sexp Diagnostic)
+  (loop ()
+    (let ((lx (. rd lx)) (b (lex-peek lx)) (base @(. rd top)))
+      (cond (< b 0) (err (lex-pos lx) "unexpected end of input")
+            (>= (closer-code b) 0) (err (lex-pos lx) (str "unexpected " (byte-text b)))
+            :else (match (read-form rd 0 run)
+                    ((some d) (Err d))
+                    (nil (if (> @(. rd top) base) (Ok (pop-form rd)) (recur))))))))
+
+;; The form on the top of the stack, taken off it.
+(defun pop-form :private (rd: Reader) -> Sexp
+  (let ((top (- @(. rd top) 1)) (stk (. rd stack)))
+    (do (set! (. rd top) top)
+        (array-take! &stk top))))
+
+;; The byte as text, for a message.
+(defun byte-text :private (b: i64) -> str
+  (str-from-bytes (array 1 (trunc i8 b))))
 
 ;; The error of a read that failed: the lexical error itself, or the first one in the rest of the text, or `d`.
 (defun settle :private (rd: Reader d: Diagnostic) -> (Result (Vec Sexp) Diagnostic)
@@ -133,14 +188,50 @@
         (array-set! &stk top f)
         (set! (. rd top) (+ top 1)))))
 
-;; Reads the form that starts at the cursor (a byte that is not a closer) and pushes it; the error that stops it, nil if none.
-(defun read-form :private (rd: Reader depth: i64) -> (Option Diagnostic)
-  (let ((lx (. rd lx)) (pos (lex-pos lx)) (b (lex-byte lx)))
-    (cond (= b 40) (read-list rd depth pos 0)
-          (= b 123) (read-list rd depth pos 1)
-          (= b 91) (read-list rd depth pos 2)
-          (or (= b 34) (= b 60)) (read-token rd)
-          :else (do (push rd (SxAtom (lex-atom-text lx) pos)) nil))))
+;; Reads the form that starts at the cursor (a byte that is not a closer) and pushes it; the error that stops it, nil if none. With no
+;; readtable bindings this is the whole of the reader's dispatch, one load away; with any, the table is consulted first (`read-form-with`).
+(defun read-form :private (rd: Reader depth: i64 run: Runner) -> (Option Diagnostic)
+  (if @(. (. rd table) active)
+      (read-form-with rd depth run)
+      (let ((lx (. rd lx)) (pos (lex-pos lx)) (b (lex-byte lx)))
+        (cond (= b 40) (read-list rd depth pos 0 run)
+              (= b 123) (read-list rd depth pos 1 run)
+              (= b 91) (read-list rd depth pos 2 run)
+              (or (= b 34) (= b 60)) (read-token rd)
+              :else (do (push rd (SxAtom (lex-atom-text lx) pos)) nil)))))
+
+;; `read-form` under the readtable: a bound byte runs its reader macro with the stream after it; `#` with a dispatch macro bound runs the
+;; one of the byte after it, with the stream after both; otherwise lIR's own syntax, and an atom goes through the token reader when there is
+;; one, with the stream after the atom and the atom's form.
+(defun read-form-with :private (rd: Reader depth: i64 run: Runner) -> (Option Diagnostic)
+  (let ((lx (. rd lx)) (t (. rd table)) (pos (lex-pos lx)) (b (lex-byte lx)))
+    (match (get @(. t chars) b)
+      ((some e) (do (bump lx) (run-entry rd run e pos nil)))
+      (nil (cond (and (= b 35) (not (empty? @(. t dispatch)))) (read-dispatch rd run pos)
+                 (= b 40) (read-list rd depth pos 0 run)
+                 (= b 123) (read-list rd depth pos 1 run)
+                 (= b 91) (read-list rd depth pos 2 run)
+                 (or (= b 34) (= b 60)) (read-token rd)
+                 :else (let ((atom (SxAtom (lex-atom-text lx) pos)))
+                         (match @(. t token)
+                           (nil (do (push rd atom) nil))
+                           ((some e) (run-entry rd run e pos (some atom))))))))))
+
+;; The macro of the byte after `#`, the stream after both; `#` at the end of the text, or before an unbound byte, is an error at the `#`.
+(defun read-dispatch :private (rd: Reader run: Runner pos: i64) -> (Option Diagnostic)
+  (let ((lx (. rd lx)))
+    (do (bump lx)
+        (let ((c (lex-byte lx)))
+          (match (if (< c 0) nil (get @(. (. rd table) dispatch) c))
+            ((some e) (do (bump lx) (run-entry rd run e pos nil)))
+            (nil (some (Diagnostic pos (if (< c 0) "unexpected end of input after #" (str "no dispatch macro for #" (byte-text c)))))))))))
+
+;; The entry run by the host: its form pushed, nothing for no form.
+(defun run-entry :private (rd: Reader run: Runner e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Option Diagnostic)
+  (match ((. run run) rd e pos tok)
+    ((Err d) (some d))
+    ((Ok nil) nil)
+    ((Ok (some f)) (do (push rd f) nil))))
 
 ;; A string or a vector type, through the token path (they are rare, and own the lexical errors).
 (defun read-token :private (rd: Reader) -> (Option Diagnostic)
@@ -154,12 +245,12 @@
        (_ nil)))))
 
 ;; The list that opens at the cursor, read to its closer and pushed; `kind` 0 is (), 1 is {} and 2 is [].
-(defun read-list :private (rd: Reader depth: i64 open: i64 kind: i64) -> (Option Diagnostic)
+(defun read-list :private (rd: Reader depth: i64 open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
   (if (> (+ depth 1) max-depth)
       (some (Diagnostic open (str "nesting deeper than " max-depth)))
       (do (bump (. rd lx))
           (let ((base @(. rd top)))
-            (match (read-items rd (+ depth 1) open kind)
+            (match (read-items rd (+ depth 1) open kind run)
               ((some d) (some d))
               (nil (let ((items (take-items rd base)))
                      (do (push rd (cond (= kind 0) (SxList items open)
@@ -168,12 +259,12 @@
                          nil))))))))
 
 ;; The forms up to the closer of `kind`, which is consumed; the error, nil if none.
-(defun read-items :private (rd: Reader depth: i64 open: i64 kind: i64) -> (Option Diagnostic)
+(defun read-items :private (rd: Reader depth: i64 open: i64 kind: i64 run: Runner) -> (Option Diagnostic)
   (loop ()
     (let ((lx (. rd lx)) (b (lex-peek lx)) (c (closer-code b)))
       (cond (< b 0) (some (Diagnostic open "unexpected end of input: unclosed list"))
             (= c kind) (do (bump lx) nil)
             (>= c 0) (some (Diagnostic (lex-pos lx) "mismatched closing bracket"))
-            :else (match (read-form rd depth)
+            :else (match (read-form rd depth run)
                     (nil (recur))
                     ((some d) (some d)))))))
