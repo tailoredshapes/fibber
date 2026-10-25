@@ -1,0 +1,75 @@
+;; compiler/native/macros/readlib.fib: the stream of a reader macro (spec/lir.md 4.7), as lIR text: compiled into the macro session beside
+;; the form library (native.macros.lib), and declared in every macro's module (`declares-source`). The stream is a struct the host
+;; (native.macros.readers) fills from the reader's cursor before a reader macro runs and reads back after: the text and its length, the
+;; byte offset, the line and the column, the file, the mailbox and the hook that reach the host (`lir.read.form`, `lir.read.skip`), and the
+;; failure a macro records with `lir.read.fail`. The layout is the contract: the host reads and writes it from fibber.
+(ns native.macros.readlib)
+
+;; What a macro's module declares of the stream's functions.
+(defun declares-source () -> str
+  "(declare lir.read.peek i64 (ptr))
+(declare lir.read.next i64 (ptr))
+(declare lir.read.position i64 (ptr))
+(declare lir.read.skip i64 (ptr))
+(declare lir.read.form ptr (ptr))
+(declare lir.read.fail ptr (ptr i64 ptr))
+")
+
+;; The library's module.
+(defun lib-source () -> str
+  (str-join [(part-0) "\n" (part-1)]))
+
+(defun part-0 :private () -> str
+  ";; lir.read: the stream of a reader macro (spec/lir.md 4.7): text, length, offset, line, column, file, mailbox, hook, failure message, failure position.
+(defstruct lir.read.stream (ptr i64 i64 i64 i64 ptr ptr ptr ptr i64))
+
+(define (lir.read.peek i64) ((ptr s))
+  (block entry
+    (let ((off (load i64 (getelementptr %struct.lir.read.stream s (i64 0) (i32 2))))
+          (n (load i64 (getelementptr %struct.lir.read.stream s (i64 0) (i32 1)))))
+      (br (icmp ult off n) in out)))
+  (block in (ret (zext i64 (load i8 (getelementptr i8 (load ptr s) off)))))
+  (block out (ret (i64 -1))))
+
+(define (lir.read.next i64) ((ptr s))
+  (block entry
+    (let ((b (call @lir.read.peek s)))
+      (br (icmp slt b (i64 0)) end more)))
+  (block end (ret (i64 -1)))
+  (block more
+    (let ((offp (getelementptr %struct.lir.read.stream s (i64 0) (i32 2))))
+      (store (add (load i64 offp) (i64 1)) offp)
+      (br (icmp eq b (i64 10)) newline same)))
+  (block newline
+    (let ((linep (getelementptr %struct.lir.read.stream s (i64 0) (i32 3))))
+      (store (add (load i64 linep) (i64 1)) linep)
+      (store (i64 1) (getelementptr %struct.lir.read.stream s (i64 0) (i32 4)))
+      (ret b)))
+  (block same (br (icmp eq (and b (i64 192)) (i64 128)) cont col))
+  (block cont (ret b))
+  (block col
+    (let ((colp (getelementptr %struct.lir.read.stream s (i64 0) (i32 4))))
+      (store (add (load i64 colp) (i64 1)) colp)
+      (ret b))))
+")
+
+(defun part-1 :private () -> str
+  "(define (lir.read.position i64) ((ptr s))
+  (block entry
+    (ret (or (shl (load i64 (getelementptr %struct.lir.read.stream s (i64 0) (i32 3))) (i64 32))
+             (load i64 (getelementptr %struct.lir.read.stream s (i64 0) (i32 4)))))))
+
+(define internal (lir.read.hook i64) ((ptr s) (i64 code))
+  (block entry
+    (ret (indirect-call (load ptr (getelementptr %struct.lir.read.stream s (i64 0) (i32 7))) (fn i64 (ptr i64 i64))
+                        (load ptr (getelementptr %struct.lir.read.stream s (i64 0) (i32 6))) (ptrtoint i64 s) code))))
+
+(define (lir.read.form ptr) ((ptr s)) (block entry (ret (inttoptr ptr (call @lir.read.hook s (i64 0))))))
+(define (lir.read.skip i64) ((ptr s)) (block entry (ret (call @lir.read.hook s (i64 1)))))
+
+(define (lir.read.fail ptr) ((ptr s) (i64 at) (ptr message))
+  (block entry
+    (store message (getelementptr %struct.lir.read.stream s (i64 0) (i32 8)))
+    (store at (getelementptr %struct.lir.read.stream s (i64 0) (i32 9)))
+    (ret (ptr null))))
+")

@@ -61,10 +61,10 @@ one() {
   if [ $ns -eq 124 ]; then echo "skip $name: the native run timed out"; return; fi
   sed -i '/^lir\.own: /d' "$d/n.err"   # the ownership verifier's report-mode summary (spec/lir.md 6.14.5) is the checker's line, printed by `lairf run` before the program runs; lir2js prints it when it translates
   reject=0; grep -q '^;; expect: reject' "$f" && reject=1
-  # A file that defines or requires macros (spec/lir.md 4.6): lir2js has no compile-time runtime, so it reads the expanded lIR `lairf expand`
-  # prints; an expansion lairf refuses is the verdict lir2js is compared with (the backend never sees such a module). A file with no macros goes
-  # to lir2js as it is, so that a diagnostic's position is the file's.
-  if grep -qE '^\((define-macro|require-macros|import) ' "$f"; then
+  # A file that defines or requires macros (spec/lir.md 4.6), imports (4.7) or defines reader macros (4.8): lir2js has no compile-time runtime, so it
+  # reads the expanded lIR `lairf expand` prints; an expansion lairf refuses is the verdict lir2js is compared with (the backend never sees such a
+  # module). A file with none goes to lir2js as it is, so that a diagnostic's position is the file's.
+  if grep -qE '^\((define-macro|require-macros|import|define-reader-macro|define-dispatch-macro|define-token-reader) ' "$f"; then
     "$LAIRF" expand "$f" > "$d/x.lir" 2> "$d/x.err"; xs=$?
     if [ $xs -ne 0 ]; then
       if [ $reject -eq 1 ] && [ $xs -eq $ns ] && cmp -s "$d/n.err" "$d/x.err"; then echo "pass $name"; else echo "differ $name: lairf expand failed with exit $xs, native $ns: $(head -c 150 "$d/x.err")"; fi
