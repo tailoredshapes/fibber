@@ -96,12 +96,14 @@
 
 ;; The arguments of the entry: the stream, and for the token reader the token's form as an object.
 (defun arguments :private (s: ptr tok: (Option Sexp)) -> (Vec i64)
-  (match tok
-    (nil [(ffi/ptr->addr s)])
-    ((some t) [(ffi/ptr->addr s) (obj/to-object t (unsafe (load-ptr (ptr+ s 40))))])))
+  (let ((file (unsafe (load-ptr (ptr+ s 40)))))
+    (match tok
+      (nil [(ffi/ptr->addr s)])
+      ((some (SxAtom text pos)) [(ffi/ptr->addr s) (obj/symbol-object text pos file)])
+      ((some t) [(ffi/ptr->addr s) (obj/to-object t file)]))))
 
-(defun run-on :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr mb: call/Mailbox e: ReaderEntry pos: i64 tok: (Option Sexp)) -> (Result (Option Sexp) Diagnostic)
-  (match (call/call-start mb (. e addr) (arguments s tok))
+(defun run-on :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr mb: call/Mailbox e: ReaderEntry pos: i64 tok: (Option Sexp) nested: bool) -> (Result (Option Sexp) Diagnostic)
+  (match (if nested (call/call-nest mb (. e addr) (arguments s tok)) (call/call-start mb (. e addr) (arguments s tok)))
     ((Err m) (err pos (str (. e name) ": " m)))
     ((Ok _) (match (serve rs st src file rd s mb)
               ((Err m) (err pos (str (. e name) ": " m)))

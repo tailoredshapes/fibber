@@ -401,6 +401,7 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(string "define")`), copied |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
 | `(lir.sexp.list bracket) : ptr` | an empty list with that bracket |
+| `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
 | `(lir.sexp.push l x) : ptr` | `x` appended to the list `l`, which grows; `l` |
 | `(lir.sexp.count l) : i64`, `(lir.sexp.nth l i) : ptr`, `(lir.sexp.bracket l) : i64` | a list's count, its `i`th item (null out of range), its bracket |
 | `(lir.sexp.text s) : ptr`, `(lir.sexp.len s) : i64` | a symbol's or a string's bytes (NUL-terminated) and count |
@@ -557,9 +558,15 @@ and `;` included (`#(`, `#;`), since the `#` is read first. A later binding of a
 it. `#`, once any dispatch macro is bound and `#` itself is not a reader macro, runs the dispatch macro of the character after it with the
 stream after both; `#` before an unbound character is `no dispatch macro for #C` at the `#`, and at the end of the text `unexpected end
 of input after #`. With `#` bound as a reader macro, that macro runs and the dispatch macros are not reached. Anything else is lIR's own
-syntax; an atom (§1: its delimiters are the reader's, so `7/2`, `1_000` and `1.5f32` are one atom each) is read as it always was, and
-when the module has a token reader it is then called with the stream after the atom and the atom's form (an integer, a float or a symbol:
-`1_000` arrives as the symbol `1_000`), and what it returns is the form. The form a macro returns is at the position of the first
+syntax; an atom (§1: its delimiters are the reader's and the classes', so `7/2`, `1_000` and `1.5f32` are one atom each) is read as it
+always was, and when the module has a token reader it is then called with the stream after the atom and the atom's text as a
+**symbol** object, whatever the text (`42` and `1.5` arrive as the symbols `42` and `1.5`: a number of lIR's is the token reader's to
+read, and the parser reads an atom by its text, so a token reader that returns the symbol `42` as it is still gives the parser the
+integer 42); what it returns is the form. **A symbol stays a symbol.** An atom of the text is classified by its text once, when it first
+becomes an object (§4.6: an integer token an integer, a float token a float, else a symbol); a symbol object, one a macro made with
+`lir.sexp.symbol` or the token reader was given, keeps its kind at every later macro boundary, whatever its text: `.5`, `inf` and `1e3`
+made as symbols are symbols to the next macro, and the parser reads their text as it reads any atom's. A macro that wants a float from
+digits it read makes one with `lir.sexp.float-text` (§4.6). The form a macro returns is at the position of the first
 character (the `'` of `'x`, the `#` of `#(..)`); a form it read with `lir.read.form` keeps its own position
 (`cases/lir/readers/positions.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
 stood there, inside a list or at the top level, which is how `#_` discards the next form (`cases/lir/readers/discard.lir`). A failure

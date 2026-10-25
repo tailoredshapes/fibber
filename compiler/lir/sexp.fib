@@ -15,7 +15,8 @@
   (SxList items: (Vec Sexp) pos: i64)                  ;; ( ... )
   (SxBrace items: (Vec Sexp) pos: i64)                 ;; { ... }
   (SxBracket items: (Vec Sexp) pos: i64)               ;; [ ... ]: an array type [N x T]
-  (SxAtom text: str pos: i64)                          ;; a symbol, number, @name or %struct.name
+  (SxAtom text: str pos: i64)                          ;; a symbol, number, @name or %struct.name, as the text had it
+  (SxSymbol text: str pos: i64)                        ;; a symbol a macro made or passed on: its text is never read as a number again (§4.8)
   (SxStr bytes: (Array i8) pos: i64)                   ;; "..." after its escapes: any bytes, not necessarily UTF-8
   (SxVecType n: str elem: str pos: i64))               ;; <N x E>, normalised to N and the element's text
 
@@ -23,21 +24,32 @@
 (defun sexp-pos (s: Sexp) -> i64
   (match s
     ((SxList _ p) p) ((SxBrace _ p) p) ((SxBracket _ p) p)
-    ((SxAtom _ p) p) ((SxStr _ p) p) ((SxVecType _ _ p) p)))
+    ((SxAtom _ p) p) ((SxSymbol _ p) p) ((SxStr _ p) p) ((SxVecType _ _ p) p)))
 
 ;; The atom's text, if this is an atom (sexp/mod.rs `Sexp::atom`).
 (defun sexp-atom (s: Sexp) -> (Option str)
-  (match s ((SxAtom a _) (some a)) (_ nil)))
+  (match s ((SxAtom a _) (some a)) ((SxSymbol a _) (some a)) (_ nil)))
 
 ;; A short description for error messages: the atom, or the head of a list (sexp/mod.rs `Sexp::describe`).
 (defun sexp-describe (s: Sexp) -> str
   (match s
     ((SxAtom a _) a)
+    ((SxSymbol a _) a)
     ((SxList items _) (if (= (count items) 0) "()" (sexp-describe (nth items 0))))
     ((SxBrace _ _) "{ … }")
     ((SxBracket items _) (str "[" (str-join-with " " (vec (map sexp-describe items))) "]"))
     ((SxStr _ _) "a string")
     ((SxVecType n e _) (str "<" n " x " e ">"))))
+
+;; The form as the parser takes it: every symbol an atom (the parser reads atoms by their text; the symbol kind matters at the macro
+;; boundaries only, where the objects are made).
+(defun sexp-plain (s: Sexp) -> Sexp
+  (match s
+    ((SxSymbol a p) (SxAtom a p))
+    ((SxList items p) (SxList (mapv sexp-plain items) p))
+    ((SxBrace items p) (SxBrace (mapv sexp-plain items) p))
+    ((SxBracket items p) (SxBracket (mapv sexp-plain items) p))
+    (_ s)))
 
 ;; The readtable of a module (spec/lir.md 4.7): what the reader does at a byte besides its own syntax. A reader macro by its byte, a dispatch
 ;; macro by the byte after `#`, and the token reader; `active` once anything is bound, so a reader with no bindings pays one load per form.
@@ -213,8 +225,8 @@
 
 ;; `read-form` under the readtable: a bound byte runs its reader macro with the stream after it; `#` with a dispatch macro bound runs the
 ;; one of the byte after it, with the stream after both; otherwise lIR's own syntax, and an atom goes through the token reader when there is
-;; one, with the stream after the atom and the atom's form.
-(defun read-form-with :private (rd: Reader depth: i64 run: Runner) -> (Option Diagnostic)
+;; one, with the stream after the atom and the atom's text as a symbol.
+(defun read-form-with :private (rd: Reader run: Runner) -> (Option Diagnostic)
   (let ((lx (. rd lx)) (t (. rd table)) (pos (lex-pos lx)) (b (lex-byte lx)))
     (match (get @(. t chars) b)
       ((some e) (do (bump lx) (run-entry rd run e pos nil)))

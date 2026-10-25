@@ -97,11 +97,12 @@
              (nil (recur (+ i 1)))))))
     (_ nil)))
 
-;; The form, its children expanded, parsed as an item.
+;; The form, its children expanded, parsed as an item (every symbol a macro made an atom to the parser: `sexp-plain`, needed only where a
+;; macro or a reader macro could have run).
 (defun parse-top :private (env: Env items: (Cell (Vec LItem)) r: Sexp) -> (Option Diagnostic)
   (match (if (empty? @(. env macros)) (Ok r) (expand env r))
     ((Err d) (some d))
-    ((Ok f) (match (items/parse-item f)
+    ((Ok f) (match (items/parse-item (if (or (not (empty? @(. env macros))) @(. (. (. env readers) table) active)) (sexp-plain f) f))
               ((Err d) (some d))
               ((Ok it) (do (update! items (fn (v) (conj v it))) nil))))))
 
@@ -116,7 +117,7 @@
 ;; ---------------------------------------------------------------- expansion
 
 (defun macro-of :private (env: Env its: (Vec Sexp)) -> (Option Macro)
-  (if (empty? its) nil (match (nth its 0) ((SxAtom a _) (get @(. env macros) a)) (_ nil))))
+  (if (empty? its) nil (match (sexp-atom (nth its 0)) ((some a) (get @(. env macros) a)) (nil nil))))
 
 (defun expand-all :private (env: Env its: (Vec Sexp)) -> (Result (Vec Sexp) Diagnostic)
   (loop ((i 0) (out []))
@@ -264,7 +265,7 @@
   (try-let ((forms (read (str (lib/declares-source) "\n" (readlib/declares-source) "\n" (macro-declares env s)))))
     (loop ((i 0) (out []))
       (if (>= i (count forms))
-          (match (items/parse-item def) ((Err d) (Err d)) ((Ok it) (Ok (LModule (conj out it)))))
+          (match (items/parse-item (sexp-plain def)) ((Err d) (Err d)) ((Ok it) (Ok (LModule (conj out it)))))
           (match (items/parse-item (nth forms i)) ((Err d) (Err d)) ((Ok it) (recur (+ i 1) (conj out it))))))))
 
 ;; The error of a macro's module the session refused: the checker's first diagnostic, where it is in the file, or the JIT's text.
@@ -310,6 +311,63 @@
 
 (defun reader-form? :private (head: str) -> bool
   (or (= head "define-reader-macro") (= head "define-dispatch-macro") (= head "define-token-reader")))
+
+(defun reader-setting? :private (head: str) -> bool
+  (or (= head "define-reader-class") (= head "define-reader-depth")))
+
+;; `(define-reader-class "C" whitespace|constituent|terminating)`: the class of the character C (one UTF-8 character; not `(`, `)` or `;`)
+;; in the module's readtable; `(define-reader-depth N)`: the nesting the reader allows, 1 to 4096.
+(defun define-reader-setting :private (env: Env head: str form: Sexp) -> (Option Diagnostic)
+  (let ((t (. (. env readers) table)))
+    (match form
+      ((SxList its pos)
+       (cond (and (= head "define-reader-class") (= (count its) 3))
+             (match (try-let ((c (class-char (nth its 1))) (k (class-kind (nth its 2)))) (Ok (readtable-class! t c k)))
+               ((Err d) (some d))
+               ((Ok _) nil))
+             (and (= head "define-reader-depth") (= (count its) 2))
+             (match (class-depth (nth its 1))
+               ((Err d) (some d))
+               ((Ok n) (do (readtable-depth! t n) nil)))
+             :else (some (Diagnostic pos (setting-usage head)))))
+      (_ (some (Diagnostic (sexp-pos form) (setting-usage head)))))))
+
+(defun setting-usage :private (head: str) -> str
+  (if (= head "define-reader-depth") "define-reader-depth expects a count from 1 to 4096" "define-reader-class expects a character and whitespace, constituent or terminating"))
+
+;; The one character of a string, as a Unicode scalar; lIR's own `(`, `)` and `;` are refused.
+(defun class-char :private (s: Sexp) -> (Result i64 Diagnostic)
+  (match s
+    ((SxStr bs pos)
+     (match (scalar-of bs)
+       (nil (err pos "define-reader-class: the character must be a string of one character"))
+       ((some c) (if (or (= c 40) (= c 41) (= c 59))
+                     (err pos (str "define-reader-class: cannot change " (str-from-bytes bs) ", which is lIR's own"))
+                     (Ok c)))))
+    (_ (err (sexp-pos s) "define-reader-class: the character must be a string of one character"))))
+
+;; The scalar of exactly one UTF-8 character, nil for any other byte count.
+(defun scalar-of :private (bs: (Array i8)) -> (Option i64)
+  (let ((n (array-len bs)) (b0 (if (> n 0) (zext i64 (array-get bs 0)) -1)))
+    (let ((w (cond (< b0 0) 0 (< b0 128) 1 (< b0 192) 0 (< b0 224) 2 (< b0 240) 3 :else 4))
+          (at (fn (i: i64) -> i64 (bit-and (zext i64 (array-get bs i)) 63))))
+      (if (or (= w 0) (not (= n w)))
+          nil
+          (some (cond (= w 1) b0
+                      (= w 2) (bit-or (shl (bit-and b0 31) 6) (at 1))
+                      (= w 3) (bit-or (bit-or (shl (bit-and b0 15) 12) (shl (at 1) 6)) (at 2))
+                      :else (bit-or (bit-or (bit-or (shl (bit-and b0 7) 18) (shl (at 1) 12)) (shl (at 2) 6)) (at 3))))))))
+
+(defun class-kind :private (s: Sexp) -> (Result i64 Diagnostic)
+  (cond (names/atom-is? s "whitespace") (Ok class-whitespace)
+        (names/atom-is? s "constituent") (Ok class-constituent)
+        (names/atom-is? s "terminating") (Ok class-terminating)
+        :else (err (sexp-pos s) "define-reader-class: the class is whitespace, constituent or terminating")))
+
+(defun class-depth :private (s: Sexp) -> (Result i64 Diagnostic)
+  (match (match (sexp-atom s) ((some a) (parse-long a)) (nil nil))
+    ((some n) (if (and (>= n 1) (<= n max-depth-setting)) (Ok n) (err (sexp-pos s) (setting-usage "define-reader-depth"))))
+    (nil (err (sexp-pos s) (setting-usage "define-reader-depth")))))
 
 ;; `(define-reader-macro "C" (STREAM) BLOCK..)`, `(define-dispatch-macro "C" (STREAM) BLOCK..)`, `(define-token-reader (STREAM TOKEN) BLOCK..)`:
 ;; the body compiled as a macro's is, under a name of its own, and bound in the module's readtable for the forms after this one.
