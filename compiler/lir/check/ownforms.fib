@@ -1,0 +1,66 @@
+;; compiler/lir/check/ownforms.fib: the type rules of the ownership forms (spec/lir.md 6.14.3; lir.intrin's class `own`). The kinds and
+;; the ten rules are lir.own's, after the whole function is typed; here only the operand and result types, in evaluation order.
+
+(ns lir.check.ownforms
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin lir.check.env lir.check.fcx lir.check.memory))
+
+
+;; The type of the form (nil for void).
+(defun check-own-form (fcx: Fcx name: str ty: (Option LType) args: (Vec LExpr) pos: i64) -> (Result (Option LType) Diagnostic)
+  (cond (= name "managed-null") (Ok (some ty-managed))
+        (or (= name "copy-value") (= name "destroy-value") (= name "is-unique") (= name "dealloc-stack")) (check-value-form fcx name (nth args 0) pos)
+        (or (= name "alloc-object") (= name "alloc-stack")) (check-alloc fcx name (unwrap-or ty ty-i32) args pos)
+        (starts-with? name "load-") (check-own-load fcx name (unwrap-or ty ty-i32) (nth args 0) pos)
+        (starts-with? name "store-") (check-own-store fcx name (nth args 0) (nth args 1) pos)
+        :else (check-addrspacecast fcx (unwrap-or ty ty-i32) (nth args 0) pos)))
+
+;; `(copy-value v)` is `(ptr 1)`, `(destroy-value v)` and `(dealloc-stack v)` void, `(is-unique v)` i1; `v : (ptr 1)`.
+(defun check-value-form :private (fcx: Fcx name: str v: LExpr pos: i64) -> (Result (Option LType) Diagnostic)
+  (try-let ((t (managed-operand fcx name v pos)))
+    (Ok (cond (= name "copy-value") (some ty-managed)
+              (= name "is-unique") (some ty-i1)
+              :else nil))))
+
+(defun managed-operand :private (fcx: Fcx name: str v: LExpr pos: i64) -> (Result unit Diagnostic)
+  (try-let ((t (fcx-val fcx v)))
+    (if (type-managed? t) (Ok ()) (err pos (str name " needs a (ptr 1) operand, found " (type-str t))))))
+
+;; `(alloc-object %struct.T tid n?)`, `(alloc-stack %struct.T tid)`: a defined struct, `tid : i32`, `n : i64`; `(ptr 1)`.
+(defun check-alloc :private (fcx: Fcx name: str ty: LType args: (Vec LExpr) pos: i64) -> (Result (Option LType) Diagnostic)
+  (try-let ((_ (fcx-valid fcx ty pos))
+            (_ (match ty ((TNamed _) (Ok ())) (_ (err pos (str name " needs a struct type, found " (type-str ty))))))
+            (tid (fcx-val fcx (nth args 0)))
+            (_ (if (= tid ty-i32) (Ok ()) (err pos (str name ": the type id must be an i32, found " (type-str tid))))))
+    (if (= (count args) 1)
+        (Ok (some ty-managed))
+        (try-let ((n (fcx-val fcx (nth args 1))))
+          (cond (not (= n ty-i64)) (err pos (str name ": the count must be an i64, found " (type-str n)))
+                (not (trailing-array? fcx ty)) (err pos (str name " with a count needs a struct whose last field is [0 x E], found " (type-str ty)))
+                :else (Ok (some ty-managed)))))))
+
+;; Whether the struct's last field is a `[0 x E]`.
+(defun trailing-array? :private (fcx: Fcx ty: LType) -> bool
+  (match (env-fields (. fcx env) ty)
+    ((some fs) (and (> (count fs) 0) (match (nth fs (- (count fs) 1)) ((TArray 0 _) true) (_ false))))
+    (nil false)))
+
+;; `(load WORD (ptr 1) a)`: the type is `(ptr 1)`, `a` a ptr or an interior address; `(ptr 1)`.
+(defun check-own-load :private (fcx: Fcx name: str ty: LType a: LExpr pos: i64) -> (Result (Option LType) Diagnostic)
+  (let ((w (str "load " (own-access-word name))))
+    (try-let ((_ (if (type-managed? ty) (Ok ()) (err pos (str w " needs (ptr 1), found " (type-str ty)))))
+              (_ (pointer fcx w a pos)))
+      (Ok (some ty-managed)))))
+
+;; `(store WORD v a)`: `v : (ptr 1)`, `a` a ptr or an interior address; void.
+(defun check-own-store :private (fcx: Fcx name: str v: LExpr a: LExpr pos: i64) -> (Result (Option LType) Diagnostic)
+  (let ((w (str "store " (own-access-word name))))
+    (try-let ((_ (managed-operand fcx w v pos))
+              (_ (pointer fcx w a pos)))
+      (Ok nil))))
+
+;; `(addrspacecast T v)`: between `ptr` and `(ptr 1)`, one each way (spec/lir.md 6.14.4); the fence is lir.own's rule 9.
+(defun check-addrspacecast :private (fcx: Fcx ty: LType v: LExpr pos: i64) -> (Result (Option LType) Diagnostic)
+  (try-let ((t (fcx-val fcx v)))
+    (cond (and (type-managed? ty) (= t ty-ptr)) (Ok (some ty-managed))
+          (and (= ty ty-ptr) (type-managed? t)) (Ok (some ty-ptr))
+          :else (err pos (str "addrspacecast converts between ptr and (ptr 1), found " (type-str t) " to " (type-str ty))))))

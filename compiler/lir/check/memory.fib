@@ -38,10 +38,10 @@
           (p (nth xs i)) (some (nth xs i))
           :else (recur (+ i 1)))))
 
-;; The operand must be a ptr.
-(defun pointer :private (fcx: Fcx op: str e: LExpr pos: i64) -> (Result unit Diagnostic)
+;; The operand must be a ptr, or an interior address of a managed object, which is `(ptr 1)` (spec/lir.md 6.14.3); the type found.
+(defun pointer (fcx: Fcx op: str e: LExpr pos: i64) -> (Result LType Diagnostic)
   (try-let ((t (fcx-val fcx e)))
-    (if (= t ty-ptr) (Ok ()) (err pos (str op " needs a ptr operand, found " (type-str t))))))
+    (if (or (= t ty-ptr) (type-managed? t)) (Ok t) (err pos (str op " needs a ptr operand, found " (type-str t))))))
 
 ;; The typed direct-access rule (spec/lir.md 6.5), on the environment and the uncounted allocas only. (memory.rs `direct`)
 (defun direct (fcx: Fcx op: str ty: LType ptr: LExpr pos: i64) -> (Result unit Diagnostic)
@@ -105,10 +105,11 @@
       ((some g) (err pos (str "store to constant @" g)))
       (nil (direct fcx "store" tv ptr pos)))))
 
+;; The result keeps the base's type: `ptr`, or `(ptr 1)` for an interior address of a managed object (spec/lir.md 6.14.3).
 (defun check-gep :private (fcx: Fcx ty: LType ptr: LExpr idx: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
   (try-let ((valid (fcx-valid fcx ty pos))
             (p (pointer fcx "getelementptr" ptr pos)))
-    (loop ((k 0) (cur ty) (result ty-ptr))
+    (loop ((k 0) (cur ty) (result p))
       (if (>= k (count idx))
           (Ok result)
           (match (fcx-val fcx (nth idx k))

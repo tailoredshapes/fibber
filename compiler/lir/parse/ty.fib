@@ -30,14 +30,27 @@
           ((Err d) (Err d))
           ((Ok t) (recur (+ i 1) (conj out t)))))))
 
-;; A type: a scalar keyword, `%struct.NAME`, `<N x E>` (1 to 1024 lanes), `{ T* }`, `[N x T]` (N up to 4294967295). (ty.rs `parse_type`)
+;; A type: a scalar keyword, `%struct.NAME`, `<N x E>` (1 to 1024 lanes), `{ T* }`, `[N x T]` (N up to 4294967295), `(ptr 1)` and the
+;; parameter kind `(owned (ptr 1))` (spec/lir.md 6.14). (ty.rs `parse_type`)
 (defun parse-type (s: Sexp) -> (Result LType Diagnostic)
   (match s
     ((SxAtom a p) (atom-type a p))
     ((SxVecType n e p) (vector-type n e p))
     ((SxBrace items _) (try-let ((ts (parse-types items))) (Ok (TAnon ts))))
     ((SxBracket items p) (array-type items p))
+    ((SxList items p) (list-type items p))
     (_ (err (sexp-pos s) (str "expected a type, found " (sexp-describe s))))))
+
+;; `(ptr 1)`: the managed reference; `(owned (ptr 1))`: a parameter of the owned kind.
+(defun list-type :private (items: (Vec Sexp) p: i64) -> (Result LType Diagnostic)
+  (cond (and (= (count items) 2) (atom-is? (nth items 0) "ptr"))
+        (if (atom-is? (nth items 1) "1") (Ok ty-managed) (err p (str "ptr: the only address space is 1, found " (sexp-describe (nth items 1)))))
+        (and (= (count items) 2) (atom-is? (nth items 0) "owned"))
+        (try-let ((t (parse-type (nth items 1))))
+          (if (type-managed? t) (Ok ty-owned) (err p (str "owned needs (ptr 1), found " (type-str t)))))
+        (and (> (count items) 0) (atom-is? (nth items 0) "ptr")) (err p "ptr with an address space is (ptr 1)")
+        (and (> (count items) 0) (atom-is? (nth items 0) "owned")) (err p "owned is (owned (ptr 1))")
+        :else (err p (str "expected a type, found " (if (= (count items) 0) "()" (sexp-describe (nth items 0)))))))
 
 (defun atom-type :private (a: str p: i64) -> (Result LType Diagnostic)
   (match (scalar-keyword a)

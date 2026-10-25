@@ -39,9 +39,12 @@
 (defun lower-intrin (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
   (match (. e kind)
     ((KIntrin name flags ty args align)
-     (match (fx-vals fx args)
-       ((Err x) (Err x))
-       ((Ok vs) (Ok (if (intrin-fact? name) (lower-fact fx e vs) (intrin-value fx name flags ty vs align))))))
+     (if (intrin-own? name)
+         ;; The ownership forms are erased before lowering (spec/lir.md 6.14.7, lir.own.erase).
+         (Err (ErrInternal (str "ownership form " name " reached the lowering unerased, at " (pos-str (. e pos)))))
+         (match (fx-vals fx args)
+           ((Err x) (Err x))
+           ((Ok vs) (Ok (if (intrin-fact? name) (lower-fact fx e vs) (intrin-value fx name flags ty vs align)))))))
     (_ (Err (ErrInternal (str "unexpected form at " (pos-str (. e pos))))))))
 
 (defun intrin-value :private (fx: Fx name: str flags: i64 ty: (Option LType) vs: (Vec i64) align: (Option i64)) -> (Option i64)
