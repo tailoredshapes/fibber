@@ -353,8 +353,9 @@ the elements of the splice were read before it ran, so a binding it makes reache
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
 may expand to a use of an earlier one, and its own body may use one), and its function `@lir.macro.NAME` is declared in the bodies of
-later macros, which may call it (`cases/lir/macros/position.lir`). A body holds blocks only: it declares nothing else, and calls nothing
-of the C library or of the module. `(require-macros "FILE")` defines, in the requiring module, the
+later macros, which may call it (`cases/lir/macros/position.lir`); a body may call its own function too, which is the module's own
+`define`, so a macro recurses over the forms it is given directly (`cases/lir/macros/self-recursive.lir`). A body holds blocks only: it
+declares nothing else, and calls nothing of the C library or of the module. `(require-macros "FILE")` defines, in the requiring module, the
 macros of the library `FILE`, a text of `define-macro` and `require-macros` forms and nothing else (`expected define-macro or
 require-macros, found declare`): a library is not a module, there is nothing to link its items into (ADR 0024). `FILE` is read as written
 when absolute, else beside the requiring file (`cases/lir/macros/x.lir` requires `"../../../lib/lir/defun.lir"`), or relative to the
@@ -405,7 +406,19 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.int s) : i64`, `(lir.sexp.flt s) : double` | an integer's or a float's value |
 | `(lir.sexp.is s cstr) : i1` | whether `s` is the symbol with that text |
 | `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the module |
+| `(lir.sexp.expand form) : ptr` | the form expanded through the module's macros as the expander would (outermost first, then the children), as an object; null when that expansion fails, and its error is then the use's (below) |
 | `(lir.sexp.fail at message) : ptr` | the expansion fails with `macro NAME: MESSAGE` at the object `at` (null: at the use); returns null, for the macro to return |
+
+**Expansion from a macro, and macro-time state.** A lowering macro delegates: `lir.sexp.expand` hands a form back to the expander, which
+expands it through the macros the module has at that point (a use of the calling macro included) and returns the result as objects; a
+macro runs on a worker of its session for this, parked while the expander answers, and a nested use runs on the next worker. When the
+nested expansion fails, the macro gets null and the nested error, where it is, is the use's error whatever the macro then returns
+(`cases/lir/macros/expand-delegate.lir`, `reject-expand-fails.lir`); a reader macro (§4.8) runs while the text is read and has no
+expansion to call: null. 
+
+
+
+
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
 list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a

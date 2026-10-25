@@ -9,7 +9,7 @@
 (defun lib-source () -> str
   (str-join [(part-0) "\n" (part-1) "\n" (part-2) "\n" (part-3)]))
 
-;; What a macro's module declares of it (`lir.sexp.failure-take` and `failure-at` are the runner's, not a macro's).
+;; What a macro's module declares of it (`lir.sexp.failure-take`, `failure-at` and `set-hook` are the runner's, not a macro's).
 (defun declares-source () -> str
   "(declare lir.sexp.tag i64 (ptr))
 (declare lir.sexp.line i64 (ptr))
@@ -31,6 +31,7 @@
 (declare lir.sexp.is i1 (ptr ptr))
 (declare lir.sexp.gensym ptr (ptr))
 (declare lir.sexp.fail ptr (ptr ptr))
+(declare lir.sexp.expand ptr (ptr))
 ")
 
 (defun part-0 :private () -> str
@@ -162,4 +163,14 @@
     (let ((p (load i64 @lir.sexp.failure.at)))
       (store (i64 0) @lir.sexp.failure.at)
       (ret p))))
+
+;; the runner's: the hook `lir.sexp.expand` calls (lair_mb_hook1) and the mailbox it parks on
+(global internal lir.sexp.hook ptr (ptr null))
+(global internal lir.sexp.mailbox ptr (ptr null))
+(define (lir.sexp.set-hook void) ((ptr hook) (ptr mailbox))
+  (block entry (store hook @lir.sexp.hook) (store mailbox @lir.sexp.mailbox) (ret)))
+;; the form expanded through the module's macros (spec/lir.md 4.6): a hook call the runner answers; null when the expansion failed
+(define (lir.sexp.expand ptr) ((ptr form))
+  (block entry
+    (ret (inttoptr ptr (indirect-call (load ptr @lir.sexp.hook) (fn i64 (ptr i64)) (load ptr @lir.sexp.mailbox) (ptrtoint i64 form))))))
 ")

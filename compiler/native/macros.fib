@@ -14,11 +14,13 @@
 ;; A defined macro: its entry, a ccc function of `fixed` ptr parameters and one more for the rest when `rest`; the file it was defined in
 ;; (an imported module exports the macros of its own file, spec/lir.md 4.7); and the two entries of the session it lives in, which the runner
 ;; calls when it returns null (`lir.sexp.failure-take`, `lir.sexp.failure-at`): a macro of an imported module runs in that module's session.
-(defstruct Macro (name: str entry: i64 fixed: i64 rest: bool file: str take: i64 at: i64))
+(defstruct Macro (name: str entry: i64 fixed: i64 rest: bool file: str take: i64 at: i64 session: Session))
 
 ;; The macro session of a module, made at its first `define-macro` and freed when the program is parsed (`env-close`): the library's two
 ;; entries the runner calls.
-(defstruct Session (jit: jit/JitSession take: i64 at: i64))
+;; `set-hook` is the library's entry that names the hook and the mailbox `lir.sexp.expand` parks on; a macro runs on the mailbox of its
+;; depth (`mailboxes`, made as needed, one per nesting of `lir.sexp.expand`); `pending` is the error of a nested expansion, the use's error.
+(defstruct Session (jit: jit/JitSession take: i64 at: i64 set-hook: i64 mailboxes: (Cell (Vec call/Mailbox)) depth: (Cell i64) pending: (Cell (Option Diagnostic))))
 
 ;; What `(import "FILE")` does (spec/lir.md 4.7), given the importing module's environment, the file as written and the form's position:
 ;; native.imports loads the module and defines its macros in the environment; the interface items are the loader's to keep. The macros
@@ -45,6 +47,10 @@
   (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{(canonical file)})) (cell 0)
        (readers/readers-new) (cell 0)))
 
+;; The environment of a file read for the module of `env` (a library): the file's own name, everything else the module's.
+(defun env-sub :private (env: Env path: str) -> Env
+  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq)))
+
 ;; The file as the objects carry it: a C string that lives as long as they do, null for none.
 (defun file-cstr :private (file: str) -> ptr
   (if (= file "") (ffi/addr->ptr 0) (ffi/bytes-new file)))
@@ -63,7 +69,8 @@
   (do (readers/readers-close (. env readers))
       (match @(. env session)
         (nil ())
-        ((some s) (do (jit/session-free (. s jit))
+        ((some s) (do (doseq [mb @(. s mailboxes)] (call/call-free mb))
+                      (jit/session-free (. s jit))
                       (when (timing/enabled?) (eprintln (str "time lir.macros " (quot @(. env ns) 1000000) " ms"))))))))
 
 (defun head-of :private (form: Sexp) -> str
@@ -168,10 +175,10 @@
   (let ((n (- (count its) 1)) (t0 (sys-clock-now)))
     (if (or (< n (. m fixed)) (and (not (. m rest)) (> n (. m fixed))))
         (err pos (str "macro " (. m name) " expects " (arity-text m) ", found " n))
-        (let ((r (call/call-i64 (. m entry) (argument-objects env m its pos))))
+        (let ((r (run-entry env m (argument-objects env m its pos) pos)))
           (do (set! (. env ns) (+ @(. env ns) (- (sys-clock-now) t0)))
               (match r
-                ((Err e) (err pos (str "macro " (. m name) ": " e)))
+                ((Err d) (Err d))
                 ((Ok a) (if (= a 0)
                             (Err (failure m pos))
                             (match (obj/from-object a pos)
@@ -180,6 +187,57 @@
 
 (defun word-or-zero :private (r: (Result i64 str)) -> i64
   (match r ((Ok v) v) ((Err _) 0)))
+
+;; ---------------------------------------------------------------- running an entry
+
+(defun str-err :private (r: (Result a str) m: Macro pos: i64) -> (Result a Diagnostic)
+  (match r ((Ok v) (Ok v)) ((Err e) (err pos (str "macro " (. m name) ": " e)))))
+
+;; The session's mailbox of depth `d`, made when the depth is first reached.
+(defun mailbox-at :private (s: Session d: i64 m: Macro pos: i64) -> (Result call/Mailbox Diagnostic)
+  (if (< d (count @(. s mailboxes)))
+      (Ok (nth @(. s mailboxes) d))
+      (match (str-err (call/call-new) m pos)
+        ((Err e) (Err e))
+        ((Ok mb) (do (set! (. s mailboxes) (conj @(. s mailboxes) mb)) (Ok mb))))))
+
+;; `lir.sexp.expand` of the session parks on `mb` from now on.
+(defun hook-to :private (s: Session mb: call/Mailbox m: Macro pos: i64) -> (Result i64 Diagnostic)
+  (str-err (call/call-i64 (. s set-hook) [(. (call/hook-addresses) one) (. mb handle)]) m pos))
+
+;; Runs the macro's entry on the mailbox of its session's current depth (a nested expansion runs on the next) and answers its hook calls;
+;; the word it returned, or the error of a nested expansion.
+(defun run-entry :private (env: Env m: Macro args: (Vec i64) pos: i64) -> (Result i64 Diagnostic)
+  (let ((s (. m session)) (d @(. s depth)))
+    (try-let ((mb (mailbox-at s d m pos)))
+      (do (set! (. s depth) (+ d 1))
+          (let ((r (try-let ((_ (hook-to s mb m pos))
+                             (_ (str-err (call/call-start mb (. m entry) args) m pos)))
+                     (serve env s mb m pos))))
+            (do (set! (. s depth) d)
+                (when (> d 0) (hook-to s (nth @(. s mailboxes) (- d 1)) m pos))
+                (match @(. s pending)
+                  ((some d2) (do (set! (. s pending) nil) (Err d2)))
+                  (nil r))))))))
+
+;; Answers the hooks until the call returns: a hook of arity 1 is `lir.sexp.expand`.
+(defun serve :private (env: Env s: Session mb: call/Mailbox m: Macro pos: i64) -> (Result i64 Diagnostic)
+  (loop ()
+    (match (call/call-wait mb)
+      ((Err e) (err pos (str "macro " (. m name) ": " e)))
+      ((Ok (call/Done)) (Ok (call/call-result mb)))
+      ((Ok (call/Hook k))
+       (do (call/call-hook-reply mb (if (= k 1) (answer-expand env s (call/call-hook-arg mb 0) pos) 0))
+           (recur))))))
+
+;; `lir.sexp.expand` of the object at `a`: the form expanded through the module's macros (as `expand`, outermost first), as an object;
+;; null, and the error kept for the use, when the expansion fails.
+(defun answer-expand :private (env: Env s: Session a: i64 pos: i64) -> i64
+  (match (obj/from-object a pos)
+    ((Err e) (do (set! (. s pending) (some (Diagnostic pos (str "lir.sexp.expand: " e)))) 0))
+    ((Ok f) (match (expand env f)
+              ((Err d) (do (set! (. s pending) (some d)) 0))
+              ((Ok out) (obj/to-object out (. env cfile)))))))
 
 ;; What a macro that returned null said through `lir.sexp.fail`, at the object it named when it named one: read from the macro's own session.
 (defun failure :private (m: Macro pos: i64) -> Diagnostic
@@ -193,14 +251,16 @@
 (defun lair-str :private (r: (Result a LairError)) -> (Result a str)
   (match r ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e)))))
 
-;; A fast-codegen session with the library in it, and the runner's two entries.
+;; A fast-codegen session with the library in it, and the runner's entries.
 (defun session-new :private () -> (Result Session str)
   (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
             (_ (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))
             (_ (lair-str (jit/session-add-source j "lir.read" (readlib/lib-source))))
             (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
-            (at (lair-str (jit/session-address j "lir.sexp.failure-at"))))
-    (Ok (Session j take at))))
+            (at (lair-str (jit/session-address j "lir.sexp.failure-at")))
+            (set-hook (lair-str (jit/session-address j "lir.sexp.set-hook")))
+)
+    (Ok (Session j take at set-hook (cell []) (cell 0) (cell nil)))))
 
 (defun session-of :private (env: Env) -> (Result Session str)
   (match @(. env session)
@@ -292,7 +352,7 @@
 (defun compile-macro :private (env: Env name: str ps: Params blocks: (Vec Sexp) pos: i64) -> (Result unit Diagnostic)
   (try-let ((s (match (session-of env) ((Err e) (err pos (str "macro " name ": " e))) ((Ok s) (Ok s))))
             (entry (compile-entry env s (str "macro " name) (str "lir.macro." name) ps blocks pos)))
-    (do (set! (. env macros) (assoc @(. env macros) name (Macro name entry (- (count (. ps names)) (if (. ps rest) 1 0)) (. ps rest) (. env file) (. s take) (. s at))))
+    (do (set! (. env macros) (assoc @(. env macros) name (Macro name entry (- (count (. ps names)) (if (. ps rest) 1 0)) (. ps rest) (. env file) (. s take) (. s at) s)))
         (Ok ()))))
 
 ;; The function `fname` of parameters `ps` and body `blocks` compiled into the session `s`: its address. Errors carry `what` (`macro NAME`,
@@ -429,7 +489,7 @@
   (match (read-file path)
                 (nil (some (Diagnostic pos (str "require-macros: cannot read " path))))
                 ((some text)
-                 (let ((sub (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq))))
+                 (let ((sub (env-sub env path)))
                    (do (set! (. env loading) (conj @(. env loading) key))
                        (let ((r (readers/read-with (. env readers) text path (fn (f: Sexp) (library-form sub f)))))
                          (do (set! (. env loading) (disj @(. env loading) key))
