@@ -8,7 +8,7 @@
 ;; consults (native.macros.readers runs them).
 (ns native.macros
   (:use lir.diag lir.sexp lir.ast lir.types native.error native.macros.types native.macros.helpers)
-  (:require [lir.parse.items :as items] [lir.parse.names :as names] [lir.words :as words] [native.jit :as jit] [native.call :as call]
+  (:require [lir.parse.items :as items] [lir.parse.names :as names] [native.jit :as jit] [native.call :as call]
             [native.macros.objects :as obj] [native.macros.lib :as lib] [native.macros.readlib :as readlib]
             [native.macros.readers :as readers] [native.macros.readforms :as rf] [native.timing :as timing]))
 
@@ -187,12 +187,11 @@
 
 ;; A fast-codegen session with the library in it, the runner's entries, the program's gensym word `g` given to it (spec/lir.md 4.6: every
 ;; module's session counts in it), and `lir.sexp.expand` told to park on the module's worker (`rs`'s, made now if no reader macro made it):
-;; a reader macro that calls it is answered null by its runner. The two libraries are lair's own lIR text in the old spelling until the
-;; conversion (lir.words), so they are read with it admitted whatever the module's mode.
+;; a reader macro that calls it is answered null by its runner.
 (defun session-new :private (rs: readers/Readers g: i64) -> (Result Session str)
   (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
-            (_ (words/admitting-old (fn () (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))))
-            (_ (words/admitting-old (fn () (lair-str (jit/session-add-source j "lir.read" (readlib/lib-source))))))
+            (_ (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))
+            (_ (lair-str (jit/session-add-source j "lir.read" (readlib/lib-source))))
             (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
             (at (lair-str (jit/session-address j "lir.sexp.failure-at")))
             (set-hook (lair-str (jit/session-address j "lir.sexp.set-hook")))
@@ -212,17 +211,11 @@
 ;; ---------------------------------------------------------------- define-macro
 
 ;; The items of a macro's module: the library's declarations, the earlier macros', the macro-imported modules' interfaces, then the definition.
-;; The declarations are lair's own text, in the old spelling until the conversion (lir.words), read with it admitted; the definition is the
-;; module's, read in the module's mode.
 (defun macro-module :private (env: Env s: Session def: Sexp) -> (Result LModule Diagnostic)
-  (try-let ((decls (words/admitting-old (fn () (declaration-items env s)))))
-    (match (items/parse-item (sexp-plain def)) ((Err d) (Err d)) ((Ok it) (Ok (LModule (conj (into decls @(. s iface)) it)))))))
-
-(defun declaration-items :private (env: Env s: Session) -> (Result (Vec LItem) Diagnostic)
   (try-let ((forms (read (str (lib/declares-source) "\n" (readlib/declares-source) "\n" (macro-declares env s)))))
     (loop ((i 0) (out []))
       (if (>= i (count forms))
-          (Ok out)
+          (match (items/parse-item (sexp-plain def)) ((Err d) (Err d)) ((Ok it) (Ok (LModule (conj (into out @(. s iface)) it)))))
           (match (items/parse-item (nth forms i)) ((Err d) (Err d)) ((Ok it) (recur (+ i 1) (conj out it))))))))
 
 ;; `(define-macro NAME (PARAM..) BLOCK..)`: the blocks are expanded with the macros so far, then compiled.

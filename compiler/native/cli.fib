@@ -71,8 +71,8 @@
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok p) (do (print-raw (lprint/print-module (. p module))) (Ok 0)))))))
 
-;; `respell FILE [--in-place|--check]` (spec/lir.md 2): the text rewritten in the new spelling at the token level (lir.respell), the old
-;; spelling admitted for the read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that differ and
+;; `respell FILE [--in-place|--check]` (spec/lir.md 2): the text rewritten in the new spelling at the token level (lir.respell), both
+;; spellings read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that differ and
 ;; exit 1 when it is not already in the new spelling).
 (defun respell-cmd :private (rest: (Vec str)) -> (Result i64 str)
   (let ((files (vec (filter (fn (a: str) (not (starts-with? a "--"))) rest)))
@@ -81,7 +81,7 @@
     (if (or (not (= (count files) 1)) (and in-place check) (not (= (+ (count files) (if in-place 1 0) (if check 1 0)) (count rest))))
         (Err usage)
         (try-let [src (read-src (nth files 0))
-                  out (match (words/admitting-old (fn () (respell/respell-text src))) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d (nth files 0)))))]
+                  out (match (respell/respell-text src) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d (nth files 0)))))]
           (cond check (if (= out src) (Ok 0) (do (print-raw (respell/respell-diff src out)) (Ok 1)))
                 in-place (if (write-file (nth files 0) out) (Ok 0) (Err (str (nth files 0) ": cannot write")))
                 :else (do (print-raw out) (Ok 0)))))))
@@ -292,13 +292,13 @@
     (do (unsafe (setenv k v 1i32)) ())))
 
 ;; `--target TRIPLE` anywhere in the words: removed, and FIB_TARGET_TRIPLE set to the triple (the code generator and the checker's target read it).
-;; `--old-spelling` and `--new-spelling` (spec/lir.md 2, transitional): removed, the parser's mode set (lir.words) and FIB_LIR_SPELLING with it,
-;; so that the processes `cases` and `fuzz` start inherit it.
+;; `--old-spelling` and `--new-spelling` (spec/lir.md 2, transitional): removed, and FIB_LIR_SPELLING set (lir.words: the variable is the mode),
+;; which the processes `cases` and `fuzz` start inherit.
 (defun take-target :private (args: (Vec str)) -> (Result (Vec str) str)
   (loop ((i 0) (out []))
     (cond (>= i (count args)) (Ok out)
-          (= (nth args i) "--old-spelling") (do (words/admit-old-spelling! true) (set-env "FIB_LIR_SPELLING" "old") (recur (+ i 1) out))
-          (= (nth args i) "--new-spelling") (do (words/admit-old-spelling! false) (set-env "FIB_LIR_SPELLING" "new") (recur (+ i 1) out))
+          (= (nth args i) "--old-spelling") (do (words/admit-old-spelling! true) (recur (+ i 1) out))
+          (= (nth args i) "--new-spelling") (do (words/admit-old-spelling! false) (recur (+ i 1) out))
           (not (= (nth args i) "--target")) (recur (+ i 1) (conj out (nth args i)))
           (>= (+ i 1) (count args)) (Err "--target needs a triple")
           :else (do (set-env "FIB_TARGET_TRIPLE" (nth args (+ i 1))) (recur (+ i 2) out)))))
