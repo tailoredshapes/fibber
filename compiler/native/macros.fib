@@ -190,6 +190,15 @@
 
 ;; ---------------------------------------------------------------- running an entry
 
+;; The gensym counter of the program: one word, made once per process, that every session's `lir.sexp.gensym` counts in (spec/lir.md 4.6).
+(def gensym-cell: (Atom i64) (atom 0))
+
+(defun program-gensym-cell :private () -> i64
+  (if (= @gensym-cell 0)
+      (let ((fresh (ffi/ptr->addr (ffi/slot-new))))
+        (swap! gensym-cell (fn (a: i64) (if (= a 0) fresh a))))
+      @gensym-cell))
+
 (defun str-err :private (r: (Result a str) m: Macro pos: i64) -> (Result a Diagnostic)
   (match r ((Ok v) (Ok v)) ((Err e) (err pos (str "macro " (. m name) ": " e)))))
 
@@ -251,7 +260,7 @@
 (defun lair-str :private (r: (Result a LairError)) -> (Result a str)
   (match r ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e)))))
 
-;; A fast-codegen session with the library in it, and the runner's entries.
+;; A fast-codegen session with the library in it, the runner's entries, and the program's gensym cell given to it.
 (defun session-new :private () -> (Result Session str)
   (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
             (_ (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))
@@ -259,7 +268,8 @@
             (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
             (at (lair-str (jit/session-address j "lir.sexp.failure-at")))
             (set-hook (lair-str (jit/session-address j "lir.sexp.set-hook")))
-)
+            (give-cell (lair-str (jit/session-address j "lir.sexp.gensym-cell")))
+            (_ (call/call-i64 give-cell [(program-gensym-cell)])))
     (Ok (Session j take at set-hook (cell []) (cell 0) (cell nil)))))
 
 (defun session-of :private (env: Env) -> (Result Session str)

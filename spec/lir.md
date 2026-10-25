@@ -405,7 +405,7 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.text s) : ptr`, `(lir.sexp.len s) : i64` | a symbol's or a string's bytes (NUL-terminated) and count |
 | `(lir.sexp.int s) : i64`, `(lir.sexp.flt s) : double` | an integer's or a float's value |
 | `(lir.sexp.is s cstr) : i1` | whether `s` is the symbol with that text |
-| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the module |
+| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the program: one counter per process, which every module's session counts in, so the names two modules of a program make never coincide (`cases/lir/macros/gensym-program.lir`) |
 | `(lir.sexp.expand form) : ptr` | the form expanded through the module's macros as the expander would (outermost first, then the children), as an object; null when that expansion fails, and its error is then the use's (below) |
 | `(lir.sexp.fail at message) : ptr` | the expansion fails with `macro NAME: MESSAGE` at the object `at` (null: at the use); returns null, for the macro to return |
 
@@ -482,8 +482,7 @@ namespace as its declarations are: defining or declaring one of them is `duplica
 the forms after it (`duplicate macro NAME` if the importer has one); the macros it took through `require-macros` or `import` are not
 (`cases/lir/imports/reject-transitive-macro.lir`). An imported macro runs in its module's session: it is used, `(NAME ..)`, and is not
 `@lir.macro.NAME` in the importer's macro bodies (§4.6 declares those for the importer's own session). `lir.sexp.gensym` counts per
-session: a name an imported macro makes and one the importer's own macro makes may coincide (`x.1` twice), which the checker refuses in
-one function (§5.3) and which distinct prefixes avoid; one counter per program is a later step.
+program (§4.6): a name an imported macro makes and one the importer's own macro makes never coincide.
 
 **The program's rules.** Each module is admitted in load order, the named module last, and its items meet the names the program has:
 

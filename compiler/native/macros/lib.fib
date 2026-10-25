@@ -7,9 +7,9 @@
 
 ;; The library's module.
 (defun lib-source () -> str
-  (str-join [(part-0) "\n" (part-1) "\n" (part-2) "\n" (part-3)]))
+  (str-join [(part-0) "\n" (part-1) "\n" (part-2) "\n" (part-3) "\n" (part-4)]))
 
-;; What a macro's module declares of it (`lir.sexp.failure-take`, `failure-at` and `set-hook` are the runner's, not a macro's).
+;; What a macro's module declares of it (`lir.sexp.failure-take`, `failure-at`, `gensym-cell` and `set-hook` are the runner's, not a macro's).
 (defun declares-source () -> str
   "(declare lir.sexp.tag i64 (ptr))
 (declare lir.sexp.line i64 (ptr))
@@ -51,7 +51,7 @@
 (defstruct lir.sexp.list (i64 i64 i64 ptr ptr i64 i64 i64))
 (global internal lir.sexp.failure.message ptr (ptr null))
 (global internal lir.sexp.failure.at i64 (i64 0))
-(global internal lir.sexp.gensyms i64 (i64 0))
+(global internal lir.sexp.gensym.cell ptr (ptr null))
 
 (define (lir.sexp.tag i64) ((ptr s)) (block entry (ret (load i64 s))))
 (define (lir.sexp.line i64) ((ptr s)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp s (i64 0) (i32 1))))))
@@ -140,9 +140,10 @@
 (defun part-3 :private () -> str
   "(define (lir.sexp.gensym ptr) ((ptr prefix))
   (block entry
-    (let ((k (add (load i64 @lir.sexp.gensyms) (i64 1)))
+    (let ((cell (load ptr @lir.sexp.gensym.cell))
+          (k (add (load i64 cell) (i64 1)))
           (buf (call @malloc (i64 96))))
-      (store k @lir.sexp.gensyms)
+      (store k cell)
       (call @snprintf buf (i64 96) (string \"%.64s.%lld\") prefix k)
       (ret (call @lir.sexp.symbol buf)))))
 (define (lir.sexp.fail ptr) ((ptr at) (ptr message))
@@ -164,13 +165,17 @@
       (store (i64 0) @lir.sexp.failure.at)
       (ret p))))
 
-;; the runner's: the hook `lir.sexp.expand` calls (lair_mb_hook1) and the mailbox it parks on
+;; the runner's: the word the gensym counter lives in (one per program), the hook `lir.sexp.expand` calls (lair_mb_hook1) and the mailbox it parks on
+(define (lir.sexp.gensym-cell void) ((ptr cell))
+  (block entry (store cell @lir.sexp.gensym.cell) (ret)))
 (global internal lir.sexp.hook ptr (ptr null))
 (global internal lir.sexp.mailbox ptr (ptr null))
 (define (lir.sexp.set-hook void) ((ptr hook) (ptr mailbox))
   (block entry (store hook @lir.sexp.hook) (store mailbox @lir.sexp.mailbox) (ret)))
-;; the form expanded through the module's macros (spec/lir.md 4.6): a hook call the runner answers; null when the expansion failed
-(define (lir.sexp.expand ptr) ((ptr form))
+;; the form expanded through the module's macros (spec/lir.md 4.6): a hook call the runner answers; null when the expansion failed")
+
+(defun part-4 :private () -> str
+  "(define (lir.sexp.expand ptr) ((ptr form))
   (block entry
     (ret (inttoptr ptr (indirect-call (load ptr @lir.sexp.hook) (fn i64 (ptr i64)) (load ptr @lir.sexp.mailbox) (ptrtoint i64 form))))))
 ")
