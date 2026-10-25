@@ -172,6 +172,7 @@ mod    ::= private | internal | external           ; linkage (§4.3), at most on
          | noinline | cold                         ; LLVM's function attributes of those names (§4.3), `define` only
          | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
          | unsafe                                  ; the fence of §6.14.4 is open inside the function, `define` only
+         | (export-name STRING)                    ; LLVM's "wasm-export-name" attribute (§4.3), `define` only
 block  ::= (block LABEL instr+)
 ```
 
@@ -231,6 +232,7 @@ any order before the calling convention (`duplicate modifier private`,
 | `inline` | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
 | `noinline` | `noinline` | **Decided** (owner, 2026-10-25: lIR spells what LLVM IR spells, and lair reads no front end's convention out of band): a `define` only (`declare cannot be noinline`, `global cannot be noinline: noinline is for a function`), once (`duplicate modifier noinline`), not with `inline` (`inline and noinline exclude each other`: LLVM's verifier refuses `alwaysinline` with `noinline`); the inliner never inlines the function. For the out-of-line half of a fast path, which LLVM would otherwise inline into its one caller (the runtime's `fib.alloc-slow`, `fib.retain-slow`, `fib.release-slow`, `fib.stack-slow`) |
 | `cold` | `cold` | **Decided** (owner, 2026-10-25): a `define` only (`declare cannot be cold`, `global cannot be cold: cold is for a function`), once; the function is rarely called: when LLVM weighs the edges of a function, a block that a call of it post-dominates is cold too, so it is laid out off the hot path. For a trap or error path |
+| `(export-name "NAME")` | `"wasm-export-name"="NAME"` | **Decided** (owner, 2026-10-25: the text is the contract; §14 item 20): a `define` only (`declare cannot be export-name`, `global cannot be export-name: export-name is for a function`), once (`duplicate modifier export-name`), among the other modifiers in any order; `NAME` a non-empty string (`export-name expects one string`, `.. found X`, `export-name: the name must not be empty`). LLVM's string attribute of that name: the WebAssembly backend marks the symbol exported in the object and `wasm-ld` exports the function under `NAME` (clang's `__attribute__((export_name))`); every other backend ignores it, and the C, JS and WGSL printers too. What a native shared library exports is not this but the linkage and visibility of this table: the `external` definitions that are not `hidden`, and nothing else (lair writes no version script or symbol list; until 2026-10-25 it took one beside the module). A front end writes it on each function a wasm host is to call |
 
 A function's name carries no attribute: lair puts `alwaysinline`, `noinline` and `cold` on a function
 when its `define` says so and never otherwise (until 2026-10-25 it made every function whose name ended
@@ -1510,7 +1512,13 @@ i32) ((i32 argc) (ptr argv)) ..)`, with the C convention: `main must be
 and exported: `main must not be private or internal` (§4.3). The
 process exit status is `main`'s result, as C gives it (the low 8
 bits on POSIX). Output buffered by the C library is flushed at exit on
-both paths.
+both paths. A module built into a library (`lair build --library`, the
+`library` of lair's build options; **Decided**, owner, 2026-10-25, §14
+item 20) is not run, so the rule does not apply to it: its entries are
+what it exports (§4.3), and on wasm it gets wasi-libc's reactor start
+and no entry point. Whether a build is a library is a build option of
+lair, never read from the environment (until 2026-10-25 `FIB_EXPORTS`
+turned the rule off).
 
 ### 7.3 Tail calls
 
@@ -1751,7 +1759,7 @@ target's triple and data layout on the module.
 ```
 lair check FILE.lir              ; parse and check only
 lair run FILE.lir [ARGS..]       ; JIT-compile and run main; exit with its status
-lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
+lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [--library] [-L DIR].. [-l LIB]..   ; --library: a library, no main rule (§7.2)
 lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair expand FILE.lir             ; print the module with its macros expanded, as lIR text (§4.6): the input of a backend with no compile-time runtime
 lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
@@ -1827,3 +1835,4 @@ one the passes used.
 | 17 | reader macros: a per-module readtable in Lisp's shape (`define-reader-macro` on a character, `define-dispatch-macro` on the character after `#`, `define-token-reader` after every atom), each an lIR function of the stream (`lir.read.*`) returning a form or no form, run at read time through the macro session; `(`, `)`, `;` and whitespace cannot be bound, everything else can and the module then reads under its table; a required library's bindings are the requiring module's, an import's are not (each module of a program reads under its own table); lIR's own syntax unchanged and a module with no bindings reads as before; `lib/lir/readers.lir` (`'x`, `[a b]`) the first library. The owner's direction of 2026-10-25: lIR as thin as possible, a language brings its own syntax as reader macros | **Proposed** (the lead, 2026-10-25) | §4, §4.8, cases/lir/readers |
 | 18 | ownership in lIR: the managed type `(ptr 1)` (LLVM's `ptr addrspace(1)`), kinds on SSA values and parameters, SIL's forms `alloc-object alloc-stack dealloc-stack copy-value destroy-value is-unique`, `load copy|borrow|take`, `store init|assign|borrow`, `addrspacecast` inside `(define unsafe ..)`, the `ownership` form naming what the forms lower to (one per program, in the interface of the module that carries it), a verifier of ten rules inside `lir.check` on every path (`FIB_LIR_OWN`, `report` the default until the emitter emits the forms), erasure as the last pass before LLVM or a printer after an optimisation slot on the explicit forms; MIR's words weighed and recorded | **Decided** (owner, 2026-10-25: lIR is the language, lair the only compiler; docs/design/lir-language.md stage 2, D4 to D10 as recommended) | §2, §4, §4.7, §6.10, §6.14, §10, §12, §13, cases/lir/own |
 | 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
+| 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |

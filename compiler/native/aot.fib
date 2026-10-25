@@ -10,9 +10,13 @@
 ;; What `aot-emit` produces (aot.rs `Output`).
 (defenum AotOutput OutObject OutAssembly OutLlvmIr)
 
-;; AOT settings (aot.rs `Options`): the level 0 to 3, the libraries to link (`-l`, after the module's own code), and the directories that hold
-;; them (`-L`, each also an absolute rpath).
-(defstruct AotOptions (opt-level: i64 libs: (Vec str) lib-dirs: (Vec str)))
+;; AOT settings (aot.rs `Options`): the level 0 to 3, the libraries to link (`-l`, after the module's own code), the directories that hold
+;; them (`-L`, each also an absolute rpath), and `library`: the output is a library, not an executable (`lair build --library`, spec/lir.md 7.2:
+;; no `main` is required; a wasm module gets wasi-libc's reactor start and no entry).
+(defstruct AotOptions (opt-level: i64 libs: (Vec str) lib-dirs: (Vec str) library: bool))
+
+;; Options for an executable.
+(defun aot-options (opt: i64 libs: (Vec str) dirs: (Vec str)) -> AotOptions (AotOptions opt libs dirs false))
 
 ;; The bytes of a string as an array.
 (defun text-bytes :private (s: str) -> (Array i8)
@@ -97,12 +101,12 @@
           ((Err m) (Err (ErrBackend m)))
           ((Ok d) (recur (+ i 1) (conj acc d)))))))
 
-;; Compiles a module that satisfies the `main` rule and links it into an executable at `path`. (aot.rs `build_executable`)
-(defun entry-check :private (m: LModule) -> (Result unit Diagnostic)
-  (if (target/exports-requested?) (Ok ()) (check/check-main m)))
+;; Compiles a module that satisfies the `main` rule (unless the output is a library) and links it into an executable at `path`. (aot.rs `build_executable`)
+(defun entry-check :private (m: LModule opts: AotOptions) -> (Result unit Diagnostic)
+  (if (. opts library) (Ok ()) (check/check-main m)))
 
 (defun aot-build-executable (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
-  (match (entry-check m)
+  (match (entry-check m opts)
     ((Err d) (Err (lair-error-diag d)))
     ((Ok _) (match (target/static-refusal-now)
               ((some msg) (Err (ErrBackend msg)))
@@ -117,12 +121,12 @@
     ((Ok ws) (Ok ws))))
 
 (defun aot-build-executable-host :private (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
-  (try-let ((_ (match (entry-check m) ((Err d) (Err (lair-error-diag d))) ((Ok _) (Ok ()))))
+  (try-let ((_ (match (entry-check m opts) ((Err d) (Err (lair-error-diag d))) ((Ok _) (Ok ()))))
             (dirs (library-dirs (. opts lib-dirs)))
             (libs (link-words m opts))
             (obj (aot-emit m name OutObject opts)))
     (match (target/static-triple)
       ((some t) (link-static obj path dirs libs t))
       (nil (if (some? (target/wasm-triple))
-               (link-wasm obj path dirs libs)
+               (link-wasm obj path dirs libs (. opts library))
                (link obj path dirs libs))))))

@@ -66,36 +66,24 @@
 ;; The linker's arguments after its own name. `dirs` are the `-L` directories, `libs` the words after `-l`. The library `js` is the host's: an extern declared
 ;; `:lib "js"` (a driver for the JavaScript host: examples/webgpu/webgpu.fib, docs/design/webgpu.md 5) is an import of the module (`env.NAME`) that the host
 ;; provides at instantiation, so `js` is `--allow-undefined` here and no library.
-(defun wasm-args (obj: str out: str lib: str rt: (Option str) dirs: (Vec str) libs: (Vec str)) -> (Vec str)
-  (let ((head (into (into (into [(str lib (if (library?) "/crt1-reactor.o" "/crt1.o")) obj]
+(defun wasm-args (obj: str out: str lib: str rt: (Option str) dirs: (Vec str) libs: (Vec str) library: bool) -> (Vec str)
+  (let ((head (into (into (into [(str lib (if library "/crt1-reactor.o" "/crt1.o")) obj]
                                 (mapv (fn (d: str) (str "-L" d)) dirs))
                           (mapv (fn (l: str) (if (= l "js") "--allow-undefined" (str "-l" l))) libs))
                     [(str "-L" lib) "-lc" "-lwasi-emulated-getpid"]))
         (tail ["-o" out (str "-zstack-size=" (show (number-env "FIB_WASM_STACK" 8388608))) "--stack-first"
                (str "--max-memory=" (show (number-env "FIB_WASM_MAX_MEMORY" 4294901760)))]))
-    (into (into (into (into head (match rt (nil []) ((some b) [b]))) tail) (library-flags)) (strip-flags))))
+    (into (into (into (into head (match rt (nil []) ((some b) [b]))) tail) (library-flags library)) (strip-flags))))
 
 ;; The name section (the function names a trap's stack shows) is dropped: the hello world is 43 KB without it and 231 KB with it. FIB_WASM_NAMES=1 keeps it.
 (defun strip-flags :private () -> (Vec str)
   (if (= (env-of "FIB_WASM_NAMES") (some "1")) [] ["--strip-all"]))
 
-;; A library (`--export`): wasi-libc's reactor start (`_initialize`, no `_start`), no entry point, each export a symbol the module exports, and `malloc` and `free` so that
-;; the host can make the memory its arguments point to.
-(defun library? :private () -> bool
-  (match (env-of "FIB_EXPORTS") ((some e) (not (= e ""))) (nil false)))
-
-(defun library-flags :private () -> (Vec str)
-  (if (library?)
-    (into ["--no-entry" "--export=malloc" "--export=free"]
-          (mapv (fn (w: str) (str "--export=" (match (str-find w "=" 0) ((some i) (str-slice w (+ i 1) (str-len w))) (nil w))))
-                (split-on-colon-or-comma (unwrap-or (env-of "FIB_EXPORTS") ""))))
-    []))
-
-(defun split-on-colon-or-comma :private (text: str) -> (Vec str)
-  (loop ((i 0) (start 0) (out []))
-    (cond (>= i (str-len text)) (conj out (str-slice text start (str-len text)))
-          (= (str-byte-at text i) 44i8) (recur (+ i 1) (+ i 1) (conj out (str-slice text start i)))
-          :else (recur (+ i 1) start out))))
+;; A library (`lair build --library`, native.aot `AotOptions.library`): wasi-libc's reactor start (`_initialize`, no `_start`), no entry point, and `malloc`
+;; and `free` exported so that the host can make the memory its arguments point to. The module's own exports are not named here: a `define` with
+;; `(export-name "N")` (spec/lir.md 4.3) carries LLVM's `"wasm-export-name"`, which marks the symbol exported in the object, and wasm-ld exports it.
+(defun library-flags :private (library: bool) -> (Vec str)
+  (if library ["--no-entry" "--export=malloc" "--export=free"] []))
 
 ;; What a failed link says when WASI lacks a function the program uses: the library's sockets, processes, host names and temporary directories are not in preview 1.
 (defun hint :private (m: str) -> str
@@ -104,7 +92,7 @@
     m))
 
 ;; Writes the object beside `out` and runs wasm-ld. (link.fib `link`, for wasi-libc)
-(defun link-wasm (object: (Array i8) out: str dirs: (Vec str) libs: (Vec str)) -> (Result unit LairError)
+(defun link-wasm (object: (Array i8) out: str dirs: (Vec str) libs: (Vec str) library: bool) -> (Result unit LairError)
   (let ((obj (object-path out))
         (errfile (str out ".lair.err")))
     (match (wasm-ld)
@@ -115,7 +103,7 @@
          ((Ok lib)
           (match (write-bytes obj object)
             ((Err m) (Err (ErrBackend m)))
-            ((Ok _) (let ((r (run-cc (into [ld] (wasm-args obj out lib (builtins) dirs libs)) errfile)))
+            ((Ok _) (let ((r (run-cc (into [ld] (wasm-args obj out lib (builtins) dirs libs library)) errfile)))
                       (do (remove-path obj)
                           (remove-path errfile)
                           (match r

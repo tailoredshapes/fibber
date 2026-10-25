@@ -20,16 +20,17 @@
 (defun check-source (src: str) -> (Result LModule LairError)
   (check-file src ""))
 
-;; Parses and checks a module that will run as a program (`check-main`). (pipeline.rs `for_executable`)
-(defun for-executable-file (src: str file: str) -> (Result LModule LairError)
+;; Parses and checks a module that will run as a program (`check-main`), or with `library` one that is linked into a library (spec/lir.md 7.2:
+;; no `main` rule; `lair build --library`). (pipeline.rs `for_executable`)
+(defun for-executable-file (src: str file: str library: bool) -> (Result LModule LairError)
   (match (check-file src file)
     ((Err e) (Err e))
-    ((Ok m) (match (if (exports-requested?) (Ok ()) (check/check-main m))
+    ((Ok m) (match (if library (Ok ()) (check/check-main m))
               ((Err d) (Err (lair-error-diag d)))
               ((Ok _) (Ok m))))))
 
-(defun for-executable (src: str) -> (Result LModule LairError)
-  (for-executable-file src ""))
+(defun for-executable (src: str library: bool) -> (Result LModule LairError)
+  (for-executable-file src "" library))
 
 ;; The verified, unoptimised LLVM IR of a module for the host: the text `lairf emit-llvm` prints. (pipeline.rs `emit_llvm`)
 (defun emit-llvm (src: str name: str) -> (Result str LairError)
@@ -48,7 +49,7 @@
 (defun check-module (m: LModule) -> (Result LModule LairError)
   (match (check/check m) ((Err diagnostics) (Err (ErrInvalid diagnostics))) ((Ok _) (Ok m))))
 
-(defun for-executable-module (m: LModule) -> (Result LModule LairError)
+(defun for-executable-module (m: LModule library: bool) -> (Result LModule LairError)
   (try-let ((checked (check-module m)))
-    (match (if (exports-requested?) (Ok ()) (check/check-main checked))
+    (match (if library (Ok ()) (check/check-main checked))
       ((Err diagnostic) (Err (lair-error-diag diagnostic))) ((Ok _) (Ok checked)))))

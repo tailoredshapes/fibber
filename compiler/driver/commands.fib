@@ -152,7 +152,7 @@
 ;; reaches) by the mode of the build, after the `-l` the command line gave, and a link that fails for one of them says what needs it; the driver
 ;; adds the module that declared it (driver.linkdecl). `--via c` builds it through the C compiler (driver.viac) instead of LLVM.
 (defun build-exe :private (lir: ec/Emitted file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> i64
-  (match (if (viac/via-c?) (viac/build-via-c (ec/emitted-text lir) file out opt dirs libs) (native/build-module (. lir ast) out opt dirs libs))
+  (match (if (viac/via-c?) (viac/build-via-c (ec/emitted-text lir) file out opt dirs libs) (native/build-module (. lir ast) out opt dirs libs (library? lir)))
     ((Err m) (compile-failed (ld/name-modules m (. lir declared))))
     ((Ok _) 0)))
 
@@ -193,5 +193,8 @@
                                      (some (str-slice (. g name) 11 (str-len (. g name)))) nil))
                  (_ nil))) (. ast items))))
 
+;; Whether the emitted module is a library (`--export`: its exports, not a `main`, are its entries), as lair's build option says it.
+(defun library? :private (m: ec/Emitted) -> bool (not (empty? (. m exports))))
+
 (defun emit-product :private (m: ec/Emitted out: str opt: i64 kind: str) -> (Result unit str)
-  (native/emit-module (. m ast) out opt kind))
+  (native/emit-module (. m ast) out opt kind (library? m)))

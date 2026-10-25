@@ -83,17 +83,17 @@
           (dotimes (i n) (array-set! &out (+ (array-len h) i) (array-get body i)))
           @out))))
 
-;; Compiles the module `src`, which must satisfy the `main` rule, and links it into the executable `path`. (jit.fib `build-executable`)
-(defun build-executable (src: str path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+;; Compiles the module `src`, which must satisfy the `main` rule unless `library` (spec/lir.md 7.2), and links it into the executable `path`. (jit.fib `build-executable`)
+(defun build-executable (src: str path: str opt: i64 libs: (Vec str) dirs: (Vec str) library: bool) -> (Result unit str)
   (cond (= path "") (Err "path is empty")
         :else (match (level-check opt)
                 ((Err m) (Err m))
-                ((Ok l) (match (checked-executable src)
+                ((Ok l) (match (checked-executable src library)
                           ((Err e) (Err (lair-error-str e)))
-                          ((Ok m) (unit-result (liro/build-executable m path path (AotOptions l libs dirs)))))))))
+                          ((Ok m) (unit-result (liro/build-executable m path path (AotOptions l libs dirs library)))))))))
 
-(defun checked-executable :private (src: str) -> (Result LModule LairError)
-  (let ((t (timing/started)) (r (pipe/for-executable src)))
+(defun checked-executable :private (src: str library: bool) -> (Result LModule LairError)
+  (let ((t (timing/started)) (r (pipe/for-executable src library)))
     (do (timing/report "lir.check" t) r)))
 
 ;; The output of `--emit KIND` (obj, asm, llvm; ptx is asm on a kernel target, whose assembly is PTX, and nothing elsewhere; wgsl is the WebGPU
@@ -129,26 +129,27 @@
         (match k ((OutObject) true) (_ false)) (Err "a kernel target emits PTX, which is text: --emit ptx (or asm, llvm), not obj")
         :else (kernel/kernel-module m)))
 
-;; Compiles the module `src`, which must satisfy the `main` rule, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
+;; Compiles the module `src`, which must satisfy the `main` rule unless `library`, to an object, assembly or LLVM IR (`kind`) written to `path`, for the target of
 ;; FIB_TARGET_TRIPLE (else the host); links nothing. On a kernel target the module is the program's kernels and the assembly is PTX. (`fibc build --emit`)
-(defun emit-file (src: str path: str opt: i64 kind: str) -> (Result unit str)
+(defun emit-file (src: str path: str opt: i64 kind: str library: bool) -> (Result unit str)
   (cond (= kind "wgsl") (emit-wgsl src path)
         (= kind "liro") (try-let [_ (level-check opt)
                                    _ (if (target/cross-target?) (Err "--emit liro initially supports the native host") (Ok ()))
                                    m (match (pipe/check-source src) ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e))))
                                    libs (libraries/lib-words (libraries/module-libs m))]
                          (unit-result (liro-file/export-file m path opt libs)))
-        :else (emit-llvm-file src path opt kind)))
+        :else (emit-llvm-file src path opt kind library)))
 
-;; The shared library `out` of the module `ast` (lIR trees), exporting `symbols` only (native.link `link-shared`): its object is written beside `out`
-;; and removed; the link adds the module's `dependent-library` forms after `libs`.
-(defun build-shared-module (ast: LModule out: str opt: i64 symbols: (Vec str) mac: bool libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+;; The shared library `out` of the module `ast` (lIR trees): what the module exports is what its text exports, the `external` definitions that are
+;; not `hidden` (spec/lir.md 4.3; the linker sees nothing else), so no list of symbols rides beside it (native.link `link-shared`). Its object is
+;; written beside `out` and removed; the link adds the module's `dependent-library` forms after `libs`.
+(defun build-shared-module (ast: LModule out: str opt: i64 mac: bool libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
   (let ((obj (link/object-path out)))
     (try-let [_ (if (target/cross-target?) (Err "a shared library is linked for the host only; use --emit obj and link where the target runs") (Ok ()))
               ds (match (library-dirs dirs) ((Err e) (Err (lair-error-str e))) ((Ok d) (Ok d)))
               words (libraries/link-words ast libs dirs)
-              _ (emit-llvm-module ast obj opt "obj")]
-      (let ((r (link/link-shared [obj] out symbols mac ds words)))
+              _ (emit-llvm-module ast obj opt "obj" true)]
+      (let ((r (link/link-shared [obj] out mac ds words)))
         (do (link/remove-path obj)
             (match r ((Err e) (Err (libraries/explain-failure (lair-error-str e) (libraries/module-libs ast)))) ((Ok _) (Ok ()))))))))
 
@@ -156,14 +157,14 @@
   (try-let [_ (level-check opt)
             _ (if (target/cross-target?) (Err "liro linking initially supports the native host") (Ok ()))
             _ (if (or (= out "") (empty? objects)) (Err "liro linking needs objects and an output path") (Ok ()))]
-    (unit-result (liro-link/link-files objects out (AotOptions opt libs dirs)))))
+    (unit-result (liro-link/link-files objects out (aot-options opt libs dirs)))))
 
-(defun emit-llvm-file :private (src: str path: str opt: i64 kind: str) -> (Result unit str)
+(defun emit-llvm-file :private (src: str path: str opt: i64 kind: str library: bool) -> (Result unit str)
   (try-let [l (level-check opt)
             k (output-kind kind)
-            m0 (match (if (kernel-target?) (pipe/check-source src) (pipe/for-executable src)) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
+            m0 (match (if (kernel-target?) (pipe/check-source src) (pipe/for-executable src library)) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))
             m (module-for-target m0 k)
-            bytes0 (match (aot-emit m path k (AotOptions l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b)))
+            bytes0 (match (aot-emit m path k (aot-options l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b)))
             bytes (Ok (if (and (kernel-target?) (match k ((OutAssembly) true) (_ false))) (with-header (kernel/kernel-signatures m) bytes0) bytes0))]
     (match (link/write-bytes path bytes)
       ((Err e) (Err (str path ": " e)))
@@ -171,21 +172,22 @@
 
 ;; The front end hands generated trees to these entry points. Validation precedes
 ;; code generation and every LIRO cache lookup.
-(defun checked-executable-module :private (ast: LModule) -> (Result LModule LairError)
-  (let ((t (timing/started)) (r (pipe/for-executable-module ast)))
+(defun checked-executable-module :private (ast: LModule library: bool) -> (Result LModule LairError)
+  (let ((t (timing/started)) (r (pipe/for-executable-module ast library)))
     (do (timing/report "lir.check" t) r)))
 
-;; The executable `path` of the module `ast`: linked with `libs` (the command line's `-l`) and the module's own `dependent-library` forms; a link that
-;; fails for one of those says what needs it (native.libraries `explain-failure`).
-(defun build-executable-module (ast: LModule path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+;; The executable `path` of the module `ast` (with `library`, a library: no `main` rule, spec/lir.md 7.2; a wasm module with the reactor start): linked
+;; with `libs` (the command line's `-l`) and the module's own `dependent-library` forms; a link that fails for one of those says what needs it
+;; (native.libraries `explain-failure`).
+(defun build-executable-module (ast: LModule path: str opt: i64 libs: (Vec str) dirs: (Vec str) library: bool) -> (Result unit str)
   (try-let ((l (level-check opt))
             (_ (if (= path "") (Err "path is empty") (Ok ())))
-            (m (match (checked-executable-module ast) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))))
-    (match (liro/build-executable m path path (AotOptions l libs dirs))
+            (m (match (checked-executable-module ast library) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m)))))
+    (match (liro/build-executable m path path (AotOptions l libs dirs library))
       ((Err e) (Err (libraries/explain-failure (lair-error-str e) (libraries/module-libs m))))
       ((Ok _) (Ok ())))))
 
-(defun emit-module (ast: LModule path: str opt: i64 kind: str) -> (Result unit str)
+(defun emit-module (ast: LModule path: str opt: i64 kind: str library: bool) -> (Result unit str)
   (try-let ((_ (level-check opt)))
     (cond (= kind "wgsl") (emit-wgsl-module ast path)
           (= kind "liro")
@@ -193,7 +195,7 @@
                     (m (match (pipe/check-module ast) ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m))))
                     (libs (libraries/lib-words (libraries/module-libs m))))
             (unit-result (liro-file/export-file m path opt libs)))
-          :else (emit-llvm-module ast path opt kind))))
+          :else (emit-llvm-module ast path opt kind library))))
 
 (defun emit-wgsl-module :private (ast: LModule path: str) -> (Result unit str)
   (if (not (wgsl-target?))
@@ -202,12 +204,12 @@
                 (km (kernel/kernel-module m)) (text (wgsl/wgsl-module km)))
         (match (link/write-bytes path (str-bytes text)) ((Err e) (Err (str path ": " e))) ((Ok _) (Ok ()))))))
 
-(defun emit-llvm-module :private (ast: LModule path: str opt: i64 kind: str) -> (Result unit str)
+(defun emit-llvm-module :private (ast: LModule path: str opt: i64 kind: str library: bool) -> (Result unit str)
   (try-let ((l (level-check opt)) (k (output-kind kind))
-            (m0 (match (if (kernel-target?) (pipe/check-module ast) (pipe/for-executable-module ast))
+            (m0 (match (if (kernel-target?) (pipe/check-module ast) (pipe/for-executable-module ast library))
                   ((Err e) (Err (lair-error-str e))) ((Ok m) (Ok m))))
             (m (module-for-target m0 k))
-            (bytes0 (match (aot-emit m path k (AotOptions l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b))))
+            (bytes0 (match (aot-emit m path k (aot-options l [] [])) ((Err e) (Err (lair-error-str e))) ((Ok b) (Ok b))))
             (bytes (Ok (if (and (kernel-target?) (match k ((OutAssembly) true) (_ false)))
                            (with-header (kernel/kernel-signatures m) bytes0) bytes0))))
     (match (link/write-bytes path bytes) ((Err e) (Err (str path ": " e))) ((Ok _) (Ok ())))))

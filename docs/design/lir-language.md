@@ -107,6 +107,9 @@ The sizes are estimates from reading the code, not measurements. An agent-week i
    - exports are already `external` and not `hidden` in the text;
    - wasm gets LLVM's `"wasm-export-name"` as `(export-name "x")`;
    - library versus executable becomes a build option.
+
+   *Landed 2026-10-25* (spec/lir.md 4.3, 7.2, 12; cases/lir/attrs/export-name.lir): lair reads `FIB_EXPORTS` nowhere; the
+   environment variable remains fibber's own channel from `fibc build --export` to its front end.
 5. The target triple becomes `(target (triple …) (datalayout …))`, mirroring LLVM. Today `FIB_TARGET_TRIPLE` picks a row of
    fibber's `types.targets`, imported by lower.fib:5, lower/intrin.fib:10, api.fib:9 and llvm/target.fib:11. That row:
    - sets musttail versus plain `tail` (lx.fib:28-31/71-73), so spec/lir.md 7.3's guarantee fails on wasm and riscv;

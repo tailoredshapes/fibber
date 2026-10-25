@@ -47,9 +47,10 @@ fibc build X.fib --emit obj --header X.h --export NAME[=SYMBOL] .. -o X.o       
 
 1. **Link with the system `cc`, in the existing link code.** The executable link already needs `cc`; `native.link` gets `link-shared` beside `link`. A
    linker bundled in the compiler would be a second dependency to keep in step with the platforms. The object is written to `OUT.lair.o` beside the output and removed.
-2. **Only the exports are visible, twice.** The object marks everything but the export wrappers `internal` (the study's `nm` showed it), and the link adds
-   a version script (`local: *`) on Linux or an `-exported_symbols_list` on macOS. Either alone holds; the second is there so that a future runtime
-   symbol that forgets `internal` cannot leak. The gate checks `nm -D --defined-only` against the declared names plus `fib_status` and `fib_error`, the two symbols every library has (docs/design/stack-check.md 6; the names are provisional until the owner confirms them).
+2. **Only the exports are visible, once** (since 2026-10-25; spec/lir.md 4.3, decision 20). The object marks everything but the export wrappers `internal`
+   (the study's `nm` showed it), and that is the whole guard: the lIR's linkage and visibility are the contract, so the link adds no version script and no
+   `-exported_symbols_list` any more (it did until 2026-10-25, from a symbol list handed to lair beside the module, "the second guard"; a runtime symbol
+   that forgets `internal` now shows in `nm -D`, which the gate checks). The gate checks `nm -D --defined-only` against the declared names plus `fib_status` and `fib_error`, the two symbols every library has (docs/design/stack-check.md 6; the names are provisional until the owner confirms them).
 3. **Position independent.** The host machine is created with the PIC relocation model (`compiler/llvm/target.fib`, `reloc-of`); the gate checks the library has no text relocation (`readelf -d`: no `TEXTREL`).
 4. **A wrapper per export, made at export time, in lIR (`compiler/emit/export.fib`).** The exported symbol is a C-convention function with the name the
    user gave; it first makes sure the runtime is up (`fib.export-ready`), converts, calls the fibber function, converts back. The wrapper is the only
@@ -218,6 +219,6 @@ Each was put in the compiler, a stage 2 built from it, and `shared.sh refusals k
 | `compiler/emit/exporthdr.fib` | the C header and the module map |
 | `compiler/emit/compile.fib` | `compile-library` uses them; `Emitted` carries the signatures |
 | `compiler/driver/shared.fib` | the flags' checks, the build, the header files |
-| `compiler/native/link.fib`, `api.fib` | `link-shared`: `cc -shared` / `-dynamiclib`, the version script or symbol list |
+| `compiler/native/link.fib`, `api.fib` | `link-shared`: `cc -shared` / `-dynamiclib`; `build-shared-module` from the module's trees (no symbol list since 2026-10-25) |
 | `compiler/fibc.fib`, `driver/args.fib`, `driver/commands.fib` | `--shared`, `--header` (FIB_SHARED, FIB_HEADER), the usage text |
 | `compiler/tests/shared/` | the gate: `shared.sh`, `kernels.fib`, `oracle.fib`, `host.c`, `solid-lib.fib`, `solid-host.c`; by hand: `shared-mac.sh`, `main.swift`, `solid-main.swift` |
