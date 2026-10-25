@@ -2,7 +2,7 @@
 ;; Errors are the Rust's strings (the caller prints them on standard error and exits 1). `fuzz` is package F's (native.fuzz).
 
 (ns native.cli
-  (:require [fib.string :as s] [llvm.ffi :as ffi] [native.macros :as macros] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
+  (:require [fib.string :as s] [llvm.ffi :as ffi] [native.imports :as imports] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
             [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
@@ -53,14 +53,15 @@
                 text (rendered (pipe/emit-llvm src (nth rest 0)) (nth rest 0))]
         (do (print text) (Ok 0)))))
 
-;; The canonical text of the parsed module (docs/design/lair-ast-dump.md), its macros expanded; it parses but does not check.
+;; The canonical text of the parsed program (docs/design/lair-ast-dump.md): the module with its macros expanded and its imports joined to
+;; it (spec/lir.md 4.7); it parses but does not check the module itself (an imported module is checked as it is loaded).
 (defun dump-ast-cmd :private (rest: (Vec str)) -> (Result i64 str)
   (if (not (= (count rest) 1))
       (Err usage)
       (try-let [src (read-src (nth rest 0))]
-        (match (macros/parse-source src (nth rest 0))
+        (match (imports/load-program src (nth rest 0))
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
-          ((Ok m) (do (dump/dump-with m (fn (chunk: str) (print-raw chunk))) (Ok 0)))))))
+          ((Ok p) (do (dump/dump-with (. p module) (fn (chunk: str) (print-raw chunk))) (Ok 0)))))))
 
 ;; -------------------------------------------------------------------------------------------------- the options
 
