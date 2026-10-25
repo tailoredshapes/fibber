@@ -1076,7 +1076,7 @@ lair check FILE.lir              ; parse and check only
 lair run FILE.lir [ARGS..]       ; JIT-compile and run main; exit with its status
 lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
 lair emit-llvm FILE.lir          ; print the verified LLVM IR
-lair cases DIR..                 ; run a case suite (§13)
+lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
 ```
 
 `FIB_TARGET_CPU` names the CPU code is generated for when the module has
