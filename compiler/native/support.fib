@@ -62,6 +62,10 @@
 
 ;; The lIR module of the mailbox: worker thread entry (`pthread_create`, 64 MiB stack), a mutex and two condition variables, the hooks of arity 1 and 2, and the state machine of `exchange.rs` with its defined misuse behaviour. It declares `lair_shim_run`, so the shim module is added first. (capi/exchange.rs, capi/mailbox.rs)
 (defun mailbox-source () -> str
+  (str-join [(mailbox-part-0) "\n" (mailbox-part-1) "\n" (mailbox-part-2) "\n" (mailbox-part-3) "\n" (mailbox-part-4) "\n" (mailbox-part-5) "\n" (mailbox-part-6) "\n" (mailbox-part-7) "\n" (mailbox-part-8) "\n" (mailbox-part-9) "\n" (mailbox-part-10) "\n" (mailbox-part-11)]))
+
+;; Part 0 of the mailbox's text.
+(defun mailbox-part-0 :private () -> str
   ";; The mailbox (crates/lair/src/capi/exchange.rs and mailbox.rs). A mailbox is 64 words: 0 state (0 idle, 1 running, 2 hook, 3 replied,
 ;; 4 done, 5 a nested call requested, 6 a nested call done), 1 arity, 2 a, 3 b, 4 reply, 5 result, 6 the worker's pthread_t, 7 1 when a worker has been made and not yet joined or
 ;; detached, 8 the fault text or null, 9 its length, 10 1 for a fault wait has not reported, 11 the reference count (the handle's and
@@ -105,8 +109,11 @@
 (define private (sleep-main void) ((ptr mb))
   (block entry (call @pthread_cond_wait (call @w mb (i64 40)) (call @w mb (i64 32))) (ret)))
 (define private (sleep-worker void) ((ptr mb))
-  (block entry (call @pthread_cond_wait (call @w mb (i64 48)) (call @w mb (i64 32))) (ret)))
+  (block entry (call @pthread_cond_wait (call @w mb (i64 48)) (call @w mb (i64 32))) (ret)))")
 
+;; Part 1 of the mailbox's text.
+(defun mailbox-part-1 :private () -> str
+  "
 ;; Records a misuse (the first text stays), has the next wait report it and wakes the compiler's thread. The lock is held.
 (define private (fault void) ((ptr mb) (ptr msg))
   (block entry (br (icmp eq (call @rd mb (i64 8)) (i64 0)) first rest))
@@ -140,8 +147,11 @@
       (call @pthread_mutex_init (call @w mb (i64 32)) (ptr null))
       (call @pthread_cond_init (call @w mb (i64 40)) (ptr null))
       (call @pthread_cond_init (call @w mb (i64 48)) (ptr null))
-      (ret mb))))
+      (ret mb))))")
 
+;; Part 2 of the mailbox's text.
+(defun mailbox-part-2 :private () -> str
+  "
 ;; The worker's body: the call, then the result.
 (define private (worker ptr) ((ptr mb))
   (block entry
@@ -176,8 +186,11 @@
   (block addr?
     (br (icmp eq addr (i64 0)) no-address ok))
   (block no-address (ret (string \"lair_call_start: the address is 0\")))
-  (block ok (ret (ptr null))))
+  (block ok (ret (ptr null))))")
 
+;; Part 3 of the mailbox's text.
+(defun mailbox-part-3 :private () -> str
+  "
 ;; Writes the call into the shim's record: callee, the n arguments, zeros for the rest, the integer result kind.
 (define private (fill void) ((ptr mb) (i64 addr) (ptr args) (i64 n))
   (block entry
@@ -192,8 +205,11 @@
           (i2 (add i (i64 1))))
       (call @wr mb (add (i64 14) i) v)
       (br loop)))
-  (block done (ret)))
+  (block done (ret)))")
 
+;; Part 4 of the mailbox's text.
+(defun mailbox-part-4 :private () -> str
+  "
 ;; lair_call_start: runs addr with the n arguments at args on a worker thread of 64 MiB of stack.
 (define (lair_mb_start void) ((ptr mb) (i64 addr) (ptr args) (i64 n))
   (block entry
@@ -235,8 +251,11 @@
     (ret)))
 
 (define private (add-ref void) ((ptr mb))
-  (block entry (atomicrmw add seq_cst (call @w mb (i64 11)) (i64 1)) (ret)))
+  (block entry (atomicrmw add seq_cst (call @w mb (i64 11)) (i64 1)) (ret)))")
 
+;; Part 5 of the mailbox's text.
+(defun mailbox-part-5 :private () -> str
+  "
 ;; pthread_create with a 64 MiB stack; the worker's thread id goes into word 6. 0 on success.
 (define private (spawn-thread i32) ((ptr mb))
   (block entry
@@ -276,8 +295,11 @@
     (ret (i32 3)))
   (block sleep
     (call @sleep-main mb)
-    (br again)))
+    (br again)))")
 
+;; Part 6 of the mailbox's text.
+(defun mailbox-part-6 :private () -> str
+  "
 ;; lair_mb_nest: while the worker is parked at a hook, runs the function at addr with the n integer arguments on that same worker, inside
 ;; the hook (its own hooks park as any do; the hook it was asked from is answered after it): the stack of the nested run is the worker's,
 ;; so a hook may be served by a run that hooks again, as deep as the stack goes. A nest with no hook waiting is a misuse.
@@ -310,8 +332,11 @@
   (block no
     (call @fault mb (string \"lair_mb_nest_result: no nested call has finished\"))
     (call @unlock mb)
-    (ret (i64 0))))
+    (ret (i64 0))))")
 
+;; Part 7 of the mailbox's text.
+(defun mailbox-part-7 :private () -> str
+  "
 ;; lair_call_hook_arg: argument i (0 or 1) of the hook the worker is parked at, else 0 and a fault.
 (define (lair_mb_hook_arg i64) ((ptr mb) (i64 i))
   (block entry
@@ -346,8 +371,11 @@
   (block no
     (call @fault mb (string \"lair_call_hook_reply: no hook call is waiting\"))
     (call @unlock mb)
-    (ret)))
+    (ret)))")
 
+;; Part 8 of the mailbox's text.
+(defun mailbox-part-8 :private () -> str
+  "
 ;; lair_call_result: the value the finished call returned, else 0 and a fault.
 (define (lair_mb_result i64) ((ptr mb))
   (block entry
@@ -370,8 +398,11 @@
           (n (call @rd mb (i64 9))))
       (call @unlock mb)
       (store n len)
-      (ret (inttoptr ptr p)))))
+      (ret (inttoptr ptr p)))))")
 
+;; Part 9 of the mailbox's text.
+(defun mailbox-part-9 :private () -> str
+  "
 ;; lair_call_free: see capi/mailbox.rs. A finished or unused mailbox joins its worker; one that is still running is detached.
 (define (lair_mb_free void) ((ptr mb))
   (block entry
@@ -394,8 +425,11 @@
     (br drop))
   (block drop
     (call @release-ref mb)
-    (ret)))
+    (ret)))")
 
+;; Part 10 of the mailbox's text.
+(defun mailbox-part-10 :private () -> str
+  "
 ;; The hook of arity 1 or 2, called by module code with the mailbox as cx: parks the calling worker until the compiler answers.
 (define private (hook i64) ((ptr cx) (i64 arity) (i64 a) (i64 b))
   (block entry
@@ -438,6 +472,9 @@
       (ret r))))
 
 (define (lair_mb_hook1 i64) ((ptr cx) (i64 a))
-  (block entry (ret (call @hook cx (i64 1) a (i64 0)))))
-(define (lair_mb_hook2 i64) ((ptr cx) (i64 a) (i64 b))
+  (block entry (ret (call @hook cx (i64 1) a (i64 0)))))")
+
+;; Part 11 of the mailbox's text.
+(defun mailbox-part-11 :private () -> str
+  "(define (lair_mb_hook2 i64) ((ptr cx) (i64 a) (i64 b))
   (block entry (ret (call @hook cx (i64 2) a b))))")

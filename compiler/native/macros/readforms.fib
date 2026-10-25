@@ -1,0 +1,134 @@
+;; compiler/native/macros/readforms.fib: the reader forms of a module (spec/lir.md 4.8), read: `(define-reader-macro "C" (STREAM) BLOCK..)`,
+;; `(define-dispatch-macro "C" (STREAM) BLOCK..)` and `(define-token-reader (STREAM TOKEN) BLOCK..)` parsed into a `ReaderDef` for
+;; native.macros to compile as it compiles a macro and then bind here (`bind!`); and the settings `(define-reader-class "C" CLASS)` and
+;; `(define-reader-depth N)`, which need only the readtable and are done here whole. The environment of a module (native.macros `Env`)
+;; is not seen here: what a form needs of it comes in as the readtable and the count of reader macros compiled.
+(ns native.macros.readforms
+  (:use lir.diag lir.sexp lir.sexp.lexer)
+  (:require [lir.parse.names :as names]))
+
+;; A reader form parsed: what its errors say (`reader macro [`, `dispatch macro #(`, `token reader`), the name of its function in the
+;; session, its parameter names, its blocks (unexpanded), its position, its kind (0 a reader macro, 1 a dispatch macro, 2 the token
+;; reader) and its character.
+(defstruct ReaderDef (what: str fname: str names: (Vec str) blocks: (Vec Sexp) pos: i64 kind: i64 c: i64))
+
+(defun reader-form? (head: str) -> bool
+  (or (= head "define-reader-macro") (= head "define-dispatch-macro") (= head "define-token-reader")))
+
+(defun reader-setting? (head: str) -> bool
+  (or (= head "define-reader-class") (= head "define-reader-depth")))
+
+;; ---------------------------------------------------------------- the settings
+
+;; `(define-reader-class "C" whitespace|constituent|terminating)`: the class of the character C (one UTF-8 character; not `(`, `)` or `;`)
+;; in the module's readtable; `(define-reader-depth N)`: the nesting the reader allows, 1 to 4096.
+(defun define-reader-setting (t: Readtable head: str form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (cond (and (= head "define-reader-class") (= (count its) 3))
+           (match (try-let ((c (class-char (nth its 1))) (k (class-kind (nth its 2)))) (Ok (readtable-class! t c k)))
+             ((Err d) (some d))
+             ((Ok _) nil))
+           (and (= head "define-reader-depth") (= (count its) 2))
+           (match (class-depth (nth its 1))
+             ((Err d) (some d))
+             ((Ok n) (do (readtable-depth! t n) nil)))
+           :else (some (Diagnostic pos (setting-usage head)))))
+    (_ (some (Diagnostic (sexp-pos form) (setting-usage head))))))
+
+(defun setting-usage :private (head: str) -> str
+  (if (= head "define-reader-depth") "define-reader-depth expects a count from 1 to 4096" "define-reader-class expects a character and whitespace, constituent or terminating"))
+
+;; The one character of a string, as a Unicode scalar; lIR's own `(`, `)` and `;` are refused.
+(defun class-char :private (s: Sexp) -> (Result i64 Diagnostic)
+  (match s
+    ((SxStr bs pos)
+     (match (scalar-of bs)
+       (nil (err pos "define-reader-class: the character must be a string of one character"))
+       ((some c) (if (or (= c 40) (= c 41) (= c 59))
+                     (err pos (str "define-reader-class: cannot change " (str-from-bytes bs) ", which is lIR's own"))
+                     (Ok c)))))
+    (_ (err (sexp-pos s) "define-reader-class: the character must be a string of one character"))))
+
+;; The scalar of exactly one UTF-8 character, nil for any other byte count.
+(defun scalar-of :private (bs: (Array i8)) -> (Option i64)
+  (let ((n (array-len bs)) (b0 (if (> n 0) (zext i64 (array-get bs 0)) -1)))
+    (let ((w (cond (< b0 0) 0 (< b0 128) 1 (< b0 192) 0 (< b0 224) 2 (< b0 240) 3 :else 4))
+          (at (fn (i: i64) -> i64 (bit-and (zext i64 (array-get bs i)) 63))))
+      (if (or (= w 0) (not (= n w)))
+          nil
+          (some (cond (= w 1) b0
+                      (= w 2) (bit-or (shl (bit-and b0 31) 6) (at 1))
+                      (= w 3) (bit-or (bit-or (shl (bit-and b0 15) 12) (shl (at 1) 6)) (at 2))
+                      :else (bit-or (bit-or (bit-or (shl (bit-and b0 7) 18) (shl (at 1) 12)) (shl (at 2) 6)) (at 3))))))))
+
+(defun class-kind :private (s: Sexp) -> (Result i64 Diagnostic)
+  (cond (names/atom-is? s "whitespace") (Ok class-whitespace)
+        (names/atom-is? s "constituent") (Ok class-constituent)
+        (names/atom-is? s "terminating") (Ok class-terminating)
+        :else (err (sexp-pos s) "define-reader-class: the class is whitespace, constituent or terminating")))
+
+(defun class-depth :private (s: Sexp) -> (Result i64 Diagnostic)
+  (match (match (sexp-atom s) ((some a) (parse-long a)) (nil nil))
+    ((some n) (if (and (>= n 1) (<= n max-depth-setting)) (Ok n) (err (sexp-pos s) (setting-usage "define-reader-depth"))))
+    (nil (err (sexp-pos s) (setting-usage "define-reader-depth")))))
+
+;; ---------------------------------------------------------------- the reader forms
+
+;; The form parsed: its character, its parameter names (`(STREAM)`, `(STREAM TOKEN)`) and its blocks; `seq` counts the reader macros of
+;; the module, so that each has a function name of its own (`lir.reader.C.K`).
+(defun parse-reader (head: str form: Sexp seq: (Cell i64)) -> (Result ReaderDef Diagnostic)
+  (let ((token (= head "define-token-reader")) (usage (reader-usage head)))
+    (match form
+      ((SxList its pos)
+       (if (< (count its) (if token 3 4))
+           (err pos usage)
+           (try-let ((c (if token (Ok 0) (reader-char head (nth its 1))))
+                     (ns (reader-names (nth its (if token 1 2)) (if token 2 1) usage)))
+             (let ((k (+ @seq 1)))
+               (do (set! seq k)
+                   (Ok (ReaderDef (reader-what head c) (str "lir.reader." c "." k) ns (names/vec-from its (if token 2 3)) pos
+                                  (cond (= head "define-reader-macro") 0 (= head "define-dispatch-macro") 1 :else 2) c)))))))
+      (_ (err (sexp-pos form) usage)))))
+
+(defun reader-usage :private (head: str) -> str
+  (if (= head "define-token-reader") (str head " expects (STREAM TOKEN) and blocks") (str head " expects a character, (STREAM) and blocks")))
+
+(defun reader-what :private (head: str c: i64) -> str
+  (cond (= head "define-reader-macro") (str "reader macro " (str-from-bytes (array 1 (trunc i8 c))))
+        (= head "define-dispatch-macro") (str "dispatch macro #" (str-from-bytes (array 1 (trunc i8 c))))
+        :else "token reader"))
+
+;; The character of a reader or dispatch macro: a string of one printable ASCII character; a reader macro's not `(`, `)` or `;`.
+(defun reader-char :private (head: str s: Sexp) -> (Result i64 Diagnostic)
+  (match s
+    ((SxStr bs pos)
+     (let ((c (if (= (array-len bs) 1) (zext i64 (array-get bs 0)) 0)))
+       (cond (or (< c 33) (> c 126)) (err pos (str head ": the character must be a string of one printable ASCII character"))
+             (and (= head "define-reader-macro") (or (= c 40) (= c 41) (= c 59))) (err pos (str head ": cannot bind " (str-from-bytes bs) ", which is lIR's own"))
+             :else (Ok c))))
+    (_ (err (sexp-pos s) (str head ": the character must be a string of one printable ASCII character")))))
+
+;; `(STREAM)` or `(STREAM TOKEN)`: exactly `n` valid names, each once.
+(defun reader-names :private (s: Sexp n: i64 usage: str) -> (Result (Vec str) Diagnostic)
+  (match s
+    ((SxList ps pos)
+     (if (not (= (count ps) n))
+         (err pos usage)
+         (loop ((i 0) (out []))
+           (if (>= i n)
+               (Ok out)
+               (match (try-let ((a (names/atom-text (nth ps i) "a parameter name"))) (names/valid-name a (sexp-pos (nth ps i))))
+                 ((Err d) (Err d))
+                 ((Ok name) (if (some? (first (filter (fn (x: str) (= x name)) out)))
+                                (err (sexp-pos (nth ps i)) (str "duplicate parameter " name))
+                                (recur (+ i 1) (conj out name)))))))))
+    (_ (err (sexp-pos s) usage))))
+
+;; The compiled entry bound in the readtable as the form asked: a reader macro on its character, a dispatch macro on the character after
+;; `#`, or the token reader.
+(defun bind! (t: Readtable d: ReaderDef entry: i64) -> unit
+  (let ((e (ReaderEntry entry (. d what))))
+    (cond (= (. d kind) 0) (readtable-bind! t (. d c) e)
+          (= (. d kind) 1) (readtable-bind-dispatch! t (. d c) e)
+          :else (readtable-token! t e))))
