@@ -134,7 +134,7 @@
         (set-modifiers f mods)
         (if-some [t tgt] (target-attributes lx f t) ())
         (if (slow-path? name) (add-enum-attribute lx f "noinline") ())
-        (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
+        (fn-attributes lx f mods)
         (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty nil))))))))
 
 ;; The string attribute `key` = `value` on the definition `f`.
@@ -150,7 +150,13 @@
   (do (add-string-attribute lx f "target-cpu" (. t cpu))
       (add-string-attribute lx f "target-features" (. t features))))
 
-;; The enum function attribute `name` (`noinline`, `alwaysinline`) on `f`.
+;; The function attributes a `define` names (spec/lir.md 4.3) on `f`: `inline` is LLVM's `alwaysinline`, `noinline` and `cold` are LLVM's own.
+(defun fn-attributes :private (lx: Lx f: i64 mods: LModifiers) -> unit
+  (do (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
+      (if (. mods noinline) (add-enum-attribute lx f "noinline") ())
+      (if (. mods cold) (add-enum-attribute lx f "cold") ())))
+
+;; The enum function attribute `name` (`noinline`, `alwaysinline`, `cold`) on `f`.
 (defun add-enum-attribute :private (lx: Lx f: i64 name: str) -> unit
   (let ((k (ffi/bytes-new name)))
     (unsafe
@@ -197,4 +203,4 @@
   (or (s/ends-with? name "-slow") (s/includes? name "-slow.")))
 
 (defun hidden-mods :private (hidden: bool) -> LModifiers
-  (LModifiers lk-external hidden false))
+  (LModifiers lk-external hidden false false false))

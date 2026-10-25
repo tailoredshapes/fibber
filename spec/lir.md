@@ -157,6 +157,7 @@ item   ::= (defstruct NAME (type*))
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
          | inline                                  ; a function the optimiser always inlines (§4.3)
+         | noinline | cold                         ; LLVM's function attributes of those names (§4.3), `define` only
          | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
 block  ::= (block LABEL instr+)
 ```
@@ -212,6 +213,12 @@ any order before the calling convention (`duplicate modifier private`,
 | `private` | `private` | no symbol at all: the name exists only inside the module |
 | `hidden` | `hidden` visibility | exported to other modules of the same executable or shared object, but not from it (the ELF/Mach-O sense); a call to it needs no PLT |
 | `inline` | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
+| `noinline` | `noinline` | **Decided** (owner, 2026-10-25: lIR spells what LLVM IR spells, and lair reads no front end's convention out of band): a `define` only (`declare cannot be noinline`, `global cannot be noinline: noinline is for a function`), once (`duplicate modifier noinline`), not with `inline` (`inline and noinline exclude each other`: LLVM's verifier refuses `alwaysinline` with `noinline`); the inliner never inlines the function. For the out-of-line half of a fast path, which LLVM would otherwise inline into its one caller (the runtime's `fib.alloc-slow`, `fib.retain-slow`, `fib.release-slow`, `fib.stack-slow`) |
+| `cold` | `cold` | **Decided** (owner, 2026-10-25): a `define` only (`declare cannot be cold`, `global cannot be cold: cold is for a function`), once; the function is rarely called: when LLVM weighs the edges of a function, a block that a call of it post-dominates is cold too, so it is laid out off the hot path. For a trap or error path |
+
+The C backend
+writes them as gcc's `__attribute__((always_inline))`, `((noinline))` and `((cold))`; the JS and WGSL
+backends have no use for them and ignore them. Cases: `cases/lir/attrs`.
 
 A `declare` and a `declare-global` take `hidden` only: they name a
 symbol defined elsewhere, whose linkage is that definition's (`declare

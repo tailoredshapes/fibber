@@ -126,11 +126,21 @@
           ((Ok t) (recur (+ i 1) (conj out t)))))))
 
 ;; The modifiers at the front of a form and how many words they took.
-(defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool inline: bool))
+(defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool inline: bool noinline: bool cold: bool))
 
-;; The linkage word a modifier names, nil for `hidden` or a non-modifier; the second answer is whether it is a modifier at all.
+;; The code of a modifier word: 0-2 linkage, 3 `hidden`, 4 `shared`, 5 `inline`, 6 `noinline`, 7 `cold`; -1 for a word that is not one.
 (defun modifier-code :private (word: str) -> i64
-  (cond (= word "private") 0 (= word "internal") 1 (= word "external") 2 (= word "hidden") 3 (= word "shared") 4 (= word "inline") 5 :else -1))
+  (cond (= word "private") 0 (= word "internal") 1 (= word "external") 2 (= word "hidden") 3 (= word "shared") 4 (= word "inline") 5
+        (= word "noinline") 6 (= word "cold") 7 :else -1))
+
+;; Whether the flag of the modifier `code` (3 and above) is already set in `m`.
+(defun flag-set? :private (m: Mods code: i64) -> bool
+  (cond (= code 3) (. m hidden) (= code 4) (. m shared) (= code 5) (. m inline) (= code 6) (. m noinline) :else (. m cold)))
+
+;; `m` with the flag of the modifier `code` (3 and above) set.
+(defun with-flag :private (m: Mods code: i64) -> Mods
+  (cond (= code 3) (with m (hidden true)) (= code 4) (with m (shared true)) (= code 5) (with m (inline true))
+        (= code 6) (with m (noinline true)) :else (with m (cold true))))
 
 (defun linkage-of :private (code: i64) -> LLinkage
   (cond (= code 0) lk-private (= code 1) lk-internal :else lk-external))
@@ -139,21 +149,26 @@
   (match l ((LkExternal) "external") ((LkInternal) "internal") ((LkPrivate) "private")))
 
 ;; The linkage and visibility words at the front of `items`, and how many they took (spec/lir.md 4.3). (items.rs `modifiers`)
+;; `inline` and `noinline` exclude each other (LLVM's verifier refuses `alwaysinline` with `noinline`).
 (defun modifiers :private (items: (Vec Sexp)) -> (Result Mods Diagnostic)
-  (loop ((i 0) (linkage lk-external) (seen false) (hidden false) (shared false) (inline false))
+  (loop ((i 0) (seen false) (m (Mods lk-external false 0 false false false false)))
     (let ((word (if (< i (count items)) (atom-or-empty (nth items i)) ""))
           (code (modifier-code (if (< i (count items)) (atom-or-empty (nth items i)) ""))))
       (if (< code 0)
-          (Ok (Mods linkage hidden i shared inline))
+          (Ok (with m (used i)))
           (let ((is-linkage (< code 3))
-                (dup (cond (< code 3) seen (= code 3) hidden (= code 4) shared :else inline)))
-            (cond (and dup is-linkage (not (= (linkage-of code) linkage)))
-                  (err (sexp-pos (nth items i)) (str (linkage-word linkage) " and " word " exclude each other"))
+                (dup (if (< code 3) seen (flag-set? m code))))
+            (cond (and dup is-linkage (not (= (linkage-of code) (. m linkage))))
+                  (err (sexp-pos (nth items i)) (str (linkage-word (. m linkage)) " and " word " exclude each other"))
                   dup (err (sexp-pos (nth items i)) (str "duplicate modifier " word))
-                  is-linkage (recur (+ i 1) (linkage-of code) true hidden shared inline)
-                  (= code 3) (recur (+ i 1) linkage seen true shared inline)
-                  (= code 4) (recur (+ i 1) linkage seen hidden true inline)
-                  :else (recur (+ i 1) linkage seen hidden shared true)))))))
+                  is-linkage (recur (+ i 1) true (with m (linkage (linkage-of code))))
+                  (or (and (= code 5) (. m noinline)) (and (= code 6) (. m inline)))
+                  (err (sexp-pos (nth items i)) "inline and noinline exclude each other")
+                  :else (recur (+ i 1) seen (with-flag m code))))))))
+
+;; The function attribute a `declare` or a global cannot take, if `m` has one: `inline`, `noinline` or `cold` is for a `define`.
+(defun fn-attribute :private (m: Mods) -> (Option str)
+  (cond (. m inline) (some "inline") (. m noinline) (some "noinline") (. m cold) (some "cold") :else nil))
 
 ;; Whether any of the first n items is the atom `external`.
 (defun has-external? :private (items: (Vec Sexp) n: i64) -> bool
@@ -166,7 +181,7 @@
 (defun declared-hidden :private (op: str items: (Vec Sexp)) -> (Result Mods Diagnostic)
   (try-let ((m (modifiers items)))
     (cond (. m shared) (err (sexp-pos (nth items 0)) (str op " cannot be shared"))
-          (. m inline) (err (sexp-pos (nth items 0)) (str op " cannot be inline"))
+          (some? (fn-attribute m)) (err (sexp-pos (nth items 0)) (str op " cannot be " (unwrap-or (fn-attribute m) "")))
           (or (not (= (. m linkage) lk-external)) (has-external? items (. m used)))
           (err (sexp-pos (nth items 0)) (str op " cannot be " (linkage-word (. m linkage))))
           :else (Ok m))))
@@ -177,11 +192,11 @@
       (let ((body (vec-from rest (. m used))))
         (try-let ((_ (arity op body 3 pos))
                   (_ (if (and constant (. m shared)) (err pos "constant cannot be shared: shared memory is written by the block") (Ok ())))
-                  (_ (if (. m inline) (err pos (str op " cannot be inline: inline is for a function")) (Ok ())))
+                  (_ (if-some [a (fn-attribute m)] (err pos (str op " cannot be " a ": " a " is for a function")) (Ok ())))
                   (name (global-name (nth body 0)))
                   (ty (parse-type (nth body 1)))
                   (init (parse-expr (nth body 2))))
-          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden) false) pos (. m shared)))))))))
+          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden) false false false) pos (. m shared)))))))))
 
 (defun declare-global :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
   (try-let ((m (declared-hidden "declare-global" rest)))
@@ -223,7 +238,7 @@
             (ps (params (nth body 1)))
             (blocks (parse-blocks body)))
     (Ok (ItDefine (LFunction name (LFnType (. split cc) ret (. ps types) false) (. ps names) blocks
-                             (LModifiers (. m linkage) (. m hidden) (. m inline)) pos)))))
+                             (LModifiers (. m linkage) (. m hidden) (. m inline) (. m noinline) (. m cold)) pos)))))
 
 (defstruct Params (types: (Vec LType) names: (Vec LParam)))
 

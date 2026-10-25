@@ -187,9 +187,10 @@
   (run! (fn (ps: (Vec Phi)) (run! (fn (ph: Phi) (declare! cf (str (ctype (. cf cx) (. ph ty)) " " (phi-name (. ph pos)) ";"))) ps))
         (vals (. cf phis))))
 
-;; `static` for a private or internal function; an exported one carries its visibility.
+;; `static` for a private or internal function; an exported one carries its visibility; `inline`, `noinline` and `cold` (spec/lir.md 4.3) are gcc's.
 (defun linkage-text (m: LModifiers) -> str
-  (str (if (= (. m linkage) LkExternal) "" "static ") (if (. m hidden) "__attribute__((visibility(\"hidden\"))) " "") (if (. m inline) "__attribute__((always_inline)) inline " "")))
+  (str (if (= (. m linkage) LkExternal) "" "static ") (if (. m hidden) "__attribute__((visibility(\"hidden\"))) " "") (if (. m inline) "__attribute__((always_inline)) inline " "")
+       (if (. m noinline) "__attribute__((noinline)) " "") (if (. m cold) "__attribute__((cold)) " "")))
 
 ;; The parameters, and for a tailcc function the padding `int64_t` ones of the module's stack area (c.policy `tail-pads`).
 (defun params-text (cx: Cx f: LFunction) -> str
@@ -207,7 +208,7 @@
 (defun head-text-with (cx: Cx f: LFunction noinline: bool) -> str
   (if (= (. f name) "main")
       (if (= (count (. f params)) 0) "int32_t main(void)" (str "int32_t main(int32_t " (local-name (. (nth (. f params) 0) name)) ", char **fib_argv)"))
-      (str (linkage-text (. f mods)) (if noinline "__attribute__((noinline)) " "") (ret-ctype cx (. (. f ty) ret)) " " (fn-name (. f name)) (params-text cx f))))
+      (str (linkage-text (. f mods)) (if (and noinline (not (. (. f mods) noinline))) "__attribute__((noinline)) " "") (ret-ctype cx (. (. f ty) ret)) " " (fn-name (. f name)) (params-text cx f))))
 
 ;; The C text of one function. A `kernelcc` function (spec/lir.md 6.9a) is a GPU kernel's entry: an error, and no text.
 (defun function-c (cx: Cx f: LFunction) -> str
