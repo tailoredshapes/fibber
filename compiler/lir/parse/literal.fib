@@ -9,6 +9,7 @@
   (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names))
 
 (extern strtod :private (ptr ptr) -> f64)
+(extern strtof :private (ptr ptr) -> f32)
 
 (defun digit-of :private (b: i64 radix: i64) -> i64
   (let ((v (cond (and (>= b 48) (<= b 57)) (- b 48)
@@ -98,6 +99,15 @@
             (store-i8 (ptr+ p n) 0i8)
             (let ((r (strtod p e))) (do (free e) (free p) r)))))))
 
+;; `strtof` of a clean decimal text: a `float` literal rounds once, to f32 (through a double it could round twice).
+(defun read-f32 :private (s: str) -> f64
+  (let ((bs (str-bytes s)) (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))) (e (alloc 8)))
+        (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+            (store-i8 (ptr+ p n) 0i8)
+            (let ((r (strtof p e))) (do (free e) (free p) (fpext f64 r))))))))
+
 (defun finite? :private (v: f64) -> bool (= (- v v) 0.0))
 
 ;; The f64 a token reads as, or nil when it is not a float token.
@@ -108,18 +118,17 @@
         (float-syntax tok) (some (read-f64 tok))
         :else nil))
 
-;; The value of a `float` or `double` literal token (`inf`, `-inf`, `nan` included); a finite token that rounds to infinity is out of range. (literal.rs `float_value`)
+;; The value of a `float` or `double` literal token (`inf`, `-inf`, `nan` included); a finite token that rounds to infinity is out of range.
+;; A `float` token is read by `strtof`, rounded once to f32 (as a double it could round twice); the value is that f32, as an f64. (literal.rs `float_value`)
 (defun float-value (ty: LType tok: str pos: i64) -> (Result f64 Diagnostic)
   (match (float-token tok)
     (nil (err pos (str "invalid float literal " tok)))
     ((some v)
      (let ((finite-token (not (or (= tok "inf") (= tok "-inf") (= tok "nan"))))
-           (overflow (match ty
-                       ((TFloat) (not (finite? (fpext f64 (fptrunc f32 v)))))
-                       (_ (not (finite? v))))))
-       (if (and finite-token overflow)
+           (value (match ty ((TFloat) (if finite-token (read-f32 tok) v)) (_ v))))
+       (if (and finite-token (not (finite? value)))
            (err pos (str "float literal out of range for " (type-str ty)))
-           (Ok v))))))
+           (Ok value))))))
 
 ;; `(iK n)`, `(float x)`, `(double x)`, `(ptr null)`. (literal.rs `scalar_literal`)
 (defun scalar-literal (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
