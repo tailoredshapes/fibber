@@ -16,6 +16,7 @@
             (match it
               ((ItStruct s) (with acc (structs (assoc (. acc structs) (. s name) s))))
               ((ItTarget _) (with acc (target (conj (. acc target) it))))
+              ((ItOwnership _) (with acc (target (conj (. acc target) it))))
               ((ItDefine f) (with acc (symbols (assoc (. acc symbols) (. f name) it))
                                       (inlines (if (. (. f mods) inline) (conj (. acc inlines) (. f name)) (. acc inlines)))))
               (_ (with acc (symbols (assoc (. acc symbols) (symbol-name it) it))))))
@@ -24,7 +25,7 @@
 (defun exported (it: LItem) -> LItem
   (match it
     ((ItDefine f) (ItDefine (if (= (. (. f mods) linkage) LkExternal) f (with f (mods (with (. f mods) (linkage LkExternal) (hidden true)))))))
-    ((ItGlobal g) (ItGlobal (if (= (. (. g mods) linkage) LkExternal) g (with g (mods (LModifiers LkExternal true false false false))))))
+    ((ItGlobal g) (ItGlobal (if (= (. (. g mods) linkage) LkExternal) g (with g (mods (LModifiers LkExternal true false false false false))))))
     (_ it)))
 (defun declaration (it: LItem) -> LItem
   (match it
@@ -101,9 +102,24 @@
                   (recur (+ i 1))))))
         (vec (sort-by (fn (it: LItem) (match it ((ItStruct s) (. s name)) (_ ""))) @out)))))
 
+;; The functions the module's `ownership` form names (spec/lir.md 6.14.6): every unit carries the form, so every unit imports them, since
+;; erasure (after partitioning) calls them.
+(defun ownership-names (idx: LiroIndex) -> (Vec str)
+  (reduce (fn (acc: (Vec str) it: LItem)
+            (match it
+              ((ItOwnership o) (into acc [(. o retain) (. o release) (. o unique) (. o alloc) (. o stack-init) (. o stack-end)]))
+              (_ acc)))
+          [] (. idx target)))
+
+;; The header struct the form names, which every unit needs too.
+(defun ownership-header (idx: LiroIndex) -> (Vec str)
+  (reduce (fn (acc: (Vec str) it: LItem) (match it ((ItOwnership o) (conj acc (. o header))) (_ acc))) [] (. idx target)))
+
 (defun unit-module (idx: LiroIndex defs: (Vec LItem)) -> LModule
   (let ((d (deps-new)) (own (set (mapv symbol-name defs))))
     (do (doseq [it defs] (item-deps d it))
+        (doseq [n (ownership-names idx)] (set! (. d symbols) (conj @(. d symbols) n)))
+        (doseq [s (ownership-header idx)] (set! (. d structs) (conj @(. d structs) s)))
         (let ((imports (vec (keep (fn (n: str)
                               (if (contains? own n) nil
                                   (match (get (. idx symbols) n) ((some it) (some (declaration (exported it)))) (nil nil))))

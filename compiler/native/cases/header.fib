@@ -18,9 +18,10 @@
   (ExpAccept exit: i64 signals: (Vec CaseSignal) out: (Vec str))
   (ExpReject text: str))
 
-;; `facts`: the check mode the case is built and run under (`facts: trap`, spec/lir.md 6.13), nil for the caller's; `stderr`: texts the error
-;; stream of an accepted run must contain (a trap's message).
-(defstruct CaseHeader (expect: CaseExpect ir: (Vec str) ir-not: (Vec str) paths: CasePaths facts: (Option str) stderr: (Vec str)))
+;; `facts`: the check mode the case is built and run under (`facts: trap`, spec/lir.md 6.13), nil for the caller's; `own`: the mode of the
+;; ownership verifier (`own: verify`, 6.14.5), nil for the caller's; `stderr`: texts the error stream of an accepted run must contain (a
+;; trap's message).
+(defstruct CaseHeader (expect: CaseExpect ir: (Vec str) ir-not: (Vec str) paths: CasePaths facts: (Option str) stderr: (Vec str) own: (Option str)))
 
 (def signal-names: (Vec str) ["SIGILL" "SIGTRAP" "SIGABRT" "SIGFPE" "SIGSEGV" "SIGTERM"])
 (def signal-numbers: (Vec i64) [4 5 6 8 11 15])
@@ -72,9 +73,9 @@
 
 ;; The keys and values of a header so far (header.rs `parse`'s locals).
 (defstruct HAcc (expect: (Option str) exit: i64 out: (Vec str) error: (Option str) signals: (Vec CaseSignal)
-                 ir: (Vec str) ir-not: (Vec str) paths: CasePaths facts: (Option str) stderr: (Vec str)))
+                 ir: (Vec str) ir-not: (Vec str) paths: CasePaths facts: (Option str) stderr: (Vec str) own: (Option str)))
 
-(def h-empty: HAcc (HAcc nil 0 [] nil [] [] [] PathsBoth nil []))
+(def h-empty: HAcc (HAcc nil 0 [] nil [] [] [] PathsBoth nil [] nil))
 
 ;; One header line: the key, and the value with one leading space taken off.
 (defun apply-line :private (a: HAcc key: str value: str) -> (Result HAcc str)
@@ -92,6 +93,10 @@
                           (if (or (= v "use") (= v "trap") (= v "ignore"))
                               (Ok (with a (facts (some v))))
                               (Err (str-concat "bad facts: " v))))
+        (= key "own") (let ((v (s/trim value)))
+                        (if (or (= v "verify") (= v "report") (= v "off"))
+                            (Ok (with a (own (some v))))
+                            (Err (str-concat "bad own: " v))))
         (= key "paths") (let ((v (s/trim value)))
                           (cond (= v "jit") (Ok (with a (paths PathsJit)))
                                 (= v "aot") (Ok (with a (paths PathsAot)))
@@ -123,9 +128,9 @@
     (cond (and acc? (nil? (. a error)) (not (empty? (. a signals))) (not (= (. a exit) 0)))
             (Err "accept case with both exit and signal")
           (and acc? (nil? (. a error)))
-            (Ok (CaseHeader (ExpAccept (. a exit) (. a signals) (. a out)) (. a ir) (. a ir-not) (. a paths) (. a facts) (. a stderr)))
+            (Ok (CaseHeader (ExpAccept (. a exit) (. a signals) (. a out)) (. a ir) (. a ir-not) (. a paths) (. a facts) (. a stderr) (. a own)))
           (and rej? (some? (. a error)) (not (s/blank? (unwrap-or (. a error) ""))))
-            (Ok (CaseHeader (ExpReject (unwrap-or (. a error) "")) (. a ir) (. a ir-not) (. a paths) (. a facts) (. a stderr)))
+            (Ok (CaseHeader (ExpReject (unwrap-or (. a error) "")) (. a ir) (. a ir-not) (. a paths) (. a facts) (. a stderr) (. a own)))
           rej? (Err "reject case without an error text")
           (and acc? (some? (. a error))) (Err "accept case with an error text")
           :else (Err (str-concat "bad or missing expect: "

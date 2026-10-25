@@ -9,14 +9,25 @@
   (:use lir.diag lir.types lir.ast native.imports.program)
   (:require [native.macros :as macros] [lir.check :as check]))
 
-;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported.
-(defstruct Imports (iface: (Cell (Vec LItem)) hidden: (Cell (Map str str)) files: (Cell (Set str))))
+;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported,
+;; and the file whose `ownership` form (spec/lir.md 6.14.6) it took, if any: one per program, as the `target` form.
+(defstruct Imports (iface: (Cell (Vec LItem)) hidden: (Cell (Map str str)) files: (Cell (Set str)) ownership: (Cell (Option str))))
 
 ;; A program loaded: the union of its modules, parsed and expanded, the imported modules checked, the named one not yet; `hidden` explains
 ;; a use of a name an import keeps internal in that check (`explain-hidden`).
 (defstruct Program (module: LModule hidden: (Map str str)))
 
-(defun imports-new :private () -> Imports (Imports (cell []) (cell {}) (cell (set-empty))))
+(defun imports-new :private () -> Imports (Imports (cell []) (cell {}) (cell (set-empty)) (cell nil)))
+
+;; A module that writes an `ownership` form beside the one it imports: `ownership: FILE also has an ownership form` at its own
+;; (spec/lir.md 4.7); nil when the module has none or imports none.
+(defun ownership-clash :private (im: Imports own: (Vec LItem)) -> (Result unit Diagnostic)
+  (match @(. im ownership)
+    (nil (Ok ()))
+    ((some file)
+     (match (first (filter (fn (it: LItem) (match it ((ItOwnership _) true) (_ false))) own))
+       ((some (ItOwnership o)) (err (. o pos) (str "ownership: " file " also has an ownership form")))
+       (_ (Ok ()))))))
 
 ;; ---------------------------------------------------------------- loading
 
@@ -34,7 +45,8 @@
     (let ((own (. (. p module) items)))
       (if (empty? @(. st loaded))
           (Ok (Program (. p module) {}))
-          (try-let ((_ (check-with im (LModule (into @(. im iface) own))))
+          (try-let ((_ (ownership-clash im own))
+                    (_ (check-with im (LModule (into @(. im iface) own))))
                     (items (admit st file own)))
             (Ok (Program (LModule (union-items st items)) @(. im hidden))))))))
 
@@ -72,6 +84,7 @@
 ;; An imported module from its text: parsed, checked with the interface of its own imports, admitted; its export.
 (defun load-text :private (st: State im: Imports src: str file: str) -> (Result Export Diagnostic)
   (try-let ((p (parse-with st im src file))
+            (_ (ownership-clash im (. (. p module) items)))
             (_ (check-with im (LModule (into @(. im iface) (. (. p module) items)))))
             (items (admit st file (. (. p module) items))))
     (do (set! (. st loaded) (conj @(. st loaded) (Loaded file items)))
@@ -80,6 +93,20 @@
 ;; The export of `file` taken into the importing module at the import at `pos`: its interface items there, its internal names remembered,
 ;; its macros defined.
 (defun take-export :private (im: Imports env: macros/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
+  (match (take-ownership im e file pos)
+    ((some d) (some d))
+    (nil (take-items im env e file key pos))))
+
+;; The imported module's `ownership` form, if it has one: the importer's, unless another import brought one already.
+(defun take-ownership :private (im: Imports e: Export file: str pos: i64) -> (Option Diagnostic)
+  (if (some? (first (filter (fn (it: LItem) (match it ((ItOwnership _) true) (_ false))) (. e iface))))
+      (match @(. im ownership)
+        ((some other) (some (Diagnostic pos (str "ownership: " other " also has an ownership form"))))
+        (nil (do (set! (. im ownership) (some file)) nil)))
+      nil))
+
+;; The export's items into the importer: the module once (`key`, its canonical path), its names in messages as written (`file`).
+(defun take-items :private (im: Imports env: macros/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
   (do (set! (. im files) (conj @(. im files) key))
       (set! (. im iface) (into @(. im iface) (mapv (fn (it: LItem) (item-at it pos)) (. e iface))))
       (doseq [n (. e hidden)] (set! (. im hidden) (assoc @(. im hidden) n file)))
@@ -116,7 +143,7 @@
 
 
 ;; What an importer sees: a `declare` of every exported function with its type and visibility, a `declare-global` of every exported global,
-;; every struct; nothing of the module's own declarations, its target or its internal names.
+;; every struct, the `ownership` form (spec/lir.md 6.14.6); nothing of the module's own declarations, its target or its internal names.
 (defun interface :private (items: (Vec LItem)) -> (Vec LItem)
   (loop ((i 0) (out []))
     (if (>= i (count items))
@@ -125,7 +152,8 @@
                (match (nth items i)
                  ((ItDefine f) (if (exported? (. f mods)) (conj out (ItDeclare (LDeclare (. f name) (. f ty) (. (. f mods) hidden) 0))) out))
                  ((ItGlobal g) (if (exported? (. g mods)) (conj out (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) (. (. g mods) hidden) 0))) out))
-                 ((ItStruct s) (conj out (ItStruct (LStructDef (. s name) (. s fields) 0))))
+                 ((ItStruct s) (conj out (ItStruct (LStructDef (. s name) (. s fields) 0 (. s mutable)))))
+                 ((ItOwnership o) (conj out (ItOwnership (with o (pos 0)))))
                  (_ out))))))
 
 ;; The names a module keeps to itself.
@@ -145,4 +173,5 @@
     ((ItDeclare d) (ItDeclare (with d (pos pos))))
     ((ItDeclareGlobal g) (ItDeclareGlobal (with g (pos pos))))
     ((ItStruct s) (ItStruct (with s (pos pos))))
+    ((ItOwnership o) (ItOwnership (with o (pos pos))))
     (_ it)))

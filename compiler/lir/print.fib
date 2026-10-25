@@ -6,7 +6,7 @@
 ;; The text is one form per line, each line the whole form (no indentation): it reads back to the same tree, with other positions. A floating
 ;; literal is written as the shortest decimal that reads back to the same f64; a NaN is written `nan` (its payload is not kept).
 (ns lir.print
-  (:use lir.diag lir.types lir.lit lir.ast))
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin))
 
 ;; The module as lIR text, items in order, one top-level form per line.
 (defun print-module (m: LModule) -> str
@@ -177,9 +177,12 @@
     ((KBarrier) "(barrier)")
     ((KSreg r) (str "(sreg " r ")"))
     ((KIntrin name flags ty args align)
-     (if (= name "load")
-         (range-load-text ty args align)
-         (form (concat-parts [[name] (op-flag-words flags) (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args) (align-words align)]))))
+     (cond (= name "load") (range-load-text ty args align)
+           (= name "managed-null") "((ptr 1) null)"
+           (not (= (own-access-word name) ""))
+           (form (concat-parts [[(if (starts-with? name "load-") "load" "store") (own-access-word name)]
+                                (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args)]))
+           :else (form (concat-parts [[name] (op-flag-words flags) (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args) (align-words align)]))))
     ((KCall callee args tail) (print-call callee args tail))
     ((KRet v) (match v ((some x) (form ["ret" (print-expr x)])) (nil "(ret)")))
     ((KBr l) (form ["br" l]))
@@ -212,14 +215,18 @@
 (defun linkage-words :private (m: LModifiers) -> (Vec str)
   (concat-parts [(match (. m linkage) ((LkExternal) []) ((LkInternal) ["internal"]) ((LkPrivate) ["private"]))
                  (flag-words (. m hidden) "hidden") (flag-words (. m inline) "inline")
-                 (flag-words (. m noinline) "noinline") (flag-words (. m cold) "cold")]))
+                 (flag-words (. m noinline) "noinline") (flag-words (. m cold) "cold") (flag-words (. m unsafe) "unsafe")]))
 
 (defun cc-words :private (f: LFnType) -> (Vec str)
   (match (. f cc) ((CcC) []) ((CcTail) ["tailcc"]) ((CcKernel) ["kernelcc"]) ((CcPreserve) ["preservemost"])))
 
 (defun print-item :private (it: LItem) -> str
   (match it
-    ((ItStruct s) (form ["defstruct" (. s name) (form (vec (map type-str (. s fields))))]))
+    ((ItStruct s) (form (concat-parts [["defstruct"] (flag-words (. s mutable) "mutable") [(. s name) (form (vec (map type-str (. s fields))))]])))
+    ((ItOwnership o)
+     (form ["ownership" (form ["retain" (str "@" (. o retain))]) (form ["release" (str "@" (. o release))]) (form ["unique" (str "@" (. o unique))])
+            (form ["alloc" (str "@" (. o alloc))]) (form ["stack-init" (str "@" (. o stack-init))]) (form ["stack-end" (str "@" (. o stack-end))])
+            (form ["header" (str "%struct." (. o header))])]))
     ((ItGlobal g)
      (form (concat-parts [[(if (. g constant) "constant" "global")] (linkage-words (. g mods)) (flag-words (. g shared) "shared")
                           [(. g name) (type-str (. g ty)) (print-expr (. g init))]])))
@@ -239,7 +246,11 @@
   (form (loop ((i 0) (out []))
           (if (>= i (count (. f params)))
               out
-              (recur (+ i 1) (conj out (form [(type-str (nth (. (. f ty) params) i)) (. (nth (. f params) i) name)])))))))
+              (recur (+ i 1) (conj out (param-text (nth (. (. f ty) params) i) (. (nth (. f params) i) name))))))))
+
+;; `(T name)`, or `((ptr 1) owned name)` for a parameter of the owned kind (spec/lir.md 6.14.2).
+(defun param-text :private (t: LType name: str) -> str
+  (if (type-owned? t) (form ["(ptr 1)" "owned" name]) (form [(type-str t) name])))
 
 (defun block-text :private (b: LBlock) -> str
   (form (concat-parts [["block" (. b label)] (exprs-text (. b body))])))

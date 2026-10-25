@@ -21,10 +21,12 @@
 ;; structs, the file whose `target` form the program has, and every module's environment (closed together: an importer may use a module's
 ;; macros until the program is read).
 (defstruct State (loaded: (Cell (Vec Loaded)) loading: (Cell (Set str)) exports: (Cell (Map str Export)) names: (Cell (Map str Owner))
-                  structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec macros/Env))))
+                  structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec macros/Env))
+                  ;; the file whose `ownership` form the program has (spec/lir.md 6.14.6), one as the `target`
+                  ownership: (Cell (Option str))))
 
 (defun state-new () -> State
-  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell [])))
+  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell []) (cell nil)))
 
 ;; ---------------------------------------------------------------- admission
 
@@ -53,6 +55,7 @@
   (match it
     ((ItStruct s) (admit-struct st file s renames))
     ((ItTarget t) (admit-target st file t renames))
+    ((ItOwnership o) (admit-ownership st file o renames))
     ((ItDefine f) (admit-symbol st file own (. f name) (fn-type-str (. f ty)) true (exported? (. f mods)) (. f pos) renames))
     ((ItGlobal g) (admit-symbol st file own (. g name) (type-str (. g ty)) true (exported? (. g mods)) (. g pos) renames))
     ((ItDeclare d) (admit-symbol st file own (. d name) (fn-type-str (. d ty)) false true (. d pos) renames))
@@ -67,6 +70,12 @@
   (match @(. st target)
     ((some other) (err (. t pos) (str "target: " other " also has a target form")))
     (nil (do (set! (. st target) (some file)) (Ok renames)))))
+
+;; One `ownership` form per program (spec/lir.md 4.7, 6.14.6), as the `target`.
+(defun admit-ownership :private (st: State file: str o: LOwnership renames: (Map str str)) -> (Result (Map str str) Diagnostic)
+  (match @(. st ownership)
+    ((some other) (err (. o pos) (str "ownership: " other " also has an ownership form")))
+    (nil (do (set! (. st ownership) (some file)) (Ok renames)))))
 
 (defun record :private (st: State name: str o: Owner) -> unit
   (set! (. st names) (assoc @(. st names) name o)))

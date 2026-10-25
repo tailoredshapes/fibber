@@ -1,0 +1,133 @@
+;; compiler/lir/own/ctx.fib: the per-function context of the ownership verifier (spec/lir.md 6.14.5): the table of managed SSA values,
+;; the dataflow state, and the reporting of a violation. lir.own.table fills the table, lir.own.eval is the transfer function over it,
+;; lir.own.flow the driver, lir.own the entry.
+;;
+;; A managed value is a parameter or a `let`-bound name of type `(ptr 1)`; an alias `(let ((y x)) ..)` is the same value. Each has an index
+;; (its id) in `vals`; the dataflow state is one word per id: `st-undef` (not defined on this path), `st-live`, `st-evidence` (live with
+;; uniqueness evidence, rule 8) or `st-consumed`. The kinds are 6.14.2's.
+
+(ns lir.own.ctx
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.cfg))
+
+
+;; The kinds of a managed value (spec/lir.md 6.14.2), and `kd-scalar` for a value that is not managed.
+(def kd-scalar: i64 0)
+(def kd-owned: i64 1)
+(def kd-guaranteed: i64 2)
+(def kd-none: i64 3)
+(def kd-stack: i64 4)
+(def kd-interior: i64 5)
+(def kd-unresolved: i64 -1)
+
+(defun kind-word (k: i64) -> str
+  (cond (= k kd-owned) "owned" (= k kd-guaranteed) "guaranteed" (= k kd-none) "none" (= k kd-stack) "stack"
+        (= k kd-interior) "interior address" :else "value"))
+
+;; The states of the dataflow.
+(def st-undef: i64 0)
+(def st-live: i64 1)
+(def st-evidence: i64 2)
+(def st-consumed: i64 3)
+
+(defun st-live? (s: i64) -> bool (or (= s st-live) (= s st-evidence)))
+
+;; A managed value of the function: its name, kind, roots (ids of the owned, stack or guaranteed-parameter values it depends on; itself
+;; for an owned, stack or guaranteed-parameter value), the block that defines it (-1: a parameter), the position of its definition, the
+;; expression that defines it (nil for a parameter), the base object of an interior address (an id, or -1) with the struct the address
+;; was taken through, whether it is a parameter, and `mixed` for a phi that mixes owned and guaranteed values (rule 3).
+(defstruct LoVal (name: str kind: i64 roots: (Vec i64) block: i64 pos: i64 def: (Option LExpr) base: i64 struct: str param: bool mixed: bool))
+
+;; The value of an expression during the transfer: its kind, its id (-1 for a value with no name, such as a `copy-value` used as an
+;; operand), its roots, and for an interior address its base object and struct.
+(defstruct LoV (kind: i64 id: i64 roots: (Vec i64) base: i64 struct: str))
+
+(def val-scalar: LoV (LoV 0 -1 [] -1 ""))
+
+;; `(store borrow g a)` into the stack object `stack`: `roots` are g's (rule 6).
+(defstruct LoBorrow (stack: i64 roots: (Vec i64) pos: i64))
+
+(defstruct LoCx
+  (f: LFunction
+   env: LEnv
+   cfg: Cfg
+   labels: (Map str i64)
+   ;; the statements of each block (lir.check.walk `statements`)
+   stmts: (Vec (Vec LExpr))
+   unsafe: bool
+   binding: (Option LOwnership)
+   ;; the names of the `mutable` structs
+   mutables: (Set str)
+   vals: (Cell (Vec LoVal))
+   ;; name to id, aliases included
+   ids: (Cell (Map str i64))
+   ;; the name bound to `(is-unique x)`, to x's id
+   tests: (Cell (Map str i64))
+   borrows: (Cell (Vec LoBorrow))
+   ;; the state during the transfer of a block, and the block
+   state: (Cell (Vec i64))
+   cur: (Cell i64)
+   ;; whether violations are recorded (the final pass) and where
+   report: (Cell bool)
+   errs: (Cell (Vec Diagnostic))
+   ;; whether the function uses the managed type or a form at all
+   uses: (Cell bool)))
+
+(defun own-new (f: LFunction env: LEnv cfg: Cfg labels: (Map str i64) stmts: (Vec (Vec LExpr)) binding: (Option LOwnership) mutables: (Set str)) -> LoCx
+  (let ((no-vals: (Vec LoVal) (vec-empty)) (no-borrows: (Vec LoBorrow) (vec-empty)) (no-errs: (Vec Diagnostic) (vec-empty))
+        (no-state: (Vec i64) (vec-empty)))
+    (LoCx f env cfg labels stmts (. (. f mods) unsafe) binding mutables (cell no-vals) (cell {}) (cell {}) (cell no-borrows)
+         (cell no-state) (cell 0) (cell false) (cell no-errs) (cell false))))
+
+;; ---------------------------------------------------------------- the table
+
+(defun own-val (cx: LoCx id: i64) -> LoVal (nth @(. cx vals) id))
+
+(defun own-count (cx: LoCx) -> i64 (count @(. cx vals)))
+
+;; The id of a name, -1 for a name that is not a managed value.
+(defun own-id (cx: LoCx name: str) -> i64
+  (match (get @(. cx ids) name) ((some i) i) (nil -1)))
+
+;; Adds a value; its id.
+(defun own-add (cx: LoCx v: LoVal) -> i64
+  (let ((id (own-count cx)))
+    (do (update! (. cx vals) (fn (vs) (conj vs v)))
+        (update! (. cx ids) (fn (m) (assoc m (. v name) id)))
+        id)))
+
+(defun own-set-val (cx: LoCx id: i64 v: LoVal) -> unit
+  (update! (. cx vals) (fn (vs) (assoc vs id v))))
+
+;; The `LoV` of the value with this id.
+(defun own-val-of (cx: LoCx id: i64) -> LoV
+  (let ((v (own-val cx id)))
+    (LoV (. v kind) id (. v roots) (. v base) (. v struct))))
+
+;; ---------------------------------------------------------------- the state
+
+(defun own-state (cx: LoCx id: i64) -> i64 (nth @(. cx state) id))
+
+(defun own-set-state (cx: LoCx id: i64 s: i64) -> unit
+  (update! (. cx state) (fn (st) (assoc st id s))))
+
+(defun own-cur (cx: LoCx) -> i64 @(. cx cur))
+
+(defun own-label (cx: LoCx b: i64) -> str (. (nth (. (. cx f) blocks) b) label))
+
+;; Whether the definition of `id` is available in block `b`: a parameter, or bound in a block that dominates `b`.
+(defun own-defined-in? (cx: LoCx id: i64 b: i64) -> bool
+  (let ((d (. (own-val cx id) block)))
+    (or (< d 0) (cfg-dominates? (. cx cfg) d b))))
+
+;; ---------------------------------------------------------------- reporting
+
+;; Records a violation of rule `n` at `pos` when the pass is the reporting one.
+(defun violation (cx: LoCx n: i64 pos: i64 text: str) -> unit
+  (when @(. cx report)
+    (update! (. cx errs) (fn (es) (conj es (Diagnostic pos (str "ownership rule " n ": " text)))))))
+
+;; The name of a value for a message: its name, or what defines it.
+(defun val-name (cx: LoCx v: LoV) -> str
+  (if (>= (. v id) 0) (. (own-val cx (. v id)) name) (str "the " (kind-word (. v kind)) " value")))
+
+(defun id-name (cx: LoCx id: i64) -> str (. (own-val cx id) name))

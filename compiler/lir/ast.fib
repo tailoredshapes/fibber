@@ -21,12 +21,13 @@
 (defenum LLinkage LkExternal LkInternal LkPrivate)
 (derive Eq LLinkage)
 
-;; The linkage and visibility words a top-level form takes (ast.rs `Modifiers`; the default is external, not hidden), and the function
-;; attributes of a `define` (spec/lir.md 4.3): `inline` (LLVM `alwaysinline`), `noinline` and `cold`.
-(defstruct LModifiers (linkage: LLinkage hidden: bool inline: bool noinline: bool cold: bool))
+;; The linkage and visibility words a top-level form takes (ast.rs `Modifiers`; the default is external, not hidden), the function
+;; attributes of a `define` (spec/lir.md 4.3): `inline` (LLVM `alwaysinline`), `noinline` and `cold`, and `unsafe`, the fence of the
+;; ownership rules (6.14.4), a `define` only.
+(defstruct LModifiers (linkage: LLinkage hidden: bool inline: bool noinline: bool cold: bool unsafe: bool))
 
 ;; Modifiers with the linkage and visibility given and no function attributes.
-(defun mods-of (linkage: LLinkage hidden: bool) -> LModifiers (LModifiers linkage hidden false false false))
+(defun mods-of (linkage: LLinkage hidden: bool) -> LModifiers (LModifiers linkage hidden false false false false))
 
 ;; ast.rs `BinOp`.
 (defenum LBinOp BAdd BSub BMul BSDiv BUDiv BSRem BURem BFAdd BFSub BFMul BFDiv BFRem BAnd BOr BXor BShl BLShr BAShr)
@@ -211,7 +212,12 @@
 
 ;; ---------------------------------------------------------------- items
 
-(defstruct LStructDef (name: str fields: (Vec LType) pos: i64))
+;; `mutable`: its fields may be written without uniqueness evidence (spec/lir.md 6.14.5 rule 8: cells, atoms, task frames).
+(defstruct LStructDef (name: str fields: (Vec LType) pos: i64 mutable: bool))
+
+;; `(ownership (retain @f) (release @f) (unique @f) (alloc @f) (stack-init @f) (stack-end @f) (header %struct.NAME))`: what the ownership
+;; forms lower to (spec/lir.md 6.14.6). The names are without their `@` and `%struct.`.
+(defstruct LOwnership (retain: str release: str unique: str alloc: str stack-init: str stack-end: str header: str pos: i64))
 
 ;; `shared`: the global lives in the block-shared address space of a kernel target (spec/lir.md 6.9a, address space 3 on NVPTX): its content at
 ;; block start is undefined (the initialiser is the type's zero for the grammar only), and `@NAME` is its generic address. Refused off a kernel target.
@@ -239,10 +245,21 @@
   (ItDeclareGlobal decl: LGlobalDecl)
   (ItDeclare decl: LDeclare)
   (ItDefine func: LFunction)
-  (ItTarget decl: LTarget))
+  (ItTarget decl: LTarget)
+  (ItOwnership decl: LOwnership))
 
 ;; A whole module, items in source order (ast.rs `Module`).
 (defstruct LModule (items: (Vec LItem)))
+
+;; The module's `ownership` form, nil when it has none (the checker allows one).
+(defun module-ownership (m: LModule) -> (Option LOwnership)
+  (let ((items (. m items)))
+    (loop ((i 0))
+      (if (>= i (count items))
+          nil
+          (match (nth items i)
+            ((ItOwnership o) (some o))
+            (_ (recur (+ i 1))))))))
 
 ;; The module's `target` form, nil when it has none (the checker allows one).
 (defun module-target (m: LModule) -> (Option LTarget)

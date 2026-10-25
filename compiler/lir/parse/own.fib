@@ -1,0 +1,34 @@
+;; compiler/lir/parse/own.fib: the ownership forms that have their own head (spec/lir.md 6.14.3): `copy-value destroy-value is-unique
+;; alloc-object alloc-stack dealloc-stack addrspacecast`. The qualified loads and stores are lir.parse.memory's and `((ptr 1) null)` lir.parse.expr's.
+;; Each is the form `KIntrin NAME 0 TY ARGS nil` of lir.intrin's class `own`; lir.check.ownforms types them.
+
+(ns lir.parse.own
+  (:use lir.diag lir.types lir.ast lir.sexp lir.intrin lir.parse.names lir.parse.ty))
+
+;; The form for an ownership head, nil for another head.
+(defun parse-own (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
+  (cond (or (= name "copy-value") (= name "destroy-value") (= name "is-unique") (= name "dealloc-stack")) (some (one-operand sub name args pos))
+        (= name "alloc-object") (some (alloc-form sub name args pos 3))
+        (= name "alloc-stack") (some (alloc-form sub name args pos 2))
+        (= name "addrspacecast") (some (cast sub args pos))
+        :else nil))
+
+(defun one-operand :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args 1 pos))
+            (v (operand sub (nth args 0))))
+    (Ok (expr-new (KIntrin name 0 nil [v] nil) pos))))
+
+;; `(alloc-object %struct.T tid n?)`, `(alloc-stack %struct.T tid)`: the struct type, then the operands; `most` operands in all.
+(defun alloc-form :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64 most: i64) -> (Result LExpr Diagnostic)
+  (if (or (< (count args) 2) (> (count args) most))
+      (err pos (str name " expects " (if (= most 3) "2 or 3" "2") " operands, found " (count args)))
+      (try-let ((ty (parse-type (nth args 0)))
+                (ops (operands sub (vec-from args 1))))
+        (Ok (expr-new (KIntrin name 0 (some ty) ops nil) pos)))))
+
+;; `(addrspacecast T v)`: LLVM's cast between address spaces, here between `ptr` and `(ptr 1)` (spec/lir.md 6.14.4).
+(defun cast :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity "addrspacecast" args 2 pos))
+            (ty (parse-type (nth args 0)))
+            (v (operand sub (nth args 1))))
+    (Ok (expr-new (KIntrin "addrspacecast" 0 (some ty) [v] nil) pos))))

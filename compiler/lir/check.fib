@@ -1,7 +1,8 @@
 ;; compiler/lir/check.fib: the whole-module checker (spec/lir.md section 10; crates/lir/src/check/mod.rs). OWNER: package K1.
 
 (ns lir.check
-  (:use lir.diag lir.types lir.ast lir.check.env lir.check.globals lir.check.func))
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.globals lir.check.func)
+  (:require [lir.own :as own]))
 
 
 ;; The first error of one item, as a one-element or empty list.
@@ -11,7 +12,8 @@
     ((ItDefine f) (check-function env f))
     (_ (Ok ()))))
 
-;; Checks the whole module: every error of the module-level rules, else the first error of each global and function. (mod.rs `check`)
+;; Checks the whole module: every error of the module-level rules, else the first error of each global and function, then the ownership
+;; verifier (spec/lir.md 6.14.5, lir.own) over the typed module, on every path. (mod.rs `check`)
 (defun check (m: LModule) -> (Result unit (Vec Diagnostic))
   (match (env-build m)
     ((Err ds) (Err ds))
@@ -19,7 +21,7 @@
      (let ((items (. m items)))
        (loop ((i 0) (errs (vec-empty)))
          (if (>= i (count items))
-             (if (= (count errs) 0) (Ok ()) (Err errs))
+             (if (= (count errs) 0) (own/verify-module m env) (Err errs))
              (recur (+ i 1)
                     (match (check-item env (nth items i))
                       ((Ok _) errs)

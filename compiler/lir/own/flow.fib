@@ -1,0 +1,138 @@
+;; compiler/lir/own/flow.fib: the dataflow of the ownership verifier (spec/lir.md 6.14.5): the state at a block's entry is the merge of its
+;; predecessors' states at the end of their edges to it (rule 3, and rule 1's leaks on an edge), the state at its end the transfer of
+;; lir.own.eval over its statements. The edges carry what the terminator decides: a phi's incoming value is consumed on the edge, and the
+;; true edge of a `br` on `(is-unique x)` gives `x` its uniqueness evidence (rule 8). Rounds until the states settle, then one reporting pass.
+
+(ns lir.own.flow
+  (:use lir.diag lir.types lir.ast lir.check.cfg lir.check.walk lir.own.ctx lir.own.table lir.own.eval))
+
+
+;; A block's state at its end, and the evidence its terminator gives: the index of the true successor and the id tested, or -1.
+(defstruct LoOut (state: (Vec i64) true-block: i64 tested: i64))
+
+;; The state at the entry: parameters live, everything else undefined.
+(defun entry-state (cx: LoCx) -> (Vec i64)
+  (loop ((i 0) (st (vec-fill (own-count cx) st-undef)))
+    (if (>= i (own-count cx)) st (recur (+ i 1) (if (. (own-val cx i) param) (assoc st i st-live) st)))))
+
+;; The id `(is-unique x)` tests when the condition is that form or a name bound to it, else -1.
+(defun tested-id (cx: LoCx c: LExpr) -> i64
+  (match (. c kind)
+    ((KLocal n) (match (get @(. cx tests) n) ((some id) id) (nil -1)))
+    ((KIntrin name _ _ args _)
+     (if (and (= name "is-unique") (= (count args) 1))
+         (match (. (nth args 0) kind) ((KLocal x) (own-id cx x)) (_ -1))
+         -1))
+    (_ -1)))
+
+;; The transfer of block `b` from the state `in`: its forms as written (a top-level `let` keeps its bindings); the terminator is the last
+;; of its statements.
+(defun transfer (cx: LoCx b: i64 in: (Vec i64)) -> LoOut
+  (let ((stmts (nth (. cx stmts) b)))
+    (do (set! (. cx state) in)
+        (set! (. cx cur) b)
+        (doseq [s (. (nth (. (. cx f) blocks) b) body)] (stmt cx s))
+        (match (. (nth stmts (- (count stmts) 1)) kind)
+          ((KCondBr c t f)
+           (if (= t f)
+               (LoOut @(. cx state) -1 -1)
+               (LoOut @(. cx state) (unwrap-or (get (. cx labels) t) -1) (tested-id cx c))))
+          (_ (LoOut @(. cx state) -1 -1))))))
+
+;; Every phi of block `s` (they are at its top, spec/lir.md 5.4).
+(defun phis-of (cx: LoCx s: i64) -> (Vec LExpr)
+  (loop ((es (. (nth (. (. cx f) blocks) s) body)) (acc: (Vec LExpr) []))
+    (if (= (count es) 0)
+        acc
+        (let ((e (nth es 0)) (rest (vec (drop 1 es))))
+          (match (. e kind)
+            ((KPhi _ _) (recur rest (conj acc e)))
+            ((KLet binds body) (recur (into (into (mapv (fn (b: LBinding) (. b value)) binds) body) rest) acc))
+            (_ (recur (into (children e) rest) acc)))))))
+
+;; The incoming value of a phi from the block labelled `from`.
+(defun incoming-from (inc: (Vec LBinding) from: str) -> (Option LExpr)
+  (match (first (filter (fn (b: LBinding) (= (. b name) from)) inc))
+    ((some b) (some (. b value)))
+    (nil nil)))
+
+;; The phis of `s` on the edge from `p`: an owned phi consumes its incoming value, a guaranteed one borrows it.
+(defun edge-phis (cx: LoCx p: i64 s: i64) -> unit
+  (doseq [ph (phis-of cx s)]
+    (match (. ph kind)
+      ((KPhi t inc)
+       (when (type-managed? t)
+         (match (incoming-from inc (own-label cx p))
+           (nil ())
+           ((some e)
+            (let ((v (eval cx e)) (k (. (static-val cx ph) kind)))
+              (cond (= (. v kind) kd-stack) (violation cx 6 (. e pos) (str "stack " (val-name cx v) " is a phi operand"))
+                    (and (= k kd-owned) (or (= (. v kind) kd-owned) (= (. v kind) kd-interior))) (consume cx v (. e pos) 4 "")
+                    :else (use-val cx v (. e pos))))))))
+      (_ ()))))
+
+;; The state on the edge from `p` to `s`: `p`'s end, the evidence its terminator gives `s`, then `s`'s phis.
+(defun edge-state (cx: LoCx p: i64 s: i64 out: LoOut) -> (Vec i64)
+  (let ((base (if (and (= (. out true-block) s) (>= (. out tested) 0) (st-live? (nth (. out state) (. out tested))))
+                  (assoc (. out state) (. out tested) st-evidence)
+                  (. out state))))
+    (do (set! (. cx state) base)
+        (set! (. cx cur) p)
+        (edge-phis cx p s)
+        @(. cx state))))
+
+;; The merge of one value's states from the predecessors' edges (rule 3), and rule 1's leak on an edge into a block the definition does not
+;; dominate.
+(defun merge-id (cx: LoCx id: i64 b: i64 preds: (Vec i64) edges: (Vec (Vec i64)) pos: i64) -> i64
+  (let ((k (. (own-val cx id) kind)) (linear (or (= k kd-owned) (= k kd-stack))))
+    (if (not (own-defined-in? cx id b))
+        (do (dotimes (i (count edges))
+              (when (and linear (st-live? (nth (nth edges i) id)))
+                (violation cx 1 pos (str (if (= k kd-stack) "stack " "owned ") (id-name cx id) " is leaked on the edge from "
+                                         (own-label cx (nth preds i)) " to " (own-label cx b)))))
+            st-undef)
+        (loop ((i 0) (acc st-undef) (from -1))
+          (if (>= i (count edges))
+              acc
+              (let ((s (nth (nth edges i) id)))
+                (cond (= s st-undef) (recur (+ i 1) acc from)
+                      (= acc st-undef) (recur (+ i 1) s (nth preds i))
+                      (and (st-live? s) (st-live? acc)) (recur (+ i 1) (if (and (= s st-evidence) (= acc st-evidence)) st-evidence st-live) from)
+                      (= s acc) (recur (+ i 1) acc from)
+                      :else (do (when linear
+                                  (violation cx 3 pos (str (id-name cx id) " is live from " (own-label cx (if (st-live? s) (nth preds i) from))
+                                                           " and consumed from " (own-label cx (if (st-live? s) from (nth preds i)))
+                                                           " at block " (own-label cx b))))
+                                (recur (+ i 1) st-consumed from)))))))))
+
+;; The state at the entry of block `b` from the predecessors whose end is known.
+(defun merge (cx: LoCx b: i64 outs: (Vec (Option LoOut))) -> (Vec i64)
+  (if (= b 0)
+      (entry-state cx)
+      (let ((preds (filterv (fn (p: i64) (some? (nth outs p))) (nth (. (. cx cfg) preds) b)))
+            (pos (. (nth (. (. cx f) blocks) b) pos)))
+        (let ((edges (mapv (fn (p: i64) (edge-state cx p b (unwrap-or (nth outs p) (LoOut [] -1 -1)))) preds)))
+          (loop ((i 0) (st (vec-fill (own-count cx) st-undef)))
+            (if (>= i (own-count cx)) st (recur (+ i 1) (assoc st i (merge-id cx i b preds edges pos)))))))))
+
+;; One pass over the reachable blocks; whether any end state changed.
+(defun flow-pass (cx: LoCx outs: (Cell (Vec (Option LoOut)))) -> bool
+  (loop ((i 0) (changed false))
+    (if (>= i (count (. (. cx cfg) rpo)))
+        changed
+        (let ((b (nth (. (. cx cfg) rpo) i))
+              (out (transfer cx b (merge cx b @outs)))
+              (old (nth @outs b)))
+          (do (set! outs (assoc @outs b (some out)))
+              (recur (+ i 1) (or changed (not (= (some (. out state)) (match old ((some o) (some (. o state))) (nil nil)))))))))))
+
+;; Rounds to a fixed point (bounded: a state only ever goes from undefined to live to consumed), then the reporting pass.
+(defun run-flow (cx: LoCx) -> unit
+  (let ((none: (Option LoOut) nil)
+        (outs (cell (vec-fill (count (. (. cx f) blocks)) none))))
+    (do (set! (. cx report) false)
+        (loop ((n 0))
+          (when (and (< n 8) (flow-pass cx outs)) (recur (+ n 1))))
+        (set! (. cx report) true)
+        (flow-pass cx outs)
+        ())))

@@ -1,0 +1,171 @@
+;; compiler/lir/own/table.fib: the table of a function's managed values (lir.own.ctx `LoVal`): every parameter and `let` binding of type
+;; `(ptr 1)`, found in one walk over the reachable blocks in reverse postorder, then their kinds and roots resolved from the defining
+;; expressions (spec/lir.md 6.14.2) until nothing changes, since a phi may name a value bound later in its loop.
+
+(ns lir.own.table
+  (:use lir.diag lir.types lir.ast lir.intrin lir.check.env lir.check.cfg lir.check.walk lir.own.ctx))
+
+
+;; ---------------------------------------------------------------- collect
+
+(defun collect-params (cx: LoCx) -> unit
+  (let ((f (. cx f)))
+    (dotimes (i (count (. f params)))
+      (let ((t (nth (. (. f ty) params) i)) (p (nth (. f params) i)))
+        (when (type-managed? (type-param-base t))
+          (do (set! (. cx uses) true)
+              (own-add cx (LoVal (. p name) (if (type-owned? t) kd-owned kd-guaranteed) [] -1 (. p pos) nil -1 "" true false))))))))
+
+;; Whether the expression's value is of type `(ptr 1)`, by its form (the checker has typed the function already).
+(defun managed-expr? (cx: LoCx e: LExpr) -> bool
+  (match (. e kind)
+    ((KLocal n) (>= (own-id cx n) 0))
+    ((KIntrin name _ ty _ _)
+     (cond (not (intrin-own? name)) false
+           (or (= name "destroy-value") (= name "is-unique") (= name "dealloc-stack")) false
+           (starts-with? name "store-") false
+           (= name "addrspacecast") (type-managed? (unwrap-or ty ty-ptr))
+           :else true))
+    ((KCall callee _ _) (managed-result? cx callee))
+    ((KPhi t _) (type-managed? t))
+    ((KSelect _ a b) (or (managed-expr? cx a) (managed-expr? cx b)))
+    ((KGep _ _ p _) (managed-expr? cx p))
+    ((KLoad t _ _ _) (type-managed? t))
+    ((KLet _ body) (and (> (count body) 0) (managed-expr? cx (nth body (- (count body) 1)))))
+    (_ false)))
+
+(defun managed-result? (cx: LoCx callee: LCallee) -> bool
+  (match (callee-type cx callee)
+    ((some t) (match (. t ret) ((some r) (type-managed? r)) (nil false)))
+    (nil false)))
+
+;; The callee's function type: the module's for `@f`, the written one for an indirect call.
+(defun callee-type (cx: LoCx callee: LCallee) -> (Option LFnType)
+  (match callee
+    ((CalDirect n) (match (env-function (. cx env) n 0) ((Ok t) (some t)) ((Err _) nil)))
+    ((CalIndirect _ t) (some t))))
+
+;; Whether the form is an ownership form.
+(defun own-form? (e: LExpr) -> bool
+  (match (. e kind) ((KIntrin name _ _ _ _) (intrin-own? name)) (_ false)))
+
+;; A binding `(name value)` in block `blk`: an alias of a managed value is that value; a managed expression is a new value, unresolved.
+(defun collect-binding (cx: LoCx b: LBinding blk: i64) -> unit
+  (let ((v (. b value)) (name (. b name)))
+    (match (. v kind)
+      ((KLocal y) (let ((id (own-id cx y)))
+                    (when (>= id 0) (update! (. cx ids) (fn (m) (assoc m name id))))))
+      ((KIntrin iname _ _ args _)
+       (if (and (= iname "is-unique") (= (count args) 1))
+           (match (. (nth args 0) kind)
+             ((KLocal x) (let ((id (own-id cx x)))
+                           (when (>= id 0) (update! (. cx tests) (fn (m) (assoc m name id))))))
+             (_ ()))
+           (when (managed-expr? cx v)
+             (do (own-add cx (LoVal name kd-unresolved [] blk (. b pos) (some v) -1 "" false false)) ()))))
+      (_ (when (managed-expr? cx v)
+           (do (own-add cx (LoVal name kd-unresolved [] blk (. b pos) (some v) -1 "" false false)) ()))))))
+
+;; Every binding inside `e`, in evaluation order.
+(defun collect-expr (cx: LoCx e: LExpr blk: i64) -> unit
+  (match (. e kind)
+    ((KLet binds body)
+     (do (doseq [b binds] (do (collect-expr cx (. b value) blk) (collect-binding cx b blk)))
+         (doseq [x body] (collect-expr cx x blk))))
+    (_ (do (when (own-form? e) (set! (. cx uses) true))
+           (doseq [c (children e)] (collect-expr cx c blk))))))
+
+;; The whole function: parameters, then the reachable blocks in reverse postorder, each block's forms as written (a top-level `let` with
+;; its bindings, which `statements` would flatten away).
+(defun collect-function (cx: LoCx) -> unit
+  (do (collect-params cx)
+      (doseq [b (. (. cx cfg) rpo)]
+        (doseq [s (. (nth (. (. cx f) blocks) b) body)] (collect-expr cx s b)))))
+
+;; ---------------------------------------------------------------- resolve
+
+;; The union of two root lists.
+(defun roots-union (a: (Vec i64) b: (Vec i64)) -> (Vec i64)
+  (reduce (fn (acc: (Vec i64) r: i64) (if (includes? r acc) acc (conj acc r))) a b))
+
+;; The roots a value contributes when something is derived from it: itself for an owned, stack or guaranteed-parameter value, else its roots.
+(defun roots-of (v: LoV) -> (Vec i64)
+  (cond (and (>= (. v id) 0) (or (= (. v kind) kd-owned) (= (. v kind) kd-stack))) [(. v id)]
+        :else (. v roots)))
+
+;; The static value of an expression from the table as resolved so far; `kd-unresolved` where an operand is not yet known.
+(defun static-val (cx: LoCx e: LExpr) -> LoV
+  (match (. e kind)
+    ((KLocal n) (let ((id (own-id cx n))) (if (< id 0) val-scalar (own-val-of cx id))))
+    ((KIntrin name _ ty args _) (static-own-form cx name (unwrap-or ty ty-ptr) args))
+    ((KCall callee _ _) (if (managed-result? cx callee) (LoV kd-owned -1 [] -1 "") val-scalar))
+    ((KPhi t inc) (if (type-managed? t) (static-phi cx inc) val-scalar))
+    ((KSelect _ a b) (static-join cx [(static-val cx a) (static-val cx b)] false))
+    ((KGep _ t p _) (static-gep cx t (static-val cx p)))
+    ((KLoad t _ _ _) (if (type-managed? t) (LoV kd-none -1 [] -1 "") val-scalar))
+    ((KLet _ body) (if (= (count body) 0) val-scalar (static-val cx (nth body (- (count body) 1)))))
+    (_ val-scalar)))
+
+(defun static-own-form (cx: LoCx name: str ty: LType args: (Vec LExpr)) -> LoV
+  (cond (or (= name "alloc-object") (= name "copy-value") (= name "load-copy") (= name "load-take")) (LoV kd-owned -1 [] -1 "")
+        (= name "alloc-stack") (LoV kd-stack -1 [] -1 "")
+        (= name "managed-null") (LoV kd-none -1 [] -1 "")
+        (= name "addrspacecast") (if (type-managed? ty) (LoV kd-none -1 [] -1 "") val-scalar)
+        (= name "load-borrow") (let ((a (static-val cx (nth args 0))))
+                                 (if (= (. a kind) kd-unresolved) a (LoV kd-guaranteed -1 (roots-of a) -1 "")))
+        :else val-scalar))
+
+;; An interior address: the base's roots, the base object and the struct addressed.
+(defun static-gep (cx: LoCx t: LType p: LoV) -> LoV
+  (cond (= (. p kind) kd-scalar) val-scalar
+        (= (. p kind) kd-unresolved) p
+        :else (LoV kd-interior -1 (roots-of p) (if (= (. p kind) kd-interior) (. p base) (. p id))
+                   (match t ((TNamed s) s) (_ "")))))
+
+;; A phi's incoming values; an entry naming the phi itself is skipped (a loop).
+(defun static-phi (cx: LoCx inc: (Vec LBinding)) -> LoV
+  (static-join cx (mapv (fn (b: LBinding) (static-val cx (. b value))) inc) true))
+
+;; The join of several values (spec/lir.md 6.14.2): owned and none make owned (a phi) or a guaranteed value rooted in the arms (a select);
+;; guaranteed, interior and none make guaranteed with the roots' union; owned with guaranteed is `mixed` (rule 3), owned.
+(defun static-join (cx: LoCx vs: (Vec LoV) phi: bool) -> LoV
+  (let ((known (filterv (fn (v: LoV) (not (= (. v kind) kd-unresolved))) vs)))
+    (cond (< (count known) (count vs)) (LoV kd-unresolved -1 [] -1 "")
+          (every? (fn (v: LoV) (= (. v kind) kd-scalar)) known) val-scalar
+          :else (let ((roots (reduce (fn (acc: (Vec i64) v: LoV) (roots-union acc (roots-of v))) [] known))
+                      (owned (count (filterv (fn (v: LoV) (or (= (. v kind) kd-owned) (= (. v kind) kd-stack))) known)))
+                      (borrowed (count (filterv (fn (v: LoV) (or (= (. v kind) kd-guaranteed) (= (. v kind) kd-interior))) known))))
+                  (cond (not phi) (LoV kd-guaranteed -1 roots -1 "")
+                        (= owned 0) (LoV kd-guaranteed -1 roots -1 "")
+                        (= borrowed 0) (LoV kd-owned -1 [] -1 "")
+                        :else (LoV kd-owned -2 [] -1 ""))))))
+
+;; One round over the unresolved values; whether any was resolved.
+(defun resolve-round (cx: LoCx) -> bool
+  (loop ((i 0) (changed false))
+    (if (>= i (own-count cx))
+        changed
+        (let ((v (own-val cx i)))
+          (if (or (not (= (. v kind) kd-unresolved)) (nil? (. v def)))
+              (recur (+ i 1) changed)
+              (let ((s (static-val cx (unwrap-or (. v def) (LExpr KNull 0)))))
+                (if (= (. s kind) kd-unresolved)
+                    (recur (+ i 1) changed)
+                    (do (own-set-val cx i (with v (kind (. s kind)) (roots (. s roots)) (base (. s base)) (struct (. s struct))
+                                                 (mixed (= (. s id) -2))))
+                        (recur (+ i 1) true)))))))))
+
+;; A value that stays unresolved after the rounds names itself around a loop with nothing else known: a phi of itself. It is `none`.
+(defun resolve-rest (cx: LoCx) -> unit
+  (dotimes (i (own-count cx))
+    (let ((v (own-val cx i)))
+      (when (= (. v kind) kd-unresolved) (own-set-val cx i (with v (kind kd-none)))))))
+
+;; Kinds and roots of every value: the rounds, then the remainder; a parameter's roots are itself when guaranteed.
+(defun resolve-function (cx: LoCx) -> unit
+  (do (dotimes (i (own-count cx))
+        (let ((v (own-val cx i)))
+          (when (and (. v param) (= (. v kind) kd-guaranteed)) (own-set-val cx i (with v (roots [i]))))))
+      (loop ((n 0))
+        (when (and (< n 16) (resolve-round cx)) (recur (+ n 1))))
+      (resolve-rest cx)))

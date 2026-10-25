@@ -1,0 +1,64 @@
+;; expect: accept
+;; own: verify
+;; out: sum 12
+;; out: stack-end 5
+;; ir: alloca %struct.box
+;; ir: call void @rt.stack-init(ptr
+;; ir: call void @rt.stack-end(ptr
+;; spec/lir.md 6.14: a stack object, used as guaranteed, ended by dealloc-stack; erased to the entry-block alloca and the runtime's calls.
+(declare printf i32 (ptr ...))
+(declare malloc ptr (i64))
+(declare free void (ptr))
+(defstruct hdr (i64 i32 i32))
+(defstruct box (%struct.hdr i64 (ptr 1)))
+(ownership (retain @rt.retain) (release @rt.release) (unique @rt.unique) (alloc @rt.alloc) (stack-init @rt.stack-init) (stack-end @rt.stack-end) (header %struct.hdr))
+(define unsafe internal (rt.alloc ptr) ((i64 size) (i32 tid))
+  (block entry
+    (let ((p (call @malloc size)))
+      (store (i64 1) (getelementptr %struct.hdr p (i32 0) (i32 0)))
+      (store tid (getelementptr %struct.hdr p (i32 0) (i32 1)))
+      (store (i32 0) (getelementptr %struct.hdr p (i32 0) (i32 2)))
+      (call @printf (string "alloc %d size %lld\n") tid size)
+      (ret p))))
+(define unsafe internal (rt.retain void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done inc))
+  (block inc
+    (let ((c (getelementptr %struct.hdr p (i32 0) (i32 0))))
+      (store (add (load i64 c) (i64 1)) c)
+      (call @printf (string "retain %d -> %lld\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))) (load i64 c))
+      (ret)))
+  (block done (ret)))
+(define unsafe internal (rt.release void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done dec))
+  (block dec
+    (let ((c (getelementptr %struct.hdr p (i32 0) (i32 0)))
+          (n (sub (load i64 c) (i64 1))))
+      (store n c)
+      (br (icmp eq n (i64 0)) gone done)))
+  (block gone
+    (call @printf (string "free %d\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))))
+    (call @free p)
+    (ret))
+  (block done (ret)))
+(define unsafe internal (rt.unique i1) ((ptr p))
+  (block entry (ret (icmp eq (load i64 (getelementptr %struct.hdr p (i32 0) (i32 0))) (i64 1)))))
+(define unsafe internal (rt.stack-init void) ((ptr p) (i32 tid))
+  (block entry
+    (store (i64 0) (getelementptr %struct.hdr p (i32 0) (i32 0)))
+    (store tid (getelementptr %struct.hdr p (i32 0) (i32 1)))
+    (store (i32 4) (getelementptr %struct.hdr p (i32 0) (i32 2)))
+    (ret)))
+(define unsafe internal (rt.stack-end void) ((ptr p))
+  (block entry
+    (call @printf (string "stack-end %d\n") (load i32 (getelementptr %struct.hdr p (i32 0) (i32 1))))
+    (ret)))
+(define internal (peek i64) (((ptr 1) b))
+  (block entry (ret (load i64 (getelementptr %struct.box b (i32 0) (i32 1))))))
+(define (main i32) ()
+  (block entry
+    (let ((s (alloc-stack %struct.box (i32 5))))
+      (store (i64 12) (getelementptr %struct.box s (i32 0) (i32 1)))
+      (store init ((ptr 1) null) (getelementptr %struct.box s (i32 0) (i32 2)))
+      (call @printf (string "sum %lld\n") (call @peek s))
+      (dealloc-stack s)
+      (ret (i32 0)))))

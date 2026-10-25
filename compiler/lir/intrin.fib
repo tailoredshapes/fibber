@@ -17,6 +17,12 @@
 ;;   ibin         the facts `add sub mul shl` carrying `nsw`/`nuw` (spec/lir.md 6.13): 2 operands, as the unflagged `KBin`
 ;;   assume       `assume`: one i1 operand, void (`llvm.assume`)
 ;;   rload        `load` with `(range LO HI)`: the type, the pointer and the two bounds (written by lir.parse.memory, never by `parse-intrin`)
+;;   own          the ownership forms of spec/lir.md 6.14.3, parsed by lir.parse.own and lir.parse.memory (never by `parse-intrin`), typed by
+;;                lir.check.ownforms, verified by lir.own and erased by lir.own.erase before any backend: `copy-value destroy-value is-unique`
+;;                `dealloc-stack` (one operand), `alloc-object` (the struct type, the type id and an optional count), `alloc-stack` (the type and the id),
+;;                `load-copy load-borrow load-take` (written `(load copy (ptr 1) a)`: the type and the address), `store-init store-assign
+;;                store-borrow` (written `(store init v a)`: the value and the address), `addrspacecast` (the type and the value) and
+;;                `managed-null` (written `((ptr 1) null)`: the type, no operand)
 (ns lir.intrin)
 
 
@@ -50,7 +56,21 @@
    "spin-hint" (IntrinInfo "hint" "") "cache-line" (IntrinInfo "const" "")
    "stack-addr" (IntrinInfo "const" "llvm.stacksave")
    "add" (IntrinInfo "ibin" "add") "sub" (IntrinInfo "ibin" "sub") "mul" (IntrinInfo "ibin" "mul") "shl" (IntrinInfo "ibin" "shl")
-   "assume" (IntrinInfo "assume" "llvm.assume") "load" (IntrinInfo "rload" "")})
+   "assume" (IntrinInfo "assume" "llvm.assume") "load" (IntrinInfo "rload" "")
+   "copy-value" (IntrinInfo "own" "") "destroy-value" (IntrinInfo "own" "") "is-unique" (IntrinInfo "own" "")
+   "alloc-object" (IntrinInfo "own" "") "alloc-stack" (IntrinInfo "own" "") "dealloc-stack" (IntrinInfo "own" "")
+   "load-copy" (IntrinInfo "own" "") "load-borrow" (IntrinInfo "own" "") "load-take" (IntrinInfo "own" "")
+   "store-init" (IntrinInfo "own" "") "store-assign" (IntrinInfo "own" "") "store-borrow" (IntrinInfo "own" "")
+   "addrspacecast" (IntrinInfo "own" "") "managed-null" (IntrinInfo "own" "")})
+
+;; Whether the form is an ownership form (class `own`, spec/lir.md 6.14.3).
+(defun intrin-own? (name: str) -> bool (= (intrin-class name) "own"))
+
+;; The word after `load` or `store` of an ownership load or store (`copy`, `init`, ..), "" for another form.
+(defun own-access-word (name: str) -> str
+  (cond (= name "load-copy") "copy" (= name "load-borrow") "borrow" (= name "load-take") "take"
+        (= name "store-init") "init" (= name "store-assign") "assign" (= name "store-borrow") "borrow"
+        :else ""))
 
 (defun intrin-info (name: str) -> (Option IntrinInfo) (get intrin-table name))
 
@@ -85,7 +105,9 @@
 
 ;; Whether the form starts with a type operand.
 (defun intrin-typed? (name: str) -> bool
-  (or (= name "masked-load") (= name "gather") (= name "load")))
+  (or (= name "masked-load") (= name "gather") (= name "load")
+      (= name "alloc-object") (= name "alloc-stack") (= name "addrspacecast") (= name "managed-null")
+      (starts-with? name "load-")))
 
 ;; Whether the form may end in `(align N)`.
 (defun intrin-aligned? (name: str) -> bool

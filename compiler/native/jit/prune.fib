@@ -22,12 +22,16 @@
     ((ItGlobal g) (some (. g name)))
     (_ nil)))
 
-;; The module without the internal and private definitions that no exported one reaches, in the Rust's order. (prune.rs `dead_internals`)
+;; The module without the internal and private definitions that no exported one reaches, in the Rust's order. The functions the
+;; `ownership` form names are roots too: erasure (spec/lir.md 6.14.7), which comes after pruning, calls them. (prune.rs `dead_internals`)
 (defun dead-internals (m: LModule) -> LModule
   (let ((items (. m items))
         (r (PruneSearch (defined-of (. m items)) (cell {}) (cell []))))
     (do (dotimes (i (count items))
           (if (item-exported? (nth items i)) (set! (. r work) (conj @(. r work) (nth items i))) ()))
+        (match (module-ownership m)
+          ((some o) (doseq [n [(. o retain) (. o release) (. o unique) (. o alloc) (. o stack-init) (. o stack-end)]] (reach r n)))
+          (nil ()))
         (scan-all r)
         (LModule (vec (filter (fn (it: LItem) -> bool (keep? r it)) items))))))
 

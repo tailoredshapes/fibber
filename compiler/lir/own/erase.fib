@@ -1,0 +1,202 @@
+;; compiler/lir/own/erase.fib: erasure of the ownership section (spec/lir.md 6.14.7): the last pass before LLVM or a printer, after the
+;; verifier and the slot lir.own.opt. `(ptr 1)` becomes `ptr` everywhere, each form becomes the runtime call the module's `ownership`
+;; form names, `unsafe`, `mutable` and the form itself are dropped. A rewrite of the tree, local to each expression: a binding of
+;; `copy-value`, `load copy`, `load take` or `alloc-stack` takes the shape of the table (a retain after the binding, a null store, an
+;; entry-block alloca), so that the result is what the front end wrote before the section existed.
+
+(ns lir.own.erase
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin lir.check.walk)
+  (:require [lir.rewrite :as rw] [lir.own.layout :as layout]))
+
+
+;; ---------------------------------------------------------------- types
+
+(defun erase-type (t: LType) -> LType
+  (match t
+    ((TManaged) ty-ptr)
+    ((TOwned) ty-ptr)
+    ((TVector n e) (TVector n (erase-type e)))
+    ((TArray n e) (TArray n (erase-type e)))
+    ((TAnon fs) (TAnon (mapv erase-type fs)))
+    (_ t)))
+
+(defun erase-fn-type (f: LFnType) -> LFnType
+  (LFnType (. f cc) (match (. f ret) ((some r) (some (erase-type r))) (nil nil)) (mapv erase-type (. f params)) (. f varargs)))
+
+;; The types written in one node (its children are done separately).
+(defun retype (e: LExpr) -> LExpr
+  (let ((p (. e pos)))
+    (match (. e kind)
+      ((KVector t es) (LExpr (KVector (erase-type t) es) p))
+      ((KArray t es) (LExpr (KArray (erase-type t) es) p))
+      ((KZero t) (LExpr (KZero (erase-type t)) p))
+      ((KCast op t v) (LExpr (KCast op (erase-type t) v) p))
+      ((KAlloca t n a) (LExpr (KAlloca (erase-type t) n a) p))
+      ((KLoad t q v a) (LExpr (KLoad (erase-type t) q v a) p))
+      ((KGep i t q ix) (LExpr (KGep i (erase-type t) q ix) p))
+      ((KPhi t inc) (LExpr (KPhi (erase-type t) inc) p))
+      ((KIntrin n f t args a) (LExpr (KIntrin n f (match t ((some x) (some (erase-type x))) (nil nil)) args a) p))
+      ((KCall (CalIndirect c t) args tail) (LExpr (KCall (CalIndirect c (erase-fn-type t)) args tail) p))
+      (_ e))))
+
+;; ---------------------------------------------------------------- the context of one function
+
+(defstruct LoEcx (o: LOwnership structs: (Map str (Vec LType)) pb: i64
+                ;; the names the function binds, and the counter of fresh ones
+                bound: (Set str) fresh: (Cell i64)
+                ;; the allocas hoisted to the entry block, and the renames `copy-value` bindings leave behind
+                allocas: (Cell (Vec LBinding)) renames: (Cell (Map str str))))
+
+(defun fresh-name (cx: LoEcx) -> str
+  (loop ()
+    (let ((n (str "own." @(. cx fresh))))
+      (do (set! (. cx fresh) (+ @(. cx fresh) 1))
+          (if (contains? (. cx bound) n) (recur) n)))))
+
+(defun call-of (cx: LoEcx f: str args: (Vec LExpr) p: i64) -> LExpr
+  (LExpr (KCall (CalDirect f) args false) p))
+
+(defun int-of (v: i64 p: i64) -> LExpr (LExpr (KInt ty-i64 (lit-of v)) p))
+
+(defun local (n: str p: i64) -> LExpr (LExpr (KLocal n) p))
+
+(defun ptr-load (a: LExpr p: i64) -> LExpr (LExpr (KLoad ty-ptr a false nil) p))
+
+;; `(let ((t v)) stmts.. t)`: the value `v` bound to a fresh name with statements after it, as a value.
+(defun value-let (cx: LoEcx v: LExpr stmts: (fn (LExpr) (Vec LExpr)) p: i64) -> LExpr
+  (let ((t (fresh-name cx)))
+    (LExpr (KLet [(LBinding t v p)] (conj (stmts (local t p)) (local t p))) p)))
+
+;; ---------------------------------------------------------------- the forms
+
+;; `(call @ALLOC (i64 S) tid)`, or with a count `(call @ALLOC (add (i64 S) (mul (i64 E) n)) tid)`.
+(defun alloc-call (cx: LoEcx t: LType args: (Vec LExpr) p: i64) -> LExpr
+  (let ((name (match t ((TNamed s) s) (_ "")))
+        (size (int-of (layout/struct-size (. cx structs) (. cx pb) name) p)))
+    (if (= (count args) 1)
+        (call-of cx (. (. cx o) alloc) [size (nth args 0)] p)
+        (let ((elem (int-of (layout/trailing-elem-size (. cx structs) (. cx pb) name) p)))
+          (call-of cx (. (. cx o) alloc) [(LExpr (KBin BAdd size (LExpr (KBin BMul elem (nth args 1)) p)) p) (nth args 0)] p)))))
+
+;; A stack object in operand position: its alloca hoisted under a fresh name, the init where it stood.
+(defun stack-value (cx: LoEcx t: LType tid: LExpr p: i64) -> LExpr
+  (let ((s (fresh-name cx)))
+    (do (update! (. cx allocas) (fn (as) (conj as (LBinding s (LExpr (KAlloca (erase-type t) nil nil) p) p))))
+        (LExpr (KLet [] [(call-of cx (. (. cx o) stack-init) [(local s p) tid] p) (local s p)]) p))))
+
+;; One ownership form, its operands already erased, in value or statement position.
+(defun erase-own (cx: LoEcx name: str t: LType args: (Vec LExpr) p: i64) -> LExpr
+  (let ((o (. cx o)))
+    (cond (= name "managed-null") (LExpr KNull p)
+          (= name "copy-value") (value-let cx (nth args 0) (fn (x: LExpr) [(call-of cx (. o retain) [x] p)]) p)
+          (= name "destroy-value") (call-of cx (. o release) [(nth args 0)] p)
+          (= name "dealloc-stack") (call-of cx (. o stack-end) [(nth args 0)] p)
+          (= name "is-unique") (call-of cx (. o unique) [(nth args 0)] p)
+          (= name "alloc-object") (alloc-call cx t args p)
+          (= name "alloc-stack") (stack-value cx t (nth args 0) p)
+          (= name "load-copy") (value-let cx (ptr-load (nth args 0) p) (fn (x: LExpr) [(call-of cx (. o retain) [x] p)]) p)
+          (= name "load-borrow") (ptr-load (nth args 0) p)
+          (= name "load-take") (value-let cx (ptr-load (nth args 0) p) (fn (x: LExpr) [(LExpr (KStore (LExpr KNull p) (nth args 0) false nil) p)]) p)
+          (= name "store-assign")
+          (value-let cx (ptr-load (nth args 1) p)
+                     (fn (old: LExpr) [(LExpr (KStore (nth args 0) (nth args 1) false nil) p) (call-of cx (. o release) [old] p)]) p)
+          (or (= name "store-init") (= name "store-borrow")) (LExpr (KStore (nth args 0) (nth args 1) false nil) p)
+          :else (nth args 0))))   ;; addrspacecast
+
+;; ---------------------------------------------------------------- expressions
+
+;; `e` erased: children first, then its own types, then the form.
+(defun erase-expr (cx: LoEcx e: LExpr) -> LExpr
+  (match (. e kind)
+    ((KLet binds body) (erase-let cx binds body (. e pos)))
+    (_ (let ((x (retype (rw/map-children e (fn (c: LExpr) (erase-expr cx c))))))
+         (match (. x kind)
+           ((KIntrin name _ t args _) (if (intrin-own? name) (erase-own cx name (unwrap-or t ty-ptr) args (. x pos)) x))
+           (_ x))))))
+
+;; A segment of an erased `let`: a binding kept, or a statement that stands between bindings.
+(defenum LoSeg (LoBind b: LBinding) (LoStmt e: LExpr))
+
+;; The segments of one binding: the shapes of the table for `copy-value`, `load copy`, `load take` and `alloc-stack` as the value of a
+;; binding, else the binding with its value erased.
+(defun erase-binding (cx: LoEcx b: LBinding) -> (Vec LoSeg)
+  (let ((p (. b pos)) (x (. b name)) (o (. cx o)))
+    (match (. (. b value) kind)
+      ((KIntrin name _ t args0 _)
+       (let ((args (mapv (fn (a: LExpr) (erase-expr cx a)) args0)))
+         (cond (and (= name "copy-value") (local? (nth args 0)))
+               (do (update! (. cx renames) (fn (m) (assoc m x (local-name (nth args 0)))))
+                   [(LoStmt (call-of cx (. o retain) [(nth args 0)] p))])
+               (= name "copy-value") [(LoBind (LBinding x (nth args 0) p)) (LoStmt (call-of cx (. o retain) [(local x p)] p))]
+               (= name "load-copy") [(LoBind (LBinding x (ptr-load (nth args 0) p) p)) (LoStmt (call-of cx (. o retain) [(local x p)] p))]
+               (= name "load-take") [(LoBind (LBinding x (ptr-load (nth args 0) p) p)) (LoStmt (LExpr (KStore (LExpr KNull p) (nth args 0) false nil) p))]
+               (= name "alloc-stack")
+               (do (update! (. cx allocas) (fn (as) (conj as (LBinding x (LExpr (KAlloca (erase-type (unwrap-or t ty-ptr)) nil nil) p) p))))
+                   [(LoStmt (call-of cx (. o stack-init) [(local x p) (nth args 0)] p))])
+               :else [(LoBind (LBinding x (erase-expr cx (. b value)) p))])))
+      (_ [(LoBind (LBinding x (erase-expr cx (. b value)) p))]))))
+
+(defun local? (e: LExpr) -> bool (match (. e kind) ((KLocal _) true) (_ false)))
+(defun local-name (e: LExpr) -> str (match (. e kind) ((KLocal n) n) (_ "")))
+
+;; `(let (b..) body..)` from its segments: the bindings up to a statement, the statement, then the rest as the body, nested.
+(defun build-let (segs: (Vec LoSeg) body: (Vec LExpr) p: i64) -> (Vec LExpr)
+  (if (= (count segs) 0)
+      body
+      (let ((n (loop ((i 0)) (if (and (< i (count segs)) (match (nth segs i) ((LoBind _) true) (_ false))) (recur (+ i 1)) i)))
+            (binds (mapv (fn (s: LoSeg) (match s ((LoBind b) b) ((LoStmt e) (LBinding "" e 0)))) (vec (take n segs))))
+            (rest (vec (drop n segs))))
+        (let ((inner (if (= (count rest) 0)
+                         body
+                         (match (nth rest 0)
+                           ((LoStmt e) (into [e] (build-let (vec (drop 1 rest)) body p)))
+                           ((LoBind _) body)))))
+          (if (= n 0) inner [(LExpr (KLet binds inner) p)])))))
+
+(defun erase-let (cx: LoEcx binds: (Vec LBinding) body: (Vec LExpr) p: i64) -> LExpr
+  (let ((segs (reduce (fn (acc: (Vec LoSeg) b: LBinding) (into acc (erase-binding cx b))) (vec-empty) binds))
+        (ebody (mapv (fn (e: LExpr) (erase-expr cx e)) body))
+        (out (build-let segs ebody p)))
+    (if (and (= (count out) 1) (match (. (nth out 0) kind) ((KLet _ _) true) (_ false)))
+        (nth out 0)
+        (LExpr (KLet [] out) p))))
+
+;; ---------------------------------------------------------------- items
+
+(defun erase-block (cx: LoEcx b: LBlock) -> LBlock
+  (with b (body (mapv (fn (e: LExpr) (erase-expr cx e)) (. b body)))))
+
+;; The function: every block erased, the hoisted allocas first in the entry block, the renames applied.
+(defun erase-function (o: LOwnership structs: (Map str (Vec LType)) pb: i64 f: LFunction) -> LFunction
+  (let ((bound (match (bindings f) ((Ok b) (reduce (fn (s: (Set str) n: str) (conj s n)) (set-empty) (keys (. b defs)))) ((Err _) (set-empty))))
+        (cx (LoEcx o structs pb bound (cell 0) (cell (vec-empty)) (cell {}))))
+    (let ((blocks (mapv (fn (b: LBlock) (erase-block cx b)) (. f blocks)))
+          (allocas @(. cx allocas)) (renames @(. cx renames)))
+      (let ((hoisted (if (= (count allocas) 0)
+                         blocks
+                         (assoc blocks 0 (with (nth blocks 0) (body [(LExpr (KLet allocas (. (nth blocks 0) body)) (. (nth blocks 0) pos))])))))
+            (renamed (fn (b: LBlock) (if (= (count renames) 0) b (with b (body (mapv (fn (e: LExpr) (rw/substitute-locals e renames)) (. b body))))))))
+        (with f (ty (erase-fn-type (. f ty))) (mods (with (. f mods) (unsafe false))) (blocks (mapv renamed hoisted)))))))
+
+(defun erase-item (o: LOwnership structs: (Map str (Vec LType)) pb: i64 it: LItem) -> (Option LItem)
+  (match it
+    ((ItOwnership _) nil)
+    ((ItStruct s) (some (ItStruct (with s (fields (mapv erase-type (. s fields))) (mutable false)))))
+    ((ItGlobal g) (some (ItGlobal (with g (ty (erase-type (. g ty))) (init (erase-expr (LoEcx o structs pb (set-empty) (cell 0) (cell (vec-empty)) (cell {})) (. g init)))))))
+    ((ItDeclareGlobal g) (some (ItDeclareGlobal (with g (ty (erase-type (. g ty)))))))
+    ((ItDeclare d) (some (ItDeclare (with d (ty (erase-fn-type (. d ty)))))))
+    ((ItDefine f) (some (ItDefine (erase-function o structs pb f))))
+    ((ItTarget _) (some it))))
+
+(defun struct-table (m: LModule) -> (Map str (Vec LType))
+  (reduce (fn (acc: (Map str (Vec LType)) it: LItem) (match it ((ItStruct s) (assoc acc (. s name) (. s fields))) (_ acc))) {} (. m items)))
+
+;; The module erased for a target whose pointers are `pb` bytes; a module without an `ownership` form has nothing to erase (the checker
+;; refuses one that uses the managed type without the form) and is returned as it is.
+(defun erase-module (m: LModule pb: i64) -> LModule
+  (match (module-ownership m)
+    (nil m)
+    ((some o)
+     (let ((structs (struct-table m)))
+       (LModule (reduce (fn (acc: (Vec LItem) it: LItem) (match (erase-item o structs pb it) ((some x) (conj acc x)) (nil acc)))
+                        (vec-empty) (. m items)))))))

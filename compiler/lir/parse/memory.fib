@@ -35,7 +35,29 @@
       ((some items) (if volatile
                         (err (sexp-pos (nth rest 0)) "range on a volatile load")
                         (range-load sub items (sexp-pos (nth rest 0)) (vec-from rest 1) pos)))
-      (nil (plain-load sub args pos)))))
+      (nil (if (= (own-word "load" args) "") (plain-load sub args pos) (own-load sub (own-word "load" args) (vec-from args 1) pos))))))
+
+;; The ownership word of a load or store (spec/lir.md 6.14.3), read by the operand count: `(load copy (ptr 1) a)` has three operands
+;; where a plain load has two, `(store init v a)` three where a plain store has two; "" for a plain access.
+(defun own-word :private (op: str args: (Vec Sexp)) -> str
+  (if (not (= (count args) 3))
+      ""
+      (let ((w (atom-or-empty (nth args 0))))
+        (cond (and (= op "load") (or (= w "copy") (= w "borrow") (= w "take"))) w
+              (and (= op "store") (or (= w "init") (= w "assign") (= w "borrow"))) w
+              :else ""))))
+
+;; `(load WORD T a)`: the form `load-WORD` with the type and the address (lir.intrin class `own`).
+(defun own-load :private (sub: ExprParser w: str rest: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((ty (parse-type (nth rest 0)))
+            (p (operand sub (nth rest 1))))
+    (Ok (expr-new (KIntrin (str "load-" w) 0 (some ty) [p] nil) pos))))
+
+;; `(store WORD v a)`: the form `store-WORD` with the value and the address.
+(defun own-store :private (sub: ExprParser w: str rest: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((v (operand sub (nth rest 0)))
+            (p (operand sub (nth rest 1))))
+    (Ok (expr-new (KIntrin (str "store-" w) 0 nil [v p] nil) pos))))
 
 ;; The items of a leading `(range ..)`, nil when the first operand is not one.
 (defun range-head :private (args: (Vec Sexp)) -> (Option (Vec Sexp))
@@ -70,11 +92,13 @@
     (Ok (expr-new (KLoad ty p (. ac volatile) (. ac align)) pos))))
 
 (defun store :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (try-let ((ac (access-options args))
-            (_ (arity "store" (. ac rest) 2 pos))
-            (v (operand sub (nth (. ac rest) 0)))
-            (p (operand sub (nth (. ac rest) 1))))
-    (Ok (expr-new (KStore v p (. ac volatile) (. ac align)) pos))))
+  (if (not (= (own-word "store" args) ""))
+      (own-store sub (own-word "store" args) (vec-from args 1) pos)
+      (try-let ((ac (access-options args))
+                (_ (arity "store" (. ac rest) 2 pos))
+                (v (operand sub (nth (. ac rest) 0)))
+                (p (operand sub (nth (. ac rest) 1))))
+        (Ok (expr-new (KStore v p (. ac volatile) (. ac align)) pos)))))
 
 ;; A leading `volatile`, then an optional `(align N)`.
 (defun access-options :private (args: (Vec Sexp)) -> (Result Access Diagnostic)
