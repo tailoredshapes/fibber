@@ -116,13 +116,14 @@
   (read-each-with src (readtable-new) (no-runner) f))
 
 ;; `read-each` with a readtable, which `f` may add to as it goes (a binding applies to the forms after the one that made it), and the host's
-;; runner of its entries.
+;; runner of its entries. Under a table that has anything set, the first error is the error: the rest of the text is not lIR's lexer's to
+;; re-lex (`settle`), so a reader macro's diagnostic is never displaced by what lIR's own lexer would say of the text after it.
 (defun read-each-with (src: str table: Readtable run: Runner f: (fn (Sexp) (Option Diagnostic)) :borrow) -> (Option Diagnostic)
   (let ((rd (reader-new src table))
         (held (cell nil)))
     (match (read-forms-each rd run f held)
       (nil @held)
-      ((some d) (match (settle rd d) ((Err e) (some e)) ((Ok _) nil))))))
+      ((some d) (if @(. table active) (some d) (match (settle rd d) ((Err e) (some e)) ((Ok _) nil)))))))
 
 (defun read-forms-each :private (rd: Reader run: Runner f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> (Option Diagnostic)
   (loop ()

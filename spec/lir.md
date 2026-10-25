@@ -573,8 +573,9 @@ character (the `'` of `'x`, the `#` of `#(..)`); a form it read with `lir.read.f
 stood there, inside a list or at the top level, which is how `#_` discards the next form (`cases/lir/readers/discard.lir`). A failure
 recorded with `lir.read.fail` is the module's error, at the position the macro gave or at the character; an error in a form the macro
 read through `lir.read.form` (a lexical error, an unclosed list, a nested macro's failure) is the module's error where it is, whatever
-the macro then returns (`cases/lir/readers/reject-nested-error.lir`). Reader macros nested deeper than 64 (a macro reading a form that
-runs a macro, 64 times in) are `reader macros nested deeper than 64`.
+the macro then returns (`cases/lir/readers/reject-nested-error.lir`). Under a readtable that has anything set, the first error is the
+module's error: lIR's own lexer does not go on over the rest of the text looking for a lexical error of its own to report instead (as it
+does for a module with no readtable, §1), since that text is the macros' to read (`cases/lir/readers/reject-fail-wins.lir`).
 
 **Scope.** A binding applies to the forms after the form that made it, in the module and in a library it is made in; the bindings a
 library makes with `require-macros` (§4.6) are the requiring module's from the require on: a library's reader forms go into the one
