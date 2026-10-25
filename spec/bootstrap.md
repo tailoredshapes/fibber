@@ -1252,7 +1252,7 @@ it printed before the parts had names).
 | `runtime` | the ten files `rt/*.lir`, each followed by a line break, in the order core str array vec vecbuild atom thread task weak io | `compile.rs` `RUNTIME` |
 | `externs` | one `(declare ..)` per `extern` the bodies reached, in first-use order, but those the runtime declares itself | `Program::render_externs` |
 | `types` | every object struct, the `drop`, `trace` and `share` walkers of every type id, and the type and class tables | `Objects::render` |
-| `statics` | the strings `@str.N` in first-use order, the immortal closures of named functions and the vtables | `Statics::render` |
+| `statics` | the strings `@str.N` in first-use order, the C strings `@cstr.N` (a trap's message, one constant per text, in first-use order), the immortal closures of named functions and the vtables | `Statics::render` |
 | `keywords` | `kw.show`, `kw.hash` and `kw.rank`, only when a body used `show` or `hash` on a keyword | `Program::render_keyword_helpers` |
 | `defs` | the constants `@def.N` of the values of the `def`s, evaluated through the JIT | `defs::emit_defs` |
 | `quotes` | the constants `@q.N` of the quoted forms | `Program::quote_text` |
@@ -1345,6 +1345,7 @@ file with no such macro prints `error NoMacro 0:0 0..0: no macro NAME` and statu
 == t.fib
 ;; == section statics
 (constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })
+(constant private cstr.0 [29 x i8] ([29 x i8] (i8 105) (i8 110) (i8 116) (i8 101) (i8 103) (i8 101) (i8 114) (i8 32) (i8 111) (i8 118) (i8 101) (i8 114) (i8 102) (i8 108) (i8 111) (i8 119) (i8 32) (i8 105) (i8 110) (i8 32) (i8 43) (i8 32) (i8 97) (i8 116) (i8 32) (i8 105) (i8 54) (i8 52) (i8 0)))
 ;; == section fns
 (define internal tailcc (f.main i64) ()
   (block entry
@@ -1369,7 +1370,7 @@ file with no such macro prints `error NoMacro 0:0 0..0: no macro NAME` and statu
       (br t12 trap13 ok14))
   )
   (block trap13
-    (call @fib.trap-c (string "integer overflow in + at i64"))
+    (call @fib.trap-c @cstr.0)
     (unreachable)
   )
   (block ok14

@@ -16,6 +16,9 @@
 (defun plain () -> LowerCx (cx-over (globals-new) (body-own-new)))
 (defun text-of (cx: LowerCx) -> str (fb-render (. cx b)))
 (defun has (cx: LowerCx word: str) -> bool (s/includes? (text-of cx) word))
+;; Whether the function names the program's C string of `text` (emit.statics `statics-cstring`: a trap's message is one constant per text).
+(defun has-cstr (cx: LowerCx text: str) -> bool
+  (match (get @(. (. (. cx p) statics) cstr-index) text) ((some name) (has cx (str name ")"))) (nil false)))
 (defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
 (defun starts-err (r: (Result a str) word: str) -> bool (match r ((Err m) (s/starts-with? m word)) (_ false)))
 
@@ -50,7 +53,7 @@
                     [(Pair "<" (Pair "(icmp ult p q)" LirI1)) (Pair ">=" (Pair "(icmp uge p q)" LirI1)) (Pair "=" (Pair "(icmp eq p q)" LirI1))])
       (check cs "an overflow check traps on the flag with the width in the message"
              (let ((r (ran "+" a64 b64 t64)))
-               (and (has (. r cx) "(extractvalue ") (has (. r cx) "(string \"integer overflow in + at i64\")") (has (. r cx) "(unreachable)"))))
+               (and (has (. r cx) "(extractvalue ") (has-cstr (. r cx) "integer overflow in + at i64") (has (. r cx) "(unreachable)"))))
       (check cs "a shift masks its count to the width: i32 by 31"
              (let ((cx (plain)) (r (lcx-native-method cx "Bits" "shl" [(VVal (nx/local "a") LirI32) (VVal (nx/local "b") LirI32)] [(ty-scalar SI32) (ty-scalar SI32)] (ty-scalar SI32))))
                (and (has cx "(and b (i32 31))") (has cx "(shl a "))))
@@ -61,21 +64,21 @@
   (do (check cs "quot is the division `/`: the zero check, the minimum check, sdiv, the messages name `/`"
              (let ((r (ran "quot" a64 b64 t64)))
                (and (has (. r cx) "(icmp eq b (i64 0))") (has (. r cx) "(icmp eq a (i64 -9223372036854775808))") (has (. r cx) "(icmp eq b (i64 -1))")
-                    (has (. r cx) "integer / by zero") (has (. r cx) "integer overflow in / at i64") (has (. r cx) "(sdiv a b)"))))
+                    (has-cstr (. r cx) "integer / by zero") (has-cstr (. r cx) "integer overflow in / at i64") (has (. r cx) "(sdiv a b)"))))
       (check cs "rem names rem and uses srem"
-             (let ((r (ran "rem" a64 b64 t64))) (and (has (. r cx) "integer rem by zero") (has (. r cx) "(srem a b)"))))
+             (let ((r (ran "rem" a64 b64 t64))) (and (has-cstr (. r cx) "integer rem by zero") (has (. r cx) "(srem a b)"))))
       (check cs "at i8 the minimum is -128"
-             (let ((r (ran "quot" (VVal (nx/local "a") LirI8) (VVal (nx/local "b") LirI8) (ty-scalar SI8)))) (and (has (. r cx) "(icmp eq a (i8 -128))") (has (. r cx) "at i8"))))
+             (let ((r (ran "quot" (VVal (nx/local "a") LirI8) (VVal (nx/local "b") LirI8) (ty-scalar SI8)))) (and (has (. r cx) "(icmp eq a (i8 -128))") (has-cstr (. r cx) "integer overflow in / at i8"))))
       (check cs "a literal zero divisor is the trap alone: no value, no division"
              (let ((r (ran "quot" a64 (v-int LirI64 0) t64)))
-               (and (= (. r r) (Ok nil)) (has (. r cx) "(string \"integer / by zero\")") (not (has (. r cx) "sdiv")) (not (has (. r cx) "icmp eq")))))
-      (check cs "and for rem" (let ((r (ran "rem" a64 (v-int LirI64 0) t64))) (and (= (. r r) (Ok nil)) (has (. r cx) "integer rem by zero"))))))
+               (and (= (. r r) (Ok nil)) (has-cstr (. r cx) "integer / by zero") (not (has (. r cx) "sdiv")) (not (has (. r cx) "icmp eq")))))
+      (check cs "and for rem" (let ((r (ran "rem" a64 (v-int LirI64 0) t64))) (and (= (. r r) (Ok nil)) (has-cstr (. r cx) "integer rem by zero"))))))
 
 (defun unary-checks (cs: Checks) -> unit
   (let ((one (fn (method: str x: V t: Ty) (let ((cx (plain))) (Pair cx (lcx-native-method cx "Num" method [x] [t] t))))))
     (do (check cs "neg traps on the minimum and subtracts from zero"
                (let ((r (one "neg" a64 t64)))
-                 (and (has (. r fst) "(icmp eq a (i64 -9223372036854775808))") (has (. r fst) "integer overflow in neg at i64") (has (. r fst) "(sub (i64 0) a)"))))
+                 (and (has (. r fst) "(icmp eq a (i64 -9223372036854775808))") (has-cstr (. r fst) "integer overflow in neg at i64") (has (. r fst) "(sub (i64 0) a)"))))
         (check cs "bit-not xors with -1, popcount is ctpop"
                (and (has (. (one "bit-not" a64 t64) fst) "(xor a (i64 -1))") (has (. (one "popcount" a64 t64) fst) "(ctpop a)")))
         (check cs "an unknown unary method is an error" (starts-err (. (one "nope" a64 t64) snd) "unary nope"))
@@ -142,7 +145,7 @@
   (let ((cx (plain)))
     (do (lcx-trap-if cx (VVal (nx/local "c") LirI1) "boom")
         (check cs "trap-if branches on the flag to a trap block and continues in a fresh ok block"
-               (and (has cx "(br c ") (has cx "(string \"boom\")") (has cx "(unreachable)") (s/starts-with? (fb-current (. cx b)) "ok"))))))
+               (and (has cx "(br c ") (has-cstr cx "boom") (has cx "(unreachable)") (s/starts-with? (fb-current (. cx b)) "ok"))))))
 
 ;; ---- calls
 
