@@ -216,7 +216,9 @@ any order before the calling convention (`duplicate modifier private`,
 | `noinline` | `noinline` | **Decided** (owner, 2026-10-25: lIR spells what LLVM IR spells, and lair reads no front end's convention out of band): a `define` only (`declare cannot be noinline`, `global cannot be noinline: noinline is for a function`), once (`duplicate modifier noinline`), not with `inline` (`inline and noinline exclude each other`: LLVM's verifier refuses `alwaysinline` with `noinline`); the inliner never inlines the function. For the out-of-line half of a fast path, which LLVM would otherwise inline into its one caller (the runtime's `fib.alloc-slow`, `fib.retain-slow`, `fib.release-slow`, `fib.stack-slow`) |
 | `cold` | `cold` | **Decided** (owner, 2026-10-25): a `define` only (`declare cannot be cold`, `global cannot be cold: cold is for a function`), once; the function is rarely called: when LLVM weighs the edges of a function, a block that a call of it post-dominates is cold too, so it is laid out off the hot path. For a trap or error path |
 
-The C backend
+A function's name carries no attribute: lair puts `alwaysinline`, `noinline` and `cold` on a function
+when its `define` says so and never otherwise (until 2026-10-25 it made every function whose name ended
+`-slow`, or held `-slow.`, `noinline`; a front end now writes the word, syntax.md §3.1). The C backend
 writes them as gcc's `__attribute__((always_inline))`, `((noinline))` and `((cold))`; the JS and WGSL
 backends have no use for them and ignore them. Cases: `cases/lir/attrs`.
 

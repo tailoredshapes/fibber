@@ -79,20 +79,49 @@
               (set! (. cx unwind-ops) nil)
               (fb-open b ok)))))))
 
-;; Lowers the body, returns its value, and records the function, `inline` (spec/lir.md 4.3) when asked. Rust: lower/mod.rs:276 Cx::finish_with
+;; Lowers the body, returns its value, and records the function with the function attributes `attrs` (lIR words: `inline`, `noinline`,
+;; `cold`, spec/lir.md 4.3). Rust: lower/mod.rs:276 Cx::finish_with
 ;; `key` is where the plan keeps what an entry that fails releases (`unwind-entry-key`): the body's expression id, or the `fn` literal's.
-(defun finish-with :private (cx: LowerCx body: Expr key: i64 recurses: bool inline: bool) -> (Result unit str)
+(defun finish-with :private (cx: LowerCx body: Expr key: i64 recurses: bool attrs: (Vec str)) -> (Result unit str)
   (try-let ((rt (lcx-ty cx body)) (l (program-lir (. cx p) rt)))
     (do (set! (. (. cx b) ret) l)
         (when (stack-check? cx recurses) (emit-stack-check cx (unwind-entry-key key)))
         (try-let ((flow (lcx-expr cx body)))
           (do (match flow ((FlowVal v) (ret-term cx v)) ((FlowJump) ()))
               (let ((f (fb-function (. cx b))))
-                (program-add-function (. cx p) (if inline
-                                                   (la/LFunction (. f name) (. f ty) (. f params) (. f blocks)
-                                                                 (with (. f mods) (inline true)) (. f pos))
-                                                   f)))
+                (program-add-function (. cx p) (with-attrs f attrs)))
               (Ok ()))))))
+
+;; `f` with the function attributes `attrs` (lIR words) set.
+(defun with-attrs :private (f: la/LFunction attrs: (Vec str)) -> la/LFunction
+  (let ((has (fn (w: str) (some? (find-first (fn (a: str) (= a w)) attrs))))
+        (m (. f mods)))
+    (if (empty? attrs) f (with f (mods (with m (inline (or (. m inline) (has "inline"))) (noinline (or (. m noinline) (has "noinline")))
+                                               (cold (or (. m cold) (has "cold")))))))))
+
+;; The function attributes of the body of `key`: `inline` when `inline` (the Vec read path, `inline-body?`), and those its `defun` asks for
+;; with `:noinline` and `:cold` (syntax 3.1, types.decls `fun-attrs`), for each instance of the function.
+(defun body-attrs :private (g: Globals key: BodyKey inline: bool) -> (Vec str)
+  (into (if inline ["inline"] [])
+        (match key
+          ((BodyFun f) (fun-attrs-of g f))
+          ((BodyAllOwned f) (fun-attrs-of g f))
+          (_ []))))
+
+(defun fun-attrs-of :private (g: Globals f: i64) -> (Vec str)
+  (match (get @(. g fun-attrs) f)
+    ((some a) a)
+    (nil (if (seed-slow-path? g f) ["noinline"] []))))
+
+;; The library's slow paths that the compiler itself uses: `noinline` here, until their source can say `:noinline`. The seed (SEED) reads
+;; this tree's lib/ when it builds the compiler, and a seed that predates `:noinline` reads it as the body. When SEED names a release that
+;; knows the mark, write `:noinline` on each of these and delete this function. (Until 2026-10-25 lair marked every name ending `-slow`.)
+(defun seed-slow-path? :private (g: Globals f: i64) -> bool
+  (let ((ns (g-module-name g (. (g-fun g f) module))) (name (. (g-fun g f) name)))
+    (cond (= ns "fib.prelude") (or (= name "vec-nth-slow") (= name "vec-assoc-slow") (= name "vec-conj-slow"))
+          (= ns "fib.json.parse") (= name "string-slow")
+          (= ns "fib.json.escape") (= name "put-string-slow")
+          :else false)))
 
 ;; The bodies emitted `inline`, for want of a source-level marker: the Vec read path, the prelude's `vec-nth` and the `nth` of the
 ;; `Reducible` instance of `Vec` (fib.seq.protocols) that calls it. Out of line, a hot `nth` was a call per element whose checks LLVM
@@ -156,7 +185,7 @@
                  (set! (. cx fatal) (and @(. (. cx b) unwind) (takes-slots? p (body-expr g (. inst key)))))
                  (when env (set! (. cx env) (some (VVal (nx/local "env") LirPtr))))
                  (try-let ((_ (finish-with cx (body-expr g (. inst key)) (. (body-expr g (. inst key)) id) (inst-may-recurse? cx (body-expr g (. inst key)))
-                                           (and (= code name) (inline-body? g (. inst key))))))
+                                           (body-attrs g (. inst key) (and (= code name) (inline-body? g (. inst key)))))))
                    (if (= code name) (Ok ()) (live/add-stub p inst name code)))))))))))
 
 ;; The captures of a closure body, loaded from `env` in capture order into their bindings. Rust: lower/mod.rs:462 load_captures
@@ -197,7 +226,7 @@
           (when-some (n (. f name)) (set! (. cx locals) (assoc @(. cx locals) n (LocalVal env))))
           (bind-params cx ps)
           (try-let ((loaded (load-captures cx e)))
-            (finish-with cx (. f body) (. e id) (closure-may-recurse? (. f body)) false))))))
+            (finish-with cx (. f body) (. e id) (closure-may-recurse? (. f body)) []))))))
 
 ;; Loads the captures of a task from its object into their bindings; the point of the frame is the field after them.
 (defun load-task-captures :private (cx: LowerCx oc: ClosureOwn caps: (Vec LirTy) sname: str) -> unit
