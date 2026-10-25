@@ -2,7 +2,7 @@
 """compiler/tests/live/leak.py: the resident size of a live session over 200 `load`s of one module (docs/design/live-incremental.md 8).
 usage: leak.py FIBC [ROOT]    Exit 0 when every check held. Each check prints `ok NAME` or `FAIL NAME: why`.
 The program: eight library-sized modules m0..m7 (30 functions each), `model` (the module that is swapped) and the main module, which calls
-`model/val` in a loop. 200 swaps of `val`; the VmRSS of the session is read at swaps 100 and 200. The engine kept, for every text of `model`,
+`model/val` in a loop. 200 swaps of `val`; the resident size (`ps -o rss`) of the session is read at swaps 100 and 200. The engine kept, for every text of `model`,
 the expander's entry and the persistent checker's state of the module and of every module after it (each a copy of the library's tables): about
 8 MB a swap here, 820 MB in the last 100 (measured 2026-10-22). The macro `twice` of module `mac` (after `model` in the load order, not depending on it) is built once over the 200 swaps (macros.runner keys a macro's module by the text of the modules its code can use, not by its place in the load order: it was built for every swap, 190 ms each in fib-solid's worker). The bound is 40 MB for the last 100 swaps (measured after the fix: 9 MB, the
 generations that stay resident until a `retire`), so a regression to even a tenth of the old growth fails."""
@@ -60,7 +60,8 @@ if not failed:
     s = socket.socket(socket.AF_UNIX); s.settimeout(300); s.connect(sock); f = s.makefile('rw')
     def ask(**r):
         f.write(json.dumps(r) + '\n'); f.flush(); return json.loads(f.readline())
-    def rss(): return int([l for l in open('/proc/%d/status' % p.pid) if l.startswith('VmRSS')][0].split()[1]) / 1024
+    # the resident set in MB, from `ps -o rss=` (KiB on Linux, procps, and on macOS, BSD ps; Linux has VmRSS in /proc too, macOS has no /proc)
+    def rss(): return int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(p.pid)], text=True).split()[0]) / 1024
     at = {}
     ok = True
     for i in range(1, SWAPS + 1):
