@@ -166,10 +166,11 @@ window, and the body cannot read the owner (case 339's rule) or lend it twice (c
 while a kernel runs" and "two lends" as compile-time rejections with no new checker rule; "release twice" and "use after release" become
 impossible when `release` is the scope exit of `with-buffer`. Section 10 schedules it after the kernel checker.
 
-Alignment: the kernel subset indexes elements, never bytes. The emitter writes `(align 1)` for every raw-pointer access (spec/syntax.md
-3.15: unaligned addresses are allowed on the CPU); on NVPTX a byte-aligned f32 load is four `ld.global.b8`. On a kernel target lair reads
-`(align 1)` on a scalar as the scalar's size (native.lower.memory `kernel-align`), and the PTX has `ld.global.b32`. The design's accessors
-carry the alignment themselves (a `gpu/f32-at` builtin emits `(align 4)`), and the lair rule goes.
+Alignment: the kernel subset indexes elements, never bytes. The emitter writes `(align 1)` for a raw-pointer access of a float on a CPU
+target (spec/syntax.md 3.15: unaligned addresses are allowed there); on NVPTX a byte-aligned f32 load is four `ld.global.b8`, so on a kernel
+target the emitter writes the scalar's own size, `(align 4)` for `load-f32`/`store-f32` and `(align 8)` for the f64 pair (emit.lower.builtins
+`raw-align`), and the PTX has `ld.global.b32`. lair lowers `(align N)` as written on every target (since 2026-10-25; until then it read
+`(align 1)` on a scalar as the scalar's size on a kernel target, `kernel-align`, spec/lir.md 6.9a).
 
 ### 3.4 Errors
 
@@ -377,7 +378,7 @@ What the emitter needed: **nothing above the lIR.** The compiler change (two com
 | compiler/types/targets.fib | the row `row-nvptx64-cuda`; `kernel-row?`, `kernel-triple?`, `KERNEL-FUN-PREFIX`; `os-of-triple` knows `-cuda`; `row-buildable?` admits a kernel row |
 | compiler/llvm/target.fib, core.fib | the four NVPTX initialisers; `LLVMGetTypeKind`, `LLVMGetIntTypeWidth` |
 | compiler/lir/{types,ast,parse/ty,parse/control,check/expr,check/phi,print,dump}.fib | `CcKernel` (`kernelcc`); `KSreg`, `KBarrier` (`(sreg R)`, `(barrier)`) |
-| compiler/native/lower/{lx,arith,expr,memory}.fib, lower.fib | cc 71; the intrinsics; the `kernel` flag of `Lx`; `kernel-align`; `kernel-refusal` off a kernel target |
+| compiler/native/lower/{lx,arith,expr,memory}.fib, lower.fib | cc 71; the intrinsics; the `kernel` flag of `Lx`; `kernel-refusal` off a kernel target (`kernel-align` removed 2026-10-25) |
 | compiler/native/kernel.fib (new, 215 lines) | the kernel module: reach, rewrite, refuse, PTX names |
 | compiler/native/api.fib, target.fib | `--emit ptx`; the kernel module on a kernel target; `requested-triple-row` |
 | compiler/emit/compile.fib, types/infer/mod.fib | the kernels are the export roots on a kernel target; no `main` needed there |
@@ -396,8 +397,8 @@ The design replaces three stand-ins of the prototype (each a delta the front end
    `(sreg ..)` and `(barrier)`. ADR 0003 checked: no function of `compiler/` or `lib/` is named `defkernel`, `global-id`, `local-id`,
    `group-size`, `grid-size` or `barrier`; `lib/fib/tls/hello.fib` has a `group-id` (TLS groups), which the qualified builtin `gpu/group-id`
    does not capture, but the plain name `group-id` must not become a core form.
-3. **Alignment from the accessor, not from lair.** Today: `kernel-align`. Design: `gpu/f32-at` and friends are typed element accessors
-   that emit `(align 4)`/`(align 8)`; the lair rule is removed with them.
+3. **Alignment from the emitter, not from lair.** Done 2026-10-25: the scalar raw accessors emit `(align 4)`/`(align 8)` on a kernel target
+   (`raw-align`), and lair's `kernel-align` rule is removed (section 3.3).
 
 ## 10. Phases, sizes, the first milestone
 

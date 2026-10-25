@@ -1138,7 +1138,9 @@ fibber objects (**Decided**, §9).
 `store-*` takes a pointer and that exact value type and returns `unit`.
 All ten require lexical `unsafe`. They access 4, 8, 16, 32, or 32 bytes,
 respectively, with byte alignment (LLVM `align 1`); unaligned addresses are
-permitted. Callers must keep the owner alive and supply a complete readable
+permitted. On a kernel target (`defkernel`, docs/design/gpu.md 3.3) the scalar
+pairs are written with the scalar's own alignment, `(align 4)` and `(align 8)`:
+a kernel indexes elements, and the emitter writes the alignment it means. Callers must keep the owner alive and supply a complete readable
 or writable range. These primitives add no bounds, lifetime, or uniqueness
 checks. Cases 7009, 7017, 7053, and 7056 in `cases/stdlib` pin the round trips
 and unsafe boundary. This extension is native-stage only, like the SIMD types; the frozen
