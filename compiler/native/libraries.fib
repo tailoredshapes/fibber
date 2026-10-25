@@ -1,28 +1,18 @@
-;; compiler/native/libraries.fib: the native libraries a program's modules declare (`(extern f .. :lib "curl")`, spec/syntax.md 3.15) and how `build` links them.
-;; The emitter notes each library of an extern it reaches as a line `;; link-lib: LIB MODULE` of the lIR (emit.program); a module the program does not use, or a
-;; function of one that nothing calls, leaves no line, so no `-l` and no failure for a library the program does not need. The mode of the build decides how a library
-;; is linked: `dynamic` (`-lLIB`, resolved when the program starts), or `static` (`-l:libLIB.a`, the archive bundled into the executable). Per library: `--link LIB=MODE`
-;; (FIB_LINK, a comma-separated list); for all: `--link-mode MODE` (FIB_LINK_MODE); else static in a `--static` build (a static executable has no loader to resolve
-;; anything with) and dynamic in any other.
-(ns native.libraries (:require [fib.string :as s] [native.libsearch :as search] [llvm.ffi :as ffi] [llvm.support :as support]))
+;; compiler/native/libraries.fib: the native libraries a module names with `(dependent-library "NAME")` (spec/lir.md 4.9; fibber writes one for each
+;; `(extern f .. :lib "NAME")` it reaches, spec/syntax.md 3.15) and how a build links them. A library the program does not reach leaves no form, so
+;; no `-l` and no failure for a library the program does not need. The mode of the build decides how a library is linked: `dynamic` (`-lLIB`,
+;; resolved when the program starts), or `static` (`-l:libLIB.a`, the archive bundled into the executable). Per library: `--link LIB=MODE`
+;; (FIB_LINK, a comma-separated list); for all: `--link-mode MODE` (FIB_LINK_MODE); else static in a `--static` build (a static executable has no
+;; loader to resolve anything with) and dynamic in any other. Nothing here reads the lIR text: the forms are read from the module (lir.ast
+;; `module-dependent-libraries`), and lair lowers them to LLVM's `!llvm.dependent-libraries` besides linking from them.
+(ns native.libraries (:require [fib.string :as s] [native.libsearch :as search] [llvm.ffi :as ffi] [llvm.support :as support])
+  (:use lir.ast))
 
 (extern dlerror :private () -> ptr)
 
-(defstruct LinkLib (name: str module: str))
-
-(def marker: str ";; link-lib: ")
-
-;; The libraries the lIR text declares, each once, in the order first reached.
-(defun declared-libs (lir: str) -> (Vec LinkLib)
-  (loop ((at 0) (out []))
-    (match (str-find lir marker at)
-      (nil out)
-      ((some i) (let ((from (+ i (str-len marker)))
-                      (end (unwrap-or (str-find lir "\n" from) (str-len lir))))
-                  (let ((words (s/split (str-slice lir from end) " ")))
-                    (recur end (if (and (>= (count words) 2) (not-any? (fn (l: LinkLib) (= (. l name) (nth words 0))) out))
-                                   (conj out (LinkLib (nth words 0) (nth words 1)))
-                                   out))))))))
+;; The libraries the module names, each once, in the order first written.
+(defun module-libs (m: LModule) -> (Vec str)
+  (module-dependent-libraries m))
 
 ;; The mode asked for `lib`: its own (`--link LIB=MODE`), else the build's, else nil.
 (defun mode-asked :private (lib: str) -> (Option str)
@@ -36,14 +26,18 @@
 (defun static-build? () -> bool
   (= (unwrap-or (sys-getenv "FIB_STATIC") "") "1"))
 
-;; The mode of `lib`: static or dynamic, or the reason it cannot be.
-(defun mode-of (l: LinkLib) -> (Result str str)
-  (let ((asked (mode-asked (. l name))))
+;; What a message calls the declaration of `name`.
+(defun declared-by :private (name: str) -> str
+  (str "the program needs the native library " name " (declared by `(dependent-library \"" name "\")`, which `:lib \"" name "\"` on an extern writes)"))
+
+;; The mode of `name`: static or dynamic, or the reason it cannot be.
+(defun mode-of (name: str) -> (Result str str)
+  (let ((asked (mode-asked name)))
     (cond (and (some? asked) (not (some? (find-first (fn (y: str) (= y (unwrap-or asked ""))) ["static" "dynamic"]))))
-            (Err (str "fibc: --link: the mode of " (. l name) " is static or dynamic, not " (unwrap-or asked "")))
+            (Err (str "fibc: --link: the mode of " name " is static or dynamic, not " (unwrap-or asked "")))
           (and (static-build?) (= (unwrap-or asked "static") "dynamic"))
-            (Err (str "fibc: module " (. l module) " needs the native library " (. l name) ", asked dynamic, but a --static executable has no dynamic loader: link it static (--link "
-                      (. l name) "=static, with lib" (. l name) ".a on -L) or leave it out of the program"))
+            (Err (str "fibc: " (declared-by name) ", asked dynamic, but a --static executable has no dynamic loader: link it static (--link "
+                      name "=static, with lib" name ".a on -L) or leave it out of the program"))
           :else (Ok (unwrap-or asked (if (static-build?) "static" "dynamic"))))))
 
 ;; The libraries the C library itself provides (glibc's `-lm -lpthread` are always on the link line; musl has them inside libc.a): declared, but never a link word.
@@ -51,21 +45,27 @@
   (some? (find-first (fn (y: str) (= y name)) ["c" "m" "pthread" "dl" "rt" "util"])))
 
 ;; The `-l` words for the libraries: `LIB` (dynamic) or `:libLIB.a` (static), the first failure otherwise.
-(defun lib-words (ls: (Vec LinkLib)) -> (Result (Vec str) str)
+(defun lib-words (ls: (Vec str)) -> (Result (Vec str) str)
   (loop ((i 0) (out []))
     (cond (>= i (count ls)) (Ok out)
-          (libc-part? (. (nth ls i) name)) (recur (+ i 1) out)
+          (libc-part? (nth ls i)) (recur (+ i 1) out)
           :else
         (match (mode-of (nth ls i))
           ((Err m) (Err m))
-          ((Ok mode) (recur (+ i 1) (conj out (if (= mode "static") (str ":lib" (. (nth ls i) name) ".a") (. (nth ls i) name)))))))))
+          ((Ok mode) (recur (+ i 1) (conj out (if (= mode "static") (str ":lib" (nth ls i) ".a") (nth ls i)))))))))
 
 ;; As `lib-words`, for a link that also searches `dirs` (`-L`): a dynamic library whose development link `libLIB.so` is nowhere but whose versioned file
 ;; `libLIB.so.N` is (native.libsearch) is linked by that file, `:libLIB.so.N`, which the linker finds in `dirs` and its own directories.
-(defun lib-words-in (ls: (Vec LinkLib) dirs: (Vec str)) -> (Result (Vec str) str)
+(defun lib-words-in (ls: (Vec str) dirs: (Vec str)) -> (Result (Vec str) str)
   (match (lib-words ls)
     ((Err m) (Err m))
     ((Ok words) (Ok (mapv (fn (w: str) (dynamic-word w dirs)) words)))))
+
+;; The link words of a build: the `-l` the command line gave, then the module's own libraries (spec/lir.md 4.9), searched in `dirs`.
+(defun link-words (m: LModule given: (Vec str) dirs: (Vec str)) -> (Result (Vec str) str)
+  (match (lib-words-in (module-libs m) dirs)
+    ((Err e) (Err e))
+    ((Ok words) (Ok (into given words)))))
 
 (defun dynamic-word :private (w: str dirs: (Vec str)) -> str
   (if (or (starts-with? w ":") (some? (str-find w "/" 0)))
@@ -76,9 +76,9 @@
 
 ;; The libraries loaded into this process for the JIT (`run`, `run --live`, `repl`), as an executable's loader would load them: the development link
 ;; by the dynamic linker's own search, else the file native.libsearch finds (a versioned `libLIB.so.N`); `:FILE` is the file itself. The first library
-;; that cannot be loaded is the error, with the module that declared it and what was tried. A library loaded once stays (LLVMLoadLibraryPermanently):
-;; the JIT's search of the process (llvm.orc) and the names rules (llvm.support `process-defines?`) then find its symbols.
-(defun load-for-jit (ls: (Vec LinkLib)) -> (Result unit str)
+;; that cannot be loaded is the error, with what was tried. A library loaded once stays (LLVMLoadLibraryPermanently): the JIT's search of the
+;; process (llvm.orc) and the names rules (llvm.support `process-defines?`) then find its symbols.
+(defun load-for-jit (ls: (Vec str)) -> (Result unit str)
   (loop ((i 0))
     (if (>= i (count ls))
         (Ok ())
@@ -86,8 +86,8 @@
           ((Err m) (Err m))
           ((Ok _) (recur (+ i 1)))))))
 
-(defun load-one :private (l: LinkLib) -> (Result unit str)
-  (let ((name (. l name)) (needs (str "fibc: module " (. l module) " needs the native library " (. l name) " (declared by `:lib \"" (. l name) "\"` on its externs): ")))
+(defun load-one :private (name: str) -> (Result unit str)
+  (let ((needs (str "fibc: " (declared-by name) ": ")))
     (cond (libc-part? name) (Ok ())
           (starts-with? name ":") (match (load-path (str-slice name 1 (str-len name))) ((Ok _) (Ok ())) ((Err e) (Err (str needs "cannot load it: " e))))
           (match (load-path (search/dev-name name)) ((Ok _) true) ((Err _) false)) (Ok ())
@@ -112,16 +112,10 @@
             (let ((e (unsafe (ffi/ptr->addr (dlerror)))))
               (Err (if (= e 0) path (ffi/c-string-at e))))))))
 
-;; A failed link's text with what a declaration can add: for each declared library the linker could not find (`cannot find -lLIB`, `-l:libLIB.a`), the module that needs it.
-(defun explain-failure (m: str ls: (Vec LinkLib)) -> str
-  (let ((missing (filter (fn (l: LinkLib) (or (some? (str-find m (str "cannot find -l" (. l name)) 0)) (some? (str-find m (str "cannot find -l:lib" (. l name) ".") 0)))) ls)))
+;; A failed link's text with what a declaration can add: for each declared library the linker could not find (`cannot find -lLIB`, `-l:libLIB.a`), what needs it.
+(defun explain-failure (m: str ls: (Vec str)) -> str
+  (let ((missing (filter (fn (name: str) (or (some? (str-find m (str "cannot find -l" name) 0)) (some? (str-find m (str "cannot find -l:lib" name ".") 0)))) ls)))
     (if (empty? missing)
         m
-        (str m (str-join (mapv (fn (l: LinkLib) (str "\nfibc: module " (. l module) " needs the native library " (. l name) " (declared by `:lib \"" (. l name) "\"` on its externs): not found; "
-                                                   "install it (lib" (. l name) ".so, or the versioned lib" (. l name) ".so.N, for a dynamic link, lib" (. l name) ".a for --link " (. l name) "=static or --static) or give its directory with -L DIR")) missing))))))
-
-;; Frontend metadata keeps libraries out of the generated instruction stream.
-(defun from-notes (notes: (Vec (Pair str str))) -> (Vec LinkLib)
-  (reduce (fn (out: (Vec LinkLib) note: (Pair str str))
-            (if (some? (find-first (fn (l: LinkLib) (= (. l name) (. note fst))) out)) out
-                (conj out (LinkLib (. note fst) (. note snd))))) [] notes))
+        (str m (str-join (mapv (fn (name: str) (str "\nfibc: " (declared-by name) ": not found; "
+                                                   "install it (lib" name ".so, or the versioned lib" name ".so.N, for a dynamic link, lib" name ".a for --link " name "=static or --static) or give its directory with -L DIR")) missing))))))

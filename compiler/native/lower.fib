@@ -2,7 +2,7 @@
 
 (ns native.lower
   (:use lir.diag lir.types lir.lit lir.ast lir.facts native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
-  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [types.targets :as tt]
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.metadata :as md] [llvm.target :as lt] [llvm.analysis :as analysis] [types.targets :as tt]
             [lir.own.opt :as opt] [lir.own.erase :as erase]))
 
 ;; The ownership section (spec/lir.md 6.14) leaves the tree last, immediately before LLVM: the slot of lIR-to-lIR rewrites on the explicit
@@ -64,10 +64,24 @@
             ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
             ((ItStruct _) ())
             ((ItTarget _) ())
-            ((ItOwnership _) ())))
+            ((ItOwnership _) ())
+            ((ItDependentLibrary _) ())))
+        (dependent-libraries lx m)
         (match (init-globals lx items)
           ((Err x) (Err x))
           ((Ok _) (lower-bodies lx items))))))
+
+;; The module's `dependent-library` forms (spec/lir.md 4.9) as LLVM's named metadata `!llvm.dependent-libraries = !{!{!"NAME"}, ..}`, each name
+;; once: what `#pragma comment(lib, ..)` makes in clang, and what an ELF `.deplibs` section carries.
+(defun dependent-libraries :private (lx: Lx m: LModule) -> unit
+  (let ((key (ffi/bytes-new "llvm.dependent-libraries")))
+    (do (doseq [name (module-dependent-libraries m)]
+          (let ((s (ffi/bytes-new name)))
+            (unsafe
+              (let ((slot (ffi/words-new [(md/LLVMMDStringInContext2 (. lx ctx) s (str-len name))])))
+                (do (md/LLVMAddNamedMetadataOperand (. lx module) key (md/LLVMMetadataAsValue (. lx ctx) (md/LLVMMDNodeInContext2 (. lx ctx) slot 1)))
+                    (free slot) (free s))))))
+        (unsafe (free key)))))
 
 (defun init-globals :private (lx: Lx items: (Vec LItem)) -> (Result unit LairError)
   (loop ((i 0))
@@ -157,11 +171,13 @@
   (do (add-string-attribute lx f "target-cpu" (. t cpu))
       (add-string-attribute lx f "target-features" (. t features))))
 
-;; The function attributes a `define` names (spec/lir.md 4.3) on `f`: `inline` is LLVM's `alwaysinline`, `noinline` and `cold` are LLVM's own.
+;; The function attributes a `define` names (spec/lir.md 4.3) on `f`: `inline` is LLVM's `alwaysinline`, `noinline` and `cold` are LLVM's own,
+;; `(export-name "N")` is the string attribute `"wasm-export-name"="N"` (the WebAssembly backend exports the function under it; other backends ignore it).
 (defun fn-attributes :private (lx: Lx f: i64 mods: LModifiers) -> unit
   (do (if (. mods inline) (add-enum-attribute lx f "alwaysinline") ())
       (if (. mods noinline) (add-enum-attribute lx f "noinline") ())
-      (if (. mods cold) (add-enum-attribute lx f "cold") ())))
+      (if (. mods cold) (add-enum-attribute lx f "cold") ())
+      (match (. mods export-name) (nil ()) ((some n) (add-string-attribute lx f "wasm-export-name" n)))))
 
 ;; The enum function attribute `name` (`noinline`, `alwaysinline`, `cold`) on `f`.
 (defun add-enum-attribute :private (lx: Lx f: i64 name: str) -> unit
@@ -203,4 +219,4 @@
       (if (. mods hidden) (unsafe (core/LLVMSetVisibility v 1i32)) ())))
 
 (defun hidden-mods :private (hidden: bool) -> LModifiers
-  (LModifiers lk-external hidden false false false false))
+  (LModifiers lk-external hidden false false false false nil))

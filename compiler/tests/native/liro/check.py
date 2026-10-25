@@ -186,7 +186,7 @@ def artifact_checks(probe, scratch, env):
     native_src = write(scratch / "native.c", "int liro_native_value(void) { return 12; }\n")
     library = scratch / ("libliro_native.dylib" if sys.platform == "darwin" else "libliro_native.so")
     run(["cc", "-dynamiclib" if sys.platform == "darwin" else "-shared", "-fPIC", native_src, "-o", library], env)
-    text = ";; link-lib: liro_native fixture\n(declare liro_native_value i32 ())\n(define (main i32) () (block entry (ret (call @liro_native_value))))"
+    text = "(dependent-library \"liro_native\")\n(declare liro_native_value i32 ())\n(define (main i32) () (block entry (ret (call @liro_native_value))))"
     write(src, text)
     run([probe, "emit", 2, src, obj], env)
     metadata = json.loads(Path(str(obj) + ".meta").read_text())

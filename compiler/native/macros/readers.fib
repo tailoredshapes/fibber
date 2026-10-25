@@ -2,14 +2,15 @@
 ;; readtable per byte and hands a bound entry to the runner here, which fills the stream (native.macros.readlib's struct) from the reader's
 ;; cursor, runs the compiled macro on a mailbox worker (native.call) and serves its hooks: `lir.read.form` reads the next form through the
 ;; reader itself, so a `[` macro reads to `]` with the table in force, and `lir.read.skip` passes whitespace and comments as the lexer
-;; defines them. A nested run (a macro inside a form a macro reads) takes another mailbox; the mailboxes are kept for the module.
+;; defines them. A nested run (a macro inside a form a macro reads) runs on the same worker, inside the hook (`call-nest`).
 (ns native.macros.readers
   (:use lir.diag lir.sexp lir.sexp.lexer)
   (:require [native.call :as call] [native.macros.objects :as obj] [llvm.ffi :as ffi]))
 
 ;; The reader macros of a module: its table, its mailbox (one worker: a nested run, a macro inside a form a macro reads, runs on the same
 ;; worker inside the hook that asked for the form, `call-nest`), how many runs are in progress, the streams made (one per text read: the
-;; module's, each library's), and the error of a nested read held for the run that caused it.
+;; module's, each library's), and the error of a nested read held for the run that caused it. The worker and the count are the module's,
+;; not the reader's alone: its macros run on them too (native.macros `run-entry`), so a run is started or nested by one count.
 (defstruct Readers (table: Readtable mailbox: (Cell (Option call/Mailbox)) running: (Cell i64) streams: (Cell (Vec ptr)) pending: (Cell (Option Diagnostic))))
 
 (defun readers-new () -> Readers
@@ -65,8 +66,8 @@
 
 ;; ---------------------------------------------------------------- a run
 
-;; The module's mailbox, made at the first run.
-(defun mailbox-of :private (rs: Readers) -> (Result call/Mailbox str)
+;; The module's mailbox, made at the first run (of a reader macro or a macro) or when its macro session is made.
+(defun mailbox-of (rs: Readers) -> (Result call/Mailbox str)
   (match @(. rs mailbox)
     ((some mb) (Ok mb))
     (nil (match (call/call-new)
@@ -106,7 +107,8 @@
               ((Ok result) (finish rs s result e pos))))))
 
 ;; Serves the hooks until the call (or the nested call) returns, and answers its value: `lir.read.form` (code 0) and `lir.read.skip`
-;; (code 1) on the stream; any other hook answers 0.
+;; (code 1) on the stream; any other hook answers 0: `lir.sexp.expand` (arity 1, parked on this worker, the module's) is null in a reader
+;; macro (spec/lir.md 4.6).
 (defun serve :private (rs: Readers st: (Cell ptr) src: str file: str rd: Reader s: ptr mb: call/Mailbox) -> (Result i64 str)
   (loop ()
     (match (call/call-wait mb)

@@ -1,0 +1,35 @@
+;; expect: accept
+;; out: 3
+;; spec/lir.md 4.6: (module-macro count-forms) hands every top-level form after it, unexpanded, to count-forms at the end of the text;
+;; it returns a splice of the forms with (define (count i64) () ..) of their number appended: the declare, the define-macro (data, not a
+;; direction, until spliced) and main are three.
+(define-macro count-forms (forms ...)
+  (block entry
+    (let ((out (call @lir.sexp.list (i64 0)))
+          (def (call @lir.sexp.list (i64 0))) (sig (call @lir.sexp.list (i64 0))) (blk (call @lir.sexp.list (i64 0)))
+          (r (call @lir.sexp.list (i64 0))) (lit (call @lir.sexp.list (i64 0)))
+          (n (call @lir.sexp.count forms)))
+      (call @lir.sexp.push out (call @lir.sexp.symbol (string "begin")))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (step i2))))
+      (br (icmp ult i n) step done)))
+  (block step
+    (let ((i2 (add i (i64 1))))
+      (call @lir.sexp.push out (call @lir.sexp.nth forms i))
+      (br loop)))
+  (block done
+    (call @lir.sexp.push lit (call @lir.sexp.symbol (string "i64"))) (call @lir.sexp.push lit (call @lir.sexp.integer n))
+    (call @lir.sexp.push r (call @lir.sexp.symbol (string "ret"))) (call @lir.sexp.push r lit)
+    (call @lir.sexp.push blk (call @lir.sexp.symbol (string "block"))) (call @lir.sexp.push blk (call @lir.sexp.symbol (string "entry"))) (call @lir.sexp.push blk r)
+    (call @lir.sexp.push sig (call @lir.sexp.symbol (string "count"))) (call @lir.sexp.push sig (call @lir.sexp.symbol (string "i64")))
+    (call @lir.sexp.push def (call @lir.sexp.symbol (string "define"))) (call @lir.sexp.push def sig) (call @lir.sexp.push def (call @lir.sexp.list (i64 0))) (call @lir.sexp.push def blk)
+    (call @lir.sexp.push out def)
+    (ret out)))
+(module-macro count-forms)
+(declare printf i32 (ptr ...))
+(define-macro unused (x) (block entry (ret x)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%lld\n") (call @count))
+    (ret (i32 0))))

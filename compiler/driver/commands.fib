@@ -54,8 +54,8 @@
     ((Err code) code)
     ((Ok lir)
      (do (when trace (native/setenv-set "FIB_TRACE" "1"))
-         (match (native/run-module file (. lir ast) (. lir links) opt args)
-           ((Err m) (compile-failed m))
+         (match (native/run-module file (. lir ast) opt args)
+           ((Err m) (compile-failed (ld/name-modules m (. lir declared))))
            ((Ok code) code))))))
 
 ;; The row of FIB_TARGET_TRIPLE when it is a target `build` refuses (docs/adr/0008: parked, or no row for its architecture) and
@@ -148,16 +148,13 @@
                         ((Err code) code)
                         ((Ok lir) (build-exe lir file out opt dirs libs))))))))))))
 
-;; The executable of `lir`: the libraries its modules declare (driver.linkdecl) are linked by the mode of the build, after the `-l` the command line gave; a link that fails
-;; for one of them names the module that needs it. `--via c` builds it through the C compiler (driver.viac) instead of LLVM.
+;; The executable of `lir`: lair links the libraries the module's `dependent-library` forms name (spec/lir.md 4.9; `:lib` on an extern the program
+;; reaches) by the mode of the build, after the `-l` the command line gave, and a link that fails for one of them says what needs it; the driver
+;; adds the module that declared it (driver.linkdecl). `--via c` builds it through the C compiler (driver.viac) instead of LLVM.
 (defun build-exe :private (lir: ec/Emitted file: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> i64
-  (let ((declared (ld/from-notes (. lir links))))
-    (match (ld/lib-words-in declared dirs)
-      ((Err m) (do (eprintln m) front/exit-usage))
-      ((Ok words)
-       (match (if (viac/via-c?) (viac/build-via-c (ec/emitted-text lir) file out opt dirs (into libs words)) (native/build-module (. lir ast) out opt dirs (into libs words)))
-         ((Err m) (compile-failed (ld/explain-failure m declared)))
-         ((Ok _) 0))))))
+  (match (if (viac/via-c?) (viac/build-via-c (ec/emitted-text lir) file out opt dirs libs) (native/build-module (. lir ast) out opt dirs libs (library? lir)))
+    ((Err m) (compile-failed (ld/name-modules m (. lir declared))))
+    ((Ok _) 0)))
 
 ;; `targets`: the table of code generation targets (types.targets), a header line and one tab-separated line per row.
 (defun cmd-targets () -> i64
@@ -196,6 +193,8 @@
                                      (some (str-slice (. g name) 11 (str-len (. g name)))) nil))
                  (_ nil))) (. ast items))))
 
+;; Whether the emitted module is a library (`--export`: its exports, not a `main`, are its entries), as lair's build option says it.
+(defun library? :private (m: ec/Emitted) -> bool (not (empty? (. m exports))))
+
 (defun emit-product :private (m: ec/Emitted out: str opt: i64 kind: str) -> (Result unit str)
-  (try-let ((libs (ld/lib-words (ld/from-notes (. m links)))))
-    (native/emit-module (. m ast) out opt kind libs)))
+  (native/emit-module (. m ast) out opt kind (library? m)))

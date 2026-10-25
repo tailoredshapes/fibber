@@ -69,7 +69,7 @@ exponent, or `INF`, `-INF`, `NAN`.
 
 ## 2. Types
 
-**Spelling.** (owner, 2026-10-25; §14 item 19.) lIR spells names out: it has
+**Spelling.** (owner, 2026-10-25; §14 item 21.) lIR spells names out: it has
 no sigil or shorthand of its own. Every word lIR owns is written in upper
 case: the heads of items and instructions, modifiers, calling conventions,
 types, literal heads, flags, predicates, orderings and fields (`DEFINE`,
@@ -225,12 +225,16 @@ item   ::= (DEFSTRUCT MUTABLE? NAME (type*))       ; mutable: its fields may be 
          | (DECLARE HIDDEN? cc? NAME rtype (ptype* ...?))  ; a function defined elsewhere
          | (DEFINE mod* cc? (NAME rtype) (param*) block+)
          | (TARGET (CPU STR) (FEATURES STR)?)        ; the CPU and features to generate code for (§4.5)
+         | (DEPENDENT-LIBRARY STR)                   ; a native library the code needs linked: LLVM's !llvm.dependent-libraries (§4.9)
          | (OWNERSHIP (RETAIN (GLOBAL NAME)) (RELEASE (GLOBAL NAME)) (UNIQUE (GLOBAL NAME)) (ALLOC (GLOBAL NAME))
                       (STACK-INIT (GLOBAL NAME)) (STACK-END (GLOBAL NAME)) (HEADER (STRUCT NAME)))
                                                    ; what the ownership forms lower to (§6.14.6)
          | (DEFINE-MACRO NAME (PNAME* ...?) block+)        ; a compile-time macro (§4.6)
          | (REQUIRE-MACROS STR)                         ; the macros of a library file (§4.6)
          | (IMPORT STR)                                 ; another module of the program (§4.7)
+         | (MACRO-IMPORT STR)                           ; a module compiled into the macro session only (§4.6)
+         | (MODULE-MACRO NAME)                          ; the macro applied to the rest of the module's forms (§4.6)
+         | (INCLUDE STR)                                ; a file's text read in place (§4.6)
          | (DEFINE-READER-MACRO STR (PNAME) block+)     ; a reader macro on a character (§4.8)
          | (DEFINE-DISPATCH-MACRO STR (PNAME) block+)   ; a reader macro on the character after # (§4.8)
          | (DEFINE-READER-CLASS STR class)              ; a character's class (§4.8)
@@ -245,6 +249,7 @@ mod    ::= PRIVATE | INTERNAL | EXTERNAL           ; linkage (§4.3), at most on
          | NOINLINE | COLD                         ; LLVM's function attributes of those names (§4.3), `define` only
          | SHARED                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
          | UNSAFE                                  ; the fence of §6.14.4 is open inside the function, `define` only
+         | (EXPORT-NAME STR)                       ; LLVM's "wasm-export-name" attribute (§4.3), `define` only
 block  ::= (BLOCK LABEL instr+)
 ```
 
@@ -304,6 +309,7 @@ any order before the calling convention (`duplicate modifier private`,
 | `ALWAYSINLINE` (canonical name `inline`) | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
 | `noinline` | `noinline` | **Decided** (owner, 2026-10-25: lIR spells what LLVM IR spells, and lair reads no front end's convention out of band): a `define` only (`declare cannot be noinline`, `global cannot be noinline: noinline is for a function`), once (`duplicate modifier noinline`), not with `inline` (`inline and noinline exclude each other`: LLVM's verifier refuses `alwaysinline` with `noinline`); the inliner never inlines the function. For the out-of-line half of a fast path, which LLVM would otherwise inline into its one caller (the runtime's `fib.alloc-slow`, `fib.retain-slow`, `fib.release-slow`, `fib.stack-slow`) |
 | `cold` | `cold` | **Decided** (owner, 2026-10-25): a `define` only (`declare cannot be cold`, `global cannot be cold: cold is for a function`), once; the function is rarely called: when LLVM weighs the edges of a function, a block that a call of it post-dominates is cold too, so it is laid out off the hot path. For a trap or error path |
+| `(EXPORT-NAME "NAME")` | `"wasm-export-name"="NAME"` | **Decided** (owner, 2026-10-25: the text is the contract; §14 item 20): a `define` only (`declare cannot be export-name`, `global cannot be export-name: export-name is for a function`), once (`duplicate modifier export-name`), among the other modifiers in any order; `NAME` a non-empty string (`export-name expects one string`, `.. found X`, `export-name: the name must not be empty`). LLVM's string attribute of that name: the WebAssembly backend marks the symbol exported in the object and `wasm-ld` exports the function under `NAME` (clang's `__attribute__((export_name))`); every other backend ignores it, and the C, JS and WGSL printers too. What a native shared library exports is not this but the linkage and visibility of this table: the `external` definitions that are not `hidden`, and nothing else (lair writes no version script or symbol list; until 2026-10-25 it took one beside the module). A front end writes it on each function a wasm host is to call |
 
 A function's name carries no attribute: lair puts `alwaysinline`, `noinline` and `cold` on a function
 when its `define` says so and never otherwise (until 2026-10-25 it made every function whose name ended
@@ -427,8 +433,9 @@ the elements of the splice were read before it ran, so a binding it makes reache
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
 may expand to a use of an earlier one, and its own body may use one), and its function `(GLOBAL lir.macro.NAME)` is declared in the bodies of
-later macros, which may call it (`cases/lir/macros/position.lir`). A body holds blocks only: it declares nothing else, and calls nothing
-of the C library or of the module. `(REQUIRE-MACROS "FILE")` defines, in the requiring module, the
+later macros, which may call it (`cases/lir/macros/position.lir`); a body may call its own function too, which is the module's own
+`define`, so a macro recurses over the forms it is given directly (`cases/lir/macros/self-recursive.lir`). A body holds blocks only: it
+declares nothing else, and calls nothing of the C library or of the module. `(REQUIRE-MACROS "FILE")` defines, in the requiring module, the
 macros of the library `FILE`, a text of `define-macro` and `require-macros` forms and nothing else (`expected define-macro or
 require-macros, found declare`): a library is not a module, there is nothing to link its items into (ADR 0024). `FILE` is read as written
 when absolute, else beside the requiring file (`cases/lir/macros/x.lir` requires `"../../../lib/lir/defun.lir"`), or relative to the
@@ -479,8 +486,47 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.text s) : ptr`, `(lir.sexp.len s) : i64` | a symbol's or a string's bytes (NUL-terminated) and count |
 | `(lir.sexp.int s) : i64`, `(lir.sexp.flt s) : double` | an integer's or a float's value |
 | `(lir.sexp.is s cstr) : i1` | whether `s` is the symbol with that text |
-| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the module |
+| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the program: one counter per program read (the loader's, given to every module's session, ADR 0013: no global state), so the names two modules of a program make never coincide (`cases/lir/macros/gensym-program.lir`) |
+| `(lir.sexp.expand form) : ptr` | the form expanded through the module's macros as the expander would (outermost first, then the children), as an object; null when that expansion fails, and its error is then the use's (below) |
+| `(lir.sexp.set l i x) : ptr` | item `i` of the list `l` replaced by `x`, the dual of `nth`; `l` (out of range: nothing) |
 | `(lir.sexp.fail at message) : ptr` | the expansion fails with `macro NAME: MESSAGE` at the object `at` (null: at the use); returns null, for the macro to return |
+
+**Expansion from a macro, and macro-time state.** A lowering macro delegates: `lir.sexp.expand` hands a form back to the expander, which
+expands it through the macros the module has at that point (a use of the calling macro included) and returns the result as objects; a
+macro runs on the worker of its module for this (the one thread its reader macros run on, §4.8), parked while the expander answers,
+and a nested use of the module's macros runs on the same worker inside that hook (`call-nest`, §11; a macro of an imported module on its
+own module's worker). When the
+nested expansion fails, the macro gets null and the nested error, where it is, is the use's error whatever the macro then returns
+(`cases/lir/macros/expand-delegate.lir`, `reject-expand-fails.lir`); a reader macro (§4.8) runs while the text is read and has no
+expansion to call: null (`cases/lir/readers/expand-null.lir`). 
+**macro-import.** `(MACRO-IMPORT "FILE")` compiles the lIR module `FILE` into the macro session of the module that writes it (as the
+library `lir.sexp` is), once per session by its canonical path, and declares its structs, its external `define`s and `global`s in the
+bodies of the macros defined after it, as `lir.sexp.*` are; the module is read and expanded as a module of its own (its `import`s are
+macro-imported into the session the same way, their interfaces its declarations) and checked as one, and an error in it is
+`macro-import: FILE:L:C: error: ..` at the direction; a module that imports itself through others is `macro-import: FILE imports itself`.
+Its globals are the session's state for the module's expansion: written by one macro run, read by the next of the same module, gone with
+the session at the end of the module (`cases/lir/macros/macro-import.lir`); a macro of an imported module runs in its own module's session
+(§4.7) and sees that module's, and an importer never sees them. So a type checker is ordinary runtime lIR that thin macros call. The three
+directions that bring a file: `require-macros` brings macros (and reader macros) to the module's text; `import` (§4.7) brings a module into
+the program and its interface to the importer; `macro-import` brings a module into the macro session only: it is neither linked into the
+program nor exported, and a library may hold it beside `define-macro`.
+
+**module-macro.** `(MODULE-MACRO NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
+parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
+of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
+`define-macro` or `module-macro` written there is data the macro sees); at the end of the text `NAME` is applied to them as its `...`
+argument and its result is one top-level form, expanded as any is, a `begin` splice usually, whose spliced directions then take effect in
+order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that is no top-level form is the parser's error at the direction
+(`reject-module-result.lir`). A library may hold the direction, so a `require-macros` arms it and the text after is the macro's
+(`module-library.lir`); a library that arms one when one is armed already (a library required by the library that armed) is
+`module-macro: the module has a module macro already` at its direction (`reject-module-twice.lir`), and once one is armed a direction in the
+module's own text is data the macro sees. A `module-macro` the result splices arms again and takes the rest of the splice, applied in turn.
+Each module of a program (§4.7) has its own.
+
+**include.** `(INCLUDE "FILE")` reads the file's text in place, under the module's readtable, its forms as if written there, each a
+top-level form of the module (a direction, a macro use, an item), the objects a macro gets naming `FILE` as their file; once per module
+by canonical path, in the set `require-macros` uses, a file that includes itself being `include: FILE includes itself`; an error in it is
+`include: FILE:L:C: error: ..` at the include (`cases/lir/macros/include.lir`, `reject-include-self.lir`, `reject-include-error.lir`).
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
 list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a
@@ -544,8 +590,7 @@ namespace as its declarations are: defining or declaring one of them is `duplica
 the forms after it (`duplicate macro NAME` if the importer has one); the macros it took through `require-macros` or `import` are not
 (`cases/lir/imports/reject-transitive-macro.lir`). An imported macro runs in its module's session: it is used, `(NAME ..)`, and is not
 `(GLOBAL lir.macro.NAME)` in the importer's macro bodies (§4.6 declares those for the importer's own session). `lir.sexp.gensym` counts per
-session: a name an imported macro makes and one the importer's own macro makes may coincide (`x.1` twice), which the checker refuses in
-one function (§5.3) and which distinct prefixes avoid; one counter per program is a later step.
+program (§4.6): a name an imported macro makes and one the importer's own macro makes never coincide.
 
 **The program's rules.** Each module is admitted in load order, the named module last, and its items meet the names the program has:
 
@@ -693,6 +738,32 @@ stream; what `quote` and `vector` mean is then the module's, by `define-macro`. 
 functions are an lIR module of lair's (`compiler/native/macros/readlib.fib`) compiled into the macro session beside the form library;
 the reader (`compiler/lir/sexp.fib`) consults the table per form and hands a bound character to the runner
 (`compiler/native/macros/readers.fib`).
+
+### 4.9 Dependent libraries
+
+**Decided** (owner, 2026-10-25: the text is the contract; nothing lair does follows from a comment, a name convention, an environment
+variable or an argument beside the module; §14 item 19). A module names a native library its code needs linked:
+
+```
+(DEPENDENT-LIBRARY "z")
+```
+
+It is LLVM's named metadata `!llvm.dependent-libraries = !{!{!"z"}}`, what clang's `#pragma comment(lib, "z")` makes and what an ELF
+`.deplibs` section carries, written as an s-expression. `STRING` is the name as the linker's `-l` takes it (`z` for `libz`; `:FILE`
+names a file, as `-l:FILE` does). Any number of forms, anywhere among the items; a name written twice is one library. Semantics: the
+library's symbols satisfy the module's `declare`s, so lair lowers the form to that metadata on every path and links from it:
+`lair build` adds `-lNAME` after the `-l` of its command line (static or dynamic by the build's options, `FIB_LINK`, `FIB_LINK_MODE`,
+`FIB_STATIC`, docs/design/static-linking.md 3; `c m pthread dl rt util` are the C library's own and never a link word), `lair run`,
+the JIT and a live session load the library into the process before the names rules look for its symbols (§11), a liro object records it
+for `lair link`, and `(IMPORT "FILE")` (§4.7) keeps the imported module's forms in the union, as `llvm-link` concatenates the metadata.
+A library that cannot be found or loaded is an error naming it, on the path that needed it. A `declare` the library would satisfy but
+no form names is as before: undefined at link, or found in the process by the JIT.
+
+Rules, checked by the parser: `dependent-library expects one string` (none, two, or a form that is not a string, `found X`);
+`dependent-library: the name must not be empty`. The C backend prints nothing for the form (the C route of `fibc` links from it); the JS
+and WGSL backends have no linker and ignore it; the printer writes it back as read, and `dump-ast` shows it as `dependent-library`.
+Until 2026-10-25 lair read the library list out of comments `;; link-lib: NAME MODULE` before the module, and from an argument beside
+the tree on the in-memory path; a comment is lexically nothing (§1) and now carries nothing. Cases: `cases/lir/link`.
 
 ## 5. Functions, blocks and names
 
@@ -1165,9 +1236,12 @@ assembly is PTX; nothing of them runs on a CPU target, and lair refuses them the
 
 On a kernel target `atomicrmw` and `cmpxchg` (§6.6) are valid as they are, on a global pointer and on a `shared` global (GPU-3): `add sub and or xor xchg max min umax umin` on `i32` and `i64`, `fadd` on `float` (PTX `atom.global.add.f32`, `atom.shared.add.f32`), and (GPU-5) `fadd fsub fmax fmin` on `float` for WGSL as a compare-and-exchange loop (webgpu.md 3.7; PTX expands `fmax`/`fmin`/`fsub` itself); the address space comes from the pointer's origin (LLVM's InferAddressSpaces), `monotonic` is `atom.relaxed`. No new form was needed for atomics; types.md 2.17 lists the builtins that emit them (`gpu/atomic-*`), and webgpu.md 3.7 says what WGSL takes of them.
 
-`llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. On a kernel target lair reads
-`(ALIGN 1)` on a scalar `load` or `store` as the scalar's natural alignment (the kernel subset indexes elements, never bytes; a byte-aligned
-access on a GPU is four accesses of a byte): docs/design/gpu.md 3.3 and native.lower.memory `kernel-align`.
+`llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. `(ALIGN N)` on a `load` or
+`store` means `N` on a kernel target as on every other (§6.5): a front end writes the alignment it means (the kernel subset indexes
+elements, never bytes, and a byte-aligned access on a GPU is four accesses of a byte, so fibber's emitter writes a scalar's own size on a
+kernel target, docs/design/gpu.md 3.3). Until 2026-10-25 lair read `(ALIGN 1)` on a scalar as the scalar's natural alignment there
+(native.lower.memory `kernel-align`); **Decided** (owner, 2026-10-25: the text is the contract, and `align 1` means 1 in LLVM), that
+reading is gone.
 
 ### 6.10 What is not in lIR
 
@@ -1634,7 +1708,13 @@ I32) ((I32 argc) (PTR argv)) ..)`, with the C convention: `main must be
 and exported: `main must not be private or internal` (§4.3). The
 process exit status is `main`'s result, as C gives it (the low 8
 bits on POSIX). Output buffered by the C library is flushed at exit on
-both paths.
+both paths. A module built into a library (`lair build --library`, the
+`library` of lair's build options; **Decided**, owner, 2026-10-25, §14
+item 20) is not run, so the rule does not apply to it: its entries are
+what it exports (§4.3), and on wasm it gets wasi-libc's reactor start
+and no entry point. Whether a build is a library is a build option of
+lair, never read from the environment (until 2026-10-25 `FIB_EXPORTS`
+turned the rule off).
 
 ### 7.3 Tail calls
 
@@ -1875,7 +1955,7 @@ target's triple and data layout on the module.
 ```
 lair check FILE.lir              ; parse and check only
 lair run FILE.lir [ARGS..]       ; JIT-compile and run main; exit with its status
-lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
+lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [--library] [-L DIR].. [-l LIB]..   ; --library: a library, no main rule (§7.2)
 lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair expand FILE.lir             ; print the module with its macros expanded, as lIR text (§4.6): the input of a backend with no compile-time runtime
 lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
@@ -1956,10 +2036,12 @@ one the passes used.
 | 10 | external global declarations `(declare-global NAME T)`, for `stderr` and other variables the C library or another module defines | **adopted** as proposed | §4.4 |
 | 11 | `volatile` and `(align N)` on `load`, `store` and `alloca` | **adopted** as proposed: `N` a power of two from 1 to 2^30; `volatile` is LLVM's, not atomic | §6.5 |
 | 12 | the instructions SIMD code needs (SIMD wave 2, package P0, owner decisions of 2026-10-04): `fma fmuladd fsqrt fabs ffloor fceil ftrunc fround froundeven fcopysign fmin fmax fminnum fmaxnum smin smax umin umax abs`; fast-math flags `reassoc contract arcp afn nsz` (never `nnan`, `ninf` or `fast`, which make poison) on `fadd fsub fmul fdiv frem fma reduce-fadd reduce-fmul`; the horizontal `reduce-*` family; conversions, saturating conversions and `ptrtoint`/`inttoptr` on vectors; a vector index in `getelementptr`; `masked-load`, `masked-store`, `gather`, `scatter`; the module form `(target (cpu ..) (features ..))` | **adopted** as designed in docs/design/simd-and-tensors.md 2.9, 2.10, with `nsz` allowed (it never makes poison) and `fmuladd` and `fcopysign` added; implemented by the compiler in fibber only (the Rust `lair` is the legacy oracle and does not have them: its harness skips the cases marked `;; stage: 2`) | §4.5, §6.1, §6.3, §6.4, §6.5 |
-| 13 | kernel forms for a kernel target: `kernelcc`, `(sreg R)`, `(barrier)`, and `(align 1)` on a scalar read as natural alignment there | **Accepted** (the owner, 2026-10-07): implemented in the parser, checker, printer and lair, exercised by compiler/tests/native/gpu-emit.sh and j-unit; docs/design/gpu.md. `fib.gpu` is core, not a driver: `defkernel` is the deliberate opt-in, and a build for a platform with no kernel target rejects the program with a clear message. GPU-5 added to the same family `(sreg laneid)`, `(sreg warpsize)`, the intrinsic forms `shfl-down shfl-up shfl-xor shfl-idx` and `ballot` (§6.9a): **Accepted** (the owner, 2026-10-08: "Accept"), with the target-defined behaviours as written there | §2, §6.9a |
+| 13 | kernel forms for a kernel target: `kernelcc`, `(sreg R)`, `(barrier)`, and (until 2026-10-25, see §6.9a) `(align 1)` on a scalar read as natural alignment there | **Accepted** (the owner, 2026-10-07): implemented in the parser, checker, printer and lair, exercised by compiler/tests/native/gpu-emit.sh and j-unit; docs/design/gpu.md. `fib.gpu` is core, not a driver: `defkernel` is the deliberate opt-in, and a build for a platform with no kernel target rejects the program with a clear message. GPU-5 added to the same family `(sreg laneid)`, `(sreg warpsize)`, the intrinsic forms `shfl-down shfl-up shfl-xor shfl-idx` and `ballot` (§6.9a): **Accepted** (the owner, 2026-10-08: "Accept"), with the target-defined behaviours as written there | §2, §6.9a |
 | 14 | facts: `nsw`/`nuw` on `add sub mul shl`, `(assume c)`, `(load (range LO HI) T p)`, each LLVM's own form in LLVM's spelling (lIR is LLVM IR as S-expressions; a front-end abstraction is the front end's to lower into these), and the check mode `FIB_LIR_FACTS=use|trap|ignore` | **Decided** (owner, 2026-10-24); docs/design/lir-facts.md | §6.1, §6.5, §6.12, §6.13, §10 |
 | 15 | compile-time macros in lIR: a module-level `define-macro` whose body is lIR over s-expression objects that lIR owns (`lir.sexp.*`), expansion by lair outermost-first between reading and parsing, `require-macros` of a file of definitions, no hygiene (gensym), `defun` as the first library macro (lib/lir/defun.lir). The named exception to "LLVM's spelling first" (docs/design/lir-language.md D1): LLVM has no macros, and the languages on lIR are libraries of them | **Accepted by default** (the gloss design, 2026-10-25, takes D1's recommendation; the owner may override) | §4, §4.6, §12, cases/lir/macros |
 | 16 | `(import "FILE")`: a program is the union of its modules as `llvm-link` joins LLVM modules; the importer sees the imported module's exported functions as `declare`s, its exported globals as `declare-global`s, its structs, and the macros of its own file; loaded once per program in dependency order, cycles refused, errors at the import with the module's file and position; exported names defined once, declarations agree in type, internal names renamed `NAME.N` on collision; no transitive export, no search root (a path, as `require-macros`); fibber's numbered ids (ADR 0024) are met by the duplicate rule (an emitted program is imported by nothing) | **Accepted by default** (gloss item 3, 2026-10-25; the owner may override) | §4, §4.7, cases/lir/imports |
 | 17 | reader macros: a per-module readtable in Lisp's shape (`define-reader-macro` on a character, `define-dispatch-macro` on the character after `#`, `define-token-reader` after every atom), each an lIR function of the stream (`lir.read.*`) returning a form or no form, run at read time through the macro session; `(`, `)`, `;` and whitespace cannot be bound, everything else can and the module then reads under its table; a required library's bindings are the requiring module's, an import's are not (each module of a program reads under its own table); lIR's own syntax unchanged and a module with no bindings reads as before; `lib/lir/readers.lir` (`'x`, `[a b]`) the first library. The owner's direction of 2026-10-25: lIR as thin as possible, a language brings its own syntax as reader macros | **Proposed** (the lead, 2026-10-25) | §4, §4.8, cases/lir/readers |
 | 18 | ownership in lIR: the managed type `(ptr 1)` (LLVM's `ptr addrspace(1)`), kinds on SSA values and parameters, SIL's forms `alloc-object alloc-stack dealloc-stack copy-value destroy-value is-unique`, `load copy|borrow|take`, `store init|assign|borrow`, `addrspacecast` inside `(define unsafe ..)`, the `ownership` form naming what the forms lower to (one per program, in the interface of the module that carries it), a verifier of ten rules inside `lir.check` on every path (`FIB_LIR_OWN`, `report` the default until the emitter emits the forms), erasure as the last pass before LLVM or a printer after an optimisation slot on the explicit forms; MIR's words weighed and recorded | **Decided** (owner, 2026-10-25: lIR is the language, lair the only compiler; docs/design/lir-language.md stage 2, D4 to D10 as recommended) | §2, §4, §4.7, §6.10, §6.14, §10, §12, §13, cases/lir/own |
-| 19 | lIR spells names out and every word it owns is upper case (owner, 2026-10-25: "lir should prefer spelled out names not abbreviations or macros. So @ should be 'global'"; "I'm also ok with using CAPS for lir"): `(GLOBAL f)` for `@f`, `(STRUCT S)` for `%struct.S`, `(PTR (ADDRSPACE 1))` for `(ptr 1)`, `FUNCTION` for `fn`, `ALWAYSINLINE` for `inline`, `PRESERVE_MOSTCC` for `preservemost`, `INF`/`NAN`, `(VECTOR N T)`, `(ARRAY N T)` and `(LITERAL-STRUCT ..)` for LLVM's bracket syntax; names as written; a name that is a word refused; the reserved words and the reserved macro names gone; one table of the words (`compiler/lir/words.fib`) held equal to the grammar by `compiler/tests/lir/words.sh`; `lair respell` converts a text. The audit and the plan: `/tank/data/fibber-scratch/lir-language/respell-audit.md` | **Decided** (owner, 2026-10-25) | §1, §2, §3, §4, §5.1, §5.3, §6, §9, §12 |
+| 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
+| 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |
+| 21 | lIR spells names out and every word it owns is upper case (owner, 2026-10-25: "lir should prefer spelled out names not abbreviations or macros. So @ should be 'global'"; "I'm also ok with using CAPS for lir"): `(GLOBAL f)` for `@f`, `(STRUCT S)` for `%struct.S`, `(PTR (ADDRSPACE 1))` for `(ptr 1)`, `FUNCTION` for `fn`, `ALWAYSINLINE` for `inline`, `PRESERVE_MOSTCC` for `preservemost`, `INF`/`NAN`, `(VECTOR N T)`, `(ARRAY N T)` and `(LITERAL-STRUCT ..)` for LLVM's bracket syntax; names as written; a name that is a word refused; the reserved words and the reserved macro names gone; one table of the words (`compiler/lir/words.fib`) held equal to the grammar by `compiler/tests/lir/words.sh`; `lair respell` converts a text. The audit and the plan: `/tank/data/fibber-scratch/lir-language/respell-audit.md` | **Decided** (owner, 2026-10-25) | §1, §2, §3, §4, §5.1, §5.3, §6, §9, §12 |

@@ -23,15 +23,12 @@
 
 ;; Builds `lir` into `exe` and runs it, its streams in files beside it.
 (defun build-and-run :private (lir: ec/Emitted dir: str opt: i64 args: (Vec str)) -> i64
-  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")) (declared (ld/from-notes (. lir links))))
-    (match (ld/lib-words declared)
-      ((Err m) (do (eprintln m) 2))
-      ((Ok words)
-       (match (native/build-module (. lir ast) exe opt [] words)
-         ((Err m) (do (eprintln (str "compile failed: " (ld/explain-failure m declared))) 5))
-         ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
-                     (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
-                       (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))))
+  (let ((exe (str dir "/x")) (out (str dir "/out")) (err (str dir "/err")))
+    (match (native/build-module (. lir ast) exe opt [] [] false)
+      ((Err m) (do (eprintln (str "compile failed: " (ld/name-modules m (. lir declared)))) 5))
+      ((Ok _) (do (native/setenv-set "FIB_TRACE" "1")
+                  (let ((pid (p/spawn-executable exe (into [exe] args) out err 300)))
+                    (if (< pid 0) 5 (report out err (p/wait-pid pid)))))))))
 
 (defun run-static (file: str args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
   (match (front/lower-module file roots rm false)

@@ -174,32 +174,24 @@
                       ((Ok _) (Ok ())))))))))
 
 ;; --- a shared library (`fibc build --shared`, docs/design/shared-libraries.md): the object linked with `cc -shared` (`cc -dynamiclib -install_name @rpath/NAME` on macOS).
-;; Only the exports are visible from outside: a version script (`local: *`) on Linux, an exported-symbols list on macOS. The object already has every other
-;; symbol local, so the list is the second guard and what a host's `nm -D` sees.
+;; Only the exports are visible from outside, because the object has every other symbol local: the lIR's linkage and visibility decide what a host's
+;; `nm -D` sees (spec/lir.md 4.3).
 
 ;; The file name of `path` (what follows its last `/`).
 (defun base-name :private (path: str) -> str
   (let ((d (dir-part path))) (str-slice path (str-len d) (str-len path))))
 
-;; The linker's list of the symbols to keep: a GNU version script, or one `_NAME` per line for Apple's ld.
-(defun exports-file :private (symbols: (Vec str) mac: bool) -> str
+;; The `cc` arguments before the object: the kind of library and its name for the loader.
+(defun shared-args :private (out: str mac: bool) -> (Vec str)
   (if mac
-      (str-join (mapv (fn (s: str) (str "_" s "\n")) symbols))
-      (str "{\n  global:\n" (str-join (mapv (fn (s: str) (str "    " s ";\n")) symbols)) "  local:\n    *;\n};\n")))
+      ["-dynamiclib" "-install_name" (str "@rpath/" (base-name out))]
+      ["-shared" (str "-Wl,-soname," (base-name out))]))
 
-;; The `cc` arguments before the object: the kind of library, its name for the loader, and the list of exports.
-(defun shared-args :private (out: str list: str mac: bool) -> (Vec str)
-  (if mac
-      ["-dynamiclib" "-install_name" (str "@rpath/" (base-name out)) (str "-Wl,-exported_symbols_list," list)]
-      ["-shared" (str "-Wl,-soname," (base-name out)) (str "-Wl,--version-script=" list)]))
-
-;; Links the objects into the shared library `out` exporting `symbols` (and nothing else); `-L` and `-l` as for an executable.
-(defun link-shared (objects: (Vec str) out: str symbols: (Vec str) mac: bool dirs: (Vec str) libs: (Vec str)) -> (Result unit LairError)
-  (let ((list (str out ".lair.exports"))
-        (errfile (str out ".lair.err")))
-    (match (write-bytes list (str-bytes (exports-file symbols mac)))
-      ((Err m) (Err (ErrBackend m)))
-      ((Ok _) (let ((r (run-cc (into (into (into ["cc"] (shared-args out list mac)) objects) (into ["-o" out] (link-args dirs libs))) errfile)))
-                (do (remove-path list)
-                    (remove-path errfile)
-                    (match r ((Err m) (Err (ErrBackend m))) ((Ok _) (Ok ())))))))))
+;; Links the objects into the shared library `out`; `-L` and `-l` as for an executable. What the library exports is what the objects export: the
+;; module's `external` definitions that are not `hidden` (spec/lir.md 4.3), every other definition being `internal` or `hidden` in the object, so no
+;; version script or exported-symbols list is written (until 2026-10-25 one was, from a list handed in beside the module).
+(defun link-shared (objects: (Vec str) out: str mac: bool dirs: (Vec str) libs: (Vec str)) -> (Result unit LairError)
+  (let ((errfile (str out ".lair.err")))
+    (let ((r (run-cc (into (into (into ["cc"] (shared-args out mac)) objects) (into ["-o" out] (link-args dirs libs))) errfile)))
+      (do (remove-path errfile)
+          (match r ((Err m) (Err (ErrBackend m))) ((Ok _) (Ok ())))))))

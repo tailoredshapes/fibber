@@ -102,11 +102,14 @@ The sizes are estimates from reading the code, not measurements. An agent-week i
 2. `-slow` names mean `noinline` (`compiler/native/lower.fib:192-197`). This becomes LLVM's `noinline`/`cold` attributes in
    lIR, with `:noinline`/`:cold` on fibber's `defun`; *in progress on a branch*.
 3. `;; link-lib:` comments (emit/assemble.fib:31, native/libraries.fib:12-25) and the separate `links` argument become LLVM's
-   `!llvm.dependent-libraries`, as `(dependent-library "curl")`.
+   `!llvm.dependent-libraries`, as `(dependent-library "curl")`; *landed 2026-10-25* (spec/lir.md 4.9, cases/lir/link).
 4. `FIB_EXPORTS` and the `exports` argument (native/target.fib:63-65, linkwasm.fib:68-92, driver/shared.fib:81):
    - exports are already `external` and not `hidden` in the text;
    - wasm gets LLVM's `"wasm-export-name"` as `(export-name "x")`;
    - library versus executable becomes a build option.
+
+   *Landed 2026-10-25* (spec/lir.md 4.3, 7.2, 12; cases/lir/attrs/export-name.lir): lair reads `FIB_EXPORTS` nowhere; the
+   environment variable remains fibber's own channel from `fibc build --export` to its front end.
 5. The target triple becomes `(target (triple …) (datalayout …))`, mirroring LLVM. Today `FIB_TARGET_TRIPLE` picks a row of
    fibber's `types.targets`, imported by lower.fib:5, lower/intrin.fib:10, api.fib:9 and llvm/target.fib:11. That row:
    - sets musttail versus plain `tail` (lx.fib:28-31/71-73), so spec/lir.md 7.3's guarantee fails on wasm and riscv;

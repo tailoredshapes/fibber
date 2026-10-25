@@ -1138,7 +1138,9 @@ fibber objects (**Decided**, §9).
 `store-*` takes a pointer and that exact value type and returns `unit`.
 All ten require lexical `unsafe`. They access 4, 8, 16, 32, or 32 bytes,
 respectively, with byte alignment (LLVM `align 1`); unaligned addresses are
-permitted. Callers must keep the owner alive and supply a complete readable
+permitted. On a kernel target (`defkernel`, docs/design/gpu.md 3.3) the scalar
+pairs are written with the scalar's own alignment, `(align 4)` and `(align 8)`:
+a kernel indexes elements, and the emitter writes the alignment it means. Callers must keep the owner alive and supply a complete readable
 or writable range. These primitives add no bounds, lifetime, or uniqueness
 checks. Cases 7009, 7017, 7053, and 7056 in `cases/stdlib` pin the round trips
 and unsafe boundary. This extension is native-stage only, like the SIMD types; the frozen
@@ -1185,7 +1187,7 @@ parameter the calls pass, and the lIR `declare` has the first N then `...`, so t
 Apple arm64, which passes variadic arguments on the stack but fixed ones in registers: `fcntl(fd, F_SETFL, flags)` declared with all three fixed
 read a garbage third argument there (docs/design/aarch64.md 7). Without `:fixed` every declared parameter is fixed, as before. x86-64 is the same either way.
 `:lib "NAME"` (stage 2) says which native library the C function lives in. It changes nothing about the call. When the program reaches the extern (a call that
-survives to the emitted code), the emitter notes the library and the module that declared it in the lIR (`;; link-lib: NAME MODULE`) and `fibc build` links it:
+survives to the emitted code), the emitter writes `(dependent-library "NAME")` in the lIR module (spec/lir.md 4.9, LLVM's `!llvm.dependent-libraries`) and lair links it from that form:
 dynamically (`-lNAME`) or bundled (the archive `libNAME.a`) by the mode of the build (`--link NAME=static|dynamic`, `--link-mode`, `--static`:
 docs/design/static-linking.md 3). `fibc run` (the JIT, also `run --live` and `repl`) loads the library into its process before the program's code, as an
 executable's loader would. Dynamically, the development link `libNAME.so` is taken first; where only the versioned file is installed (`libNAME.so.7`), the

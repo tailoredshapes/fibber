@@ -33,8 +33,19 @@
              (= head "define") (define rest pos)
              (= head "target") (target-form rest pos)
              (= head "ownership") (ownership-form rest pos)
+             (= head "dependent-library") (dependent-library-form rest pos)
              :else (err pos (str top-text ", found " (sexp-describe form))))))
     (_ (err (sexp-pos form) (str top-text ", found " (sexp-describe form))))))
+
+;; `(DEPENDENT-LIBRARY "NAME")` (spec/lir.md 4.9): one non-empty string, the library's name as the linker's `-l` takes it.
+(defun dependent-library-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (if (not (= (count rest) 1))
+      (err pos "dependent-library expects one string")
+      (match (nth rest 0)
+        ((SxStr bs _) (if (= (array-len bs) 0)
+                          (err (sexp-pos (nth rest 0)) "dependent-library: the name must not be empty")
+                          (Ok (ItDependentLibrary (LDependentLibrary (str-from-bytes bs) pos)))))
+        (other (err (sexp-pos other) (str "dependent-library expects one string, found " (sexp-describe other)))))))
 
 ;; `(OWNERSHIP (RETAIN (GLOBAL f)) .. (HEADER (STRUCT NAME)))` (spec/lir.md 6.14.6): every field once, each a list of the field's word and
 ;; one reference (`@f` and `%struct.NAME` in the old spelling); the names are kept bare.
@@ -162,8 +173,21 @@
           ((Err d) (Err d))
           ((Ok t) (recur (+ i 1) (conj out t)))))))
 
-;; The modifiers at the front of a form and how many words they took.
-(defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool inline: bool noinline: bool cold: bool unsafe: bool))
+;; The modifiers at the front of a form and how many words they took; `export-name` from `(export-name "NAME")` (spec/lir.md 4.3).
+(defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool inline: bool noinline: bool cold: bool unsafe: bool export-name: (Option str)))
+
+;; `(EXPORT-NAME "NAME")` among the modifiers: the name, or why the form is not one.
+(defun export-name-form :private (s: Sexp) -> (Result (Option str) Diagnostic)
+  (match s
+    ((SxList items p)
+     (if (and (> (count items) 0) (atom-word? (nth items 0) "export-name"))
+         (if (= (count items) 2)
+             (match (nth items 1)
+               ((SxStr bs _) (if (= (array-len bs) 0) (err p "export-name: the name must not be empty") (Ok (some (str-from-bytes bs)))))
+               (other (err (sexp-pos other) (str "export-name expects one string, found " (sexp-describe other)))))
+             (err p "export-name expects one string"))
+         (Ok nil)))
+    (_ (Ok nil))))
 
 ;; The code of a modifier word: 0-2 linkage, 3 `hidden`, 4 `shared`, 5 `inline`, 6 `noinline`, 7 `cold`, 8 `unsafe`; -1 for a word that is not one.
 (defun modifier-code :private (word: str) -> i64
@@ -189,11 +213,16 @@
 ;; The linkage and visibility words at the front of `items`, and how many they took (spec/lir.md 4.3). (items.rs `modifiers`)
 ;; `inline` and `noinline` exclude each other (LLVM's verifier refuses `alwaysinline` with `noinline`).
 (defun modifiers :private (items: (Vec Sexp)) -> (Result Mods Diagnostic)
-  (loop ((i 0) (seen false) (m (Mods lk-external false 0 false false false false false)))
+  (loop ((i 0) (seen false) (m (Mods lk-external false 0 false false false false false nil)))
     (let ((word (if (< i (count items)) (word-of (nth items i)) ""))
           (code (modifier-code (if (< i (count items)) (word-of (nth items i)) ""))))
       (if (< code 0)
-          (Ok (with m (used i)))
+          (match (if (< i (count items)) (export-name-form (nth items i)) (Ok nil))
+            ((Err d) (Err d))
+            ((Ok nil) (Ok (with m (used i))))
+            ((Ok (some name)) (if (some? (. m export-name))
+                                  (err (sexp-pos (nth items i)) "duplicate modifier export-name")
+                                  (recur (+ i 1) seen (with m (export-name (some name)))))))
           (let ((is-linkage (< code 3))
                 (dup (if (< code 3) seen (flag-set? m code))))
             (cond (and dup is-linkage (not (= (linkage-of code) (. m linkage))))
@@ -204,9 +233,10 @@
                   (err (sexp-pos (nth items i)) "inline and noinline exclude each other")
                   :else (recur (+ i 1) seen (with-flag m code))))))))
 
-;; The function attribute a `declare` or a global cannot take, if `m` has one: `inline`, `noinline`, `cold` or `unsafe` is for a `define`.
+;; The function attribute a `declare` or a global cannot take, if `m` has one: `inline`, `noinline`, `cold`, `unsafe` or `export-name` is for a `define`.
 (defun fn-attribute :private (m: Mods) -> (Option str)
-  (cond (. m inline) (some "inline") (. m noinline) (some "noinline") (. m cold) (some "cold") (. m unsafe) (some "unsafe") :else nil))
+  (cond (. m inline) (some "inline") (. m noinline) (some "noinline") (. m cold) (some "cold") (. m unsafe) (some "unsafe")
+        (some? (. m export-name)) (some "export-name") :else nil))
 
 ;; Whether any of the first n items is the atom `external`.
 (defun has-external? :private (items: (Vec Sexp) n: i64) -> bool
@@ -234,7 +264,7 @@
                   (name (global-name (nth body 0)))
                   (ty (parse-type (nth body 1)))
                   (init (parse-expr (nth body 2))))
-          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden) false false false false) pos (. m shared)))))))))
+          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden) false false false false nil) pos (. m shared)))))))))
 
 (defun declare-global :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
   (try-let ((m (declared-hidden "declare-global" rest)))
@@ -276,7 +306,7 @@
             (ps (params (nth body 1)))
             (blocks (parse-blocks body)))
     (Ok (ItDefine (LFunction name (LFnType (. split cc) ret (. ps types) false) (. ps names) blocks
-                             (LModifiers (. m linkage) (. m hidden) (. m inline) (. m noinline) (. m cold) (. m unsafe)) pos)))))
+                             (LModifiers (. m linkage) (. m hidden) (. m inline) (. m noinline) (. m cold) (. m unsafe) (. m export-name)) pos)))))
 
 (defstruct Params (types: (Vec LType) names: (Vec LParam)))
 

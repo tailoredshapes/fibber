@@ -5,7 +5,7 @@
 ;; dropped.
 (ns native.imports.program
   (:use lir.diag lir.types lir.ast)
-  (:require [lir.rewrite :as rw] [native.macros :as macros]))
+  (:require [lir.rewrite :as rw] [native.macros.types :as mt] [llvm.ffi :as ffi]))
 
 ;; A name of the program: the file that has it, whether as a definition (a `declare` otherwise) and its type as text.
 (defstruct Owner (file: str defined: bool ty: str))
@@ -15,18 +15,19 @@
 
 ;; What an importer gets of a module: its interface items (at position 0: an importer puts them at its import), the names it keeps
 ;; internal, and the macros of its own file.
-(defstruct Export (iface: (Vec LItem) hidden: (Vec str) macros: (Vec macros/Macro)))
+(defstruct Export (iface: (Vec LItem) hidden: (Vec str) macros: (Vec mt/Macro)))
 
 ;; The program being loaded: the modules admitted in order, the files being loaded (a cycle), the exports by file, the program's names and
 ;; structs, the file whose `target` form the program has, and every module's environment (closed together: an importer may use a module's
-;; macros until the program is read).
+;; macros until the program is read), and the word the program's gensym counter lives in (spec/lir.md 4.6: every module's macro session
+;; counts in it; freed with the environments).
 (defstruct State (loaded: (Cell (Vec Loaded)) loading: (Cell (Set str)) exports: (Cell (Map str Export)) names: (Cell (Map str Owner))
-                  structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec macros/Env))
+                  structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec mt/Env))
                   ;; the file whose `ownership` form the program has (spec/lir.md 6.14.6), one as the `target`
-                  ownership: (Cell (Option str))))
+                  ownership: (Cell (Option str)) gensym: i64))
 
 (defun state-new () -> State
-  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell []) (cell nil)))
+  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell []) (cell nil) (ffi/ptr->addr (ffi/slot-new))))
 
 ;; ---------------------------------------------------------------- admission
 
@@ -56,6 +57,7 @@
     ((ItStruct s) (admit-struct st file s renames))
     ((ItTarget t) (admit-target st file t renames))
     ((ItOwnership o) (admit-ownership st file o renames))
+    ((ItDependentLibrary _) (Ok renames))
     ((ItDefine f) (admit-symbol st file own (. f name) (fn-type-str (. f ty)) true (exported? (. f mods)) (. f pos) renames))
     ((ItGlobal g) (admit-symbol st file own (. g name) (type-str (. g ty)) true (exported? (. g mods)) (. g pos) renames))
     ((ItDeclare d) (admit-symbol st file own (. d name) (fn-type-str (. d ty)) false true (. d pos) renames))

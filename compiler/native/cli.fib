@@ -19,7 +19,7 @@
                                              transitional for one release; FIB_LIR_SPELLING=old|new, which `cases` and `fuzz` pass on)
   lair check FILE.lir
   lair run [-O n] FILE.lir [ARGS..]
-  lair build FILE.lir -o OUT [-O n] [--emit liro|obj|asm|llvm] [-L DIR].. [-l LIB]..
+  lair build FILE.lir -o OUT [-O n] [--emit liro|obj|asm|llvm] [--library] [-L DIR].. [-l LIB]..   ; --library: no main rule, the output is a library (a wasm reactor)
   lair link FILE.liro.. -o OUT [-O n] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
@@ -132,7 +132,7 @@
 ;; JIT-compiles the module and runs `main`; exits with its status (`exit` flushes the C library's buffers, as returning from a C main would).
 (defun execute :private (file: str opt: i64 prog-args: (Vec str) tracing: bool) -> (Result i64 str)
   (try-let [src (read-src file)
-            m (rendered (pipe/for-executable-file src file) file)
+            m (rendered (pipe/for-executable-file src file false) file)
             session (rendered (jit/session-new opt) file)
             _ (rendered (jit/session-add-module session file m) file)
             ty (rendered (jit/session-signature session "main") file)
@@ -157,7 +157,7 @@
 ;; -------------------------------------------------------------------------------------------------- build
 
 ;; What `build` was asked for so far (cli.rs `build`'s locals).
-(defstruct BuildArgs (out: (Option str) opt: i64 emit: (Option aot/AotOutput) liro: bool libs: (Vec str) dirs: (Vec str)))
+(defstruct BuildArgs (out: (Option str) opt: i64 emit: (Option aot/AotOutput) liro: bool libs: (Vec str) dirs: (Vec str) library: bool))
 
 (defun emit-kind :private (v: str) -> (Result aot/AotOutput str)
   (cond (= v "obj") (Ok aot/OutObject)
@@ -178,21 +178,22 @@
   (or (= a "-o") (= a "-O") (= a "-L") (= a "-l") (= a "--emit")))
 
 (defun parse-build :private (words: (Vec str)) -> (Result BuildArgs str)
-  (loop ((i 0) (b (BuildArgs nil 0 nil false [] [])))
+  (loop ((i 0) (b (BuildArgs nil 0 nil false [] [] false)))
     (cond (>= i (count words)) (Ok b)
+          (= (nth words i) "--library") (recur (+ i 1) (with b (library true)))
           (not (build-flag? (nth words i))) (Err (str "unknown option " (nth words i) "\n" usage))
           (>= (+ i 1) (count words)) (Err (str (nth words i) " needs a value"))
           :else (try-let [b2 (build-option b (nth words i) (nth words (+ i 1)))]
                   (recur (+ i 2) b2)))))
 
 (defun build-output :private (b: BuildArgs file: str src: str out: str) -> (Result unit str)
-  (let ((opts (aot/AotOptions (. b opt) (. b libs) (. b dirs))))
+  (let ((opts (aot/AotOptions (. b opt) (. b libs) (. b dirs) (. b library))))
     (if (. b liro)
       (try-let [m (rendered (pipe/check-file src file) file)
-                libs (libraries/lib-words (libraries/declared-libs src))]
+                libs (libraries/lib-words (libraries/module-libs m))]
         (rendered (liro-file/export-file m out (. b opt) libs) file))
     (match (. b emit)
-      (nil (try-let [m (rendered (pipe/for-executable-file src file) file)]
+      (nil (try-let [m (rendered (pipe/for-executable-file src file (. b library)) file)]
              (rendered (liro/build-executable m file out opts) file)))
       ((some kind) (try-let [m (rendered (pipe/check-file src file) file)
                              bytes (rendered (aot/aot-emit m file kind opts) file)]

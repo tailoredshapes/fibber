@@ -6,8 +6,8 @@
 #   2. the PTX holds the four kernels as `.visible .entry` with their PTX names (vadd, gemm, gemm_smem, assert_positive), the launch-ABI header
 #      (`// fib.kernel-sig vadd: ptr ptr ptr i64`), `fma.rn.f32` for `simd/fma`, `trap;` for the trap entry, `%tid.x` and `%ctaid.y` for the
 #      index space, `.shared`, `ld.shared`, `st.shared` and `bar.sync` for `gpu/shared` and `gpu/barrier`, and NO byte-wise access
-#      (`ld.global.b8`: the align-1 rule of native.lower.memory), NO runtime function (`fib_`), NO libc call (`malloc`, `write`); `--emit llvm`
-#      of the same holds `ptx_kernel`, `addrspace(3)` and the LLVM 21 barrier intrinsic;
+#      (`ld.global.b8`: the emitter writes a kernel's scalar alignment, emit.lower.gpu `raw-align`), NO runtime function (`fib_`),
+#      NO libc call (`malloc`, `write`); `--emit llvm` of the same holds `ptx_kernel`, `addrspace(3)` and the LLVM 21 barrier intrinsic;
 #   3. the kernels run on the host (`fibc run examples/gpu/gpu.fib`: the one-language guard, 0 mismatches against a CPU loop);
 #   4. refusals: a kernel that allocates (an `array` in the body) and one that prints are refused by the kernel checker at their source
 #      positions (own.kernel; the cases 8530-8569 of cases/stdlib have the rest); `--emit obj` on the kernel target is refused; `--emit ptx`
