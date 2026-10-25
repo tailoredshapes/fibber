@@ -1,0 +1,138 @@
+;; compiler/native/macros/helpers.fib: the helpers of the expander (native.macros) that need its records and nothing of its expansion: the
+;; environment of a file read for a module, paths (resolve, canonical), the macro's parameters and its function's form, the declarations a
+;; macro body gets, the errors, a module's interface for a macro-import (ADR 0006: files under 500 lines).
+(ns native.macros.helpers
+  (:use lir.diag lir.sexp lir.ast lir.types native.error native.macros.types)
+  (:require [lir.parse.names :as names] [native.call :as call] [native.macros.objects :as obj] [llvm.ffi :as ffi]))
+
+;; The environment of a file read for the module of `env` (a library, an included file): the file's own name, everything else the module's.
+(defun env-sub (env: Env path: str) -> Env
+  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq) (. env hook) (. env collected) (. env gensym)))
+
+;; The file as the objects carry it: a C string that lives as long as they do, null for none.
+(defun file-cstr (file: str) -> ptr
+  (if (= file "") (ffi/addr->ptr 0) (ffi/bytes-new file)))
+
+(defun head-of (form: Sexp) -> str
+  (match form
+    ((SxList its _) (if (empty? its) "" (names/atom-or-empty (nth its 0))))
+    (_ "")))
+
+(defun arity-text (m: Macro) -> str
+  (str (. m fixed) (if (. m rest) " or more" "") " argument" (if (and (= (. m fixed) 1) (not (. m rest))) "" "s")))
+
+;; The objects a macro's entry takes: one per fixed parameter, then the list of the remaining arguments for a rest parameter.
+(defun argument-objects (env: Env m: Macro its: (Vec Sexp) pos: i64) -> (Vec i64)
+  (let ((file (. env cfile))
+        (fixed (mapv (fn (i: i64) (obj/to-object (nth its (+ i 1)) (. env cfile))) (range (. m fixed)))))
+    (if (. m rest) (conj fixed (obj/to-object (SxList (names/vec-from its (+ (. m fixed) 1)) pos) file)) fixed)))
+
+(defun word-or-zero (r: (Result i64 str)) -> i64
+  (match r ((Ok v) v) ((Err _) 0)))
+
+(defun str-err (r: (Result a str) m: Macro pos: i64) -> (Result a Diagnostic)
+  (match r ((Ok v) (Ok v)) ((Err e) (err pos (str "macro " (. m name) ": " e)))))
+
+;; What a macro that returned null said through `lir.sexp.fail`, at the object it named when it named one: read from the macro's own session.
+(defun failure (m: Macro pos: i64) -> Diagnostic
+  (let ((msg (word-or-zero (call/call-i64 (. m take) []))) (at (word-or-zero (call/call-i64 (. m at) []))))
+    (if (= msg 0)
+        (Diagnostic pos (str "macro " (. m name) " returned no form"))
+        (Diagnostic (if (= at 0) pos at) (str "macro " (. m name) ": " (ffi/c-string-at msg))))))
+
+(defun lair-str (r: (Result a LairError)) -> (Result a str)
+  (match r ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e)))))
+
+(defun macro-name (env: Env s: Sexp) -> (Result str Diagnostic)
+  (try-let ((a (names/atom-text s "a macro name"))
+            (n (names/valid-name a (sexp-pos s))))
+    (cond (contains? form-names n) (err (sexp-pos s) (str "macro " n ": the name of a form"))
+          (some? (get @(. env macros) n)) (err (sexp-pos s) (str "duplicate macro " n))
+          :else (Ok n))))
+
+(defun param-name (s: Sexp out: (Vec str)) -> (Result str Diagnostic)
+  (try-let ((a (names/atom-text s "a parameter name"))
+            (n (names/valid-name a (sexp-pos s))))
+    (if (some? (first (filter (fn (x: str) (= x n)) out)))
+        (err (sexp-pos s) (str "duplicate parameter " n))
+        (Ok n))))
+
+;; `(NAME.. ...?)`: at most 8 names, each once; `...` last and after a name, which is then bound to the list of the remaining arguments.
+(defun macro-params (s: Sexp) -> (Result Params Diagnostic)
+  (match s
+    ((SxList ps pos)
+     (loop ((i 0) (out []))
+       (cond (> (count out) max-params) (err pos (str "a macro takes at most " max-params " parameters"))
+             (>= i (count ps)) (Ok (Params out false))
+             (names/atom-is? (nth ps i) "...")
+             (cond (= i 0) (err (sexp-pos (nth ps i)) "... must follow a parameter name")
+                   (not (= i (- (count ps) 1))) (err (sexp-pos (nth ps i)) "... must be the last parameter")
+                   :else (Ok (Params out true)))
+             :else (match (param-name (nth ps i) out)
+                     ((Err d) (Err d))
+                     ((Ok n) (recur (+ i 1) (conj out n)))))))
+    (_ (err (sexp-pos s) "expected a parameter list (NAME..)"))))
+
+;; `(define (FNAME ptr) ((ptr P)..) BLOCK..)`: the macro as an ordinary function of its session, `lir.macro.NAME` for a macro.
+(defun macro-define (fname: str ps: Params blocks: (Vec Sexp) pos: i64) -> Sexp
+  (SxList (into [(SxAtom "define" pos)
+                 (SxList [(SxAtom fname pos) (SxAtom "ptr" pos)] pos)
+                 (SxList (mapv (fn (p: str) (SxList [(SxAtom "ptr" pos) (SxAtom p pos)] pos)) (. ps names)) pos)]
+                blocks)
+          pos))
+
+;; `(declare lir.macro.NAME ptr (ptr..))` of every macro defined so far in the session `s`, as text: a macro's body may call an earlier
+;; macro's function. A macro of an imported module is in that module's session: it is used, not called (spec/lir.md 4.7).
+(defun macro-declares (env: Env s: Session) -> str
+  (str-join-with "\n"
+    (mapv (fn (m: Macro) (str "(declare lir.macro." (. m name) " ptr (" (str-join-with " " (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) "ptr")) "))"))
+          (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros)))))))
+
+;; The error of a macro's module the session refused: the checker's first diagnostic, where it is in the file, or the JIT's text.
+(defun module-error (what: str e: LairError pos: i64) -> Diagnostic
+  (match e
+    ((ErrInvalid ds) (if (empty? ds)
+                         (Diagnostic pos (str what ": invalid"))
+                         (Diagnostic (. (nth ds 0) pos) (str what ": " (. (nth ds 0) message)))))
+    (_ (Diagnostic pos (str what ": " (lair-error-str e))))))
+
+;; The directory of a path, with its slash; "" when it has none.
+(defun dir-of (file: str) -> str
+  (loop ((i (- (str-len file) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at file i) 47i8) (str-slice file 0 (+ i 1))
+          :else (recur (- i 1)))))
+
+;; `FILE` of a `require-macros` or an `import`: as written when absolute or when the module has no file, else beside the module's file.
+(defun resolve (env: Env path: str) -> str
+  (if (or (starts-with? path "/") (= (. env file) "")) path (str (dir-of (. env file)) path)))
+
+(extern realpath (ptr ptr) -> ptr)
+
+;; The canonical path of `path`, the key a library or a module is identified by (spec/lir.md 4.6, 4.7): `.`, `..` and symbolic links resolved
+;; by the OS (realpath(3), as native.link does for `-L`), so that two spellings of one file are one file. A path realpath refuses (a file
+;; that does not exist) is its own key: the reader's `cannot read` message then names it as written. Messages always name the path as written.
+(defun canonical (path: str) -> str
+  (let ((p (ffi/bytes-new path))
+        (r (unsafe (ffi/ptr->addr (realpath p (ffi/addr->ptr 0))))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= r 0)
+            path
+            (let ((s (ffi/c-string-at r)))
+              (do (ffi/free-addr r) s))))))
+
+;; What a module shows to what imports it into the session: its structs, and its external defines and globals as declarations.
+(defun interface-items (m: LModule) -> (Vec LItem)
+  (loop ((i 0) (out []))
+    (if (>= i (count (. m items)))
+        out
+        (recur (+ i 1)
+               (match (nth (. m items) i)
+                 ((ItStruct _) (conj out (nth (. m items) i)))
+                 ((ItDefine f) (if (linkage-exported? (. (. f mods) linkage))
+                                   (conj out (ItDeclare (LDeclare (. f name) (. f ty) (. (. f mods) hidden) (. f pos))))
+                                   out))
+                 ((ItGlobal g) (if (linkage-exported? (. (. g mods) linkage))
+                                   (conj out (ItDeclareGlobal (LGlobalDecl (. g name) (. g ty) (. (. g mods) hidden) (. g pos))))
+                                   out))
+                 (_ out))))))

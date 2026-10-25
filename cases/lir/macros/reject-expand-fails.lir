@@ -1,0 +1,25 @@
+;; expect: reject
+;; error: 25:58: error: macro twice expects 1 argument, found 2
+;; spec/lir.md 4.6: an expansion that fails inside lir.sexp.expand is the error of the use, where the nested use is: the macro gets null
+;; and returns it, and the nested expansion's error is reported, not `returned no form`.
+(define-macro twice (x)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "add")))
+      (call @lir.sexp.push l x)
+      (call @lir.sexp.push l x)
+      (ret l))))
+(define-macro lit64 (v)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "i64")))
+      (call @lir.sexp.push l v)
+      (ret l))))
+(define-macro count-after (f)
+  (block entry
+    (let ((e (call @lir.sexp.expand f)))
+      (br (icmp eq e (ptr null)) failed ok)))
+  (block failed (ret (ptr null)))
+  (block ok (ret (call @lir.macro.lit64 (call @lir.sexp.integer (call @lir.sexp.count e))))))
+(define (main i32) ()
+  (block entry (ret (trunc i32 (add (i64 0) (count-after (twice (i32 1) (i32 2))))))))

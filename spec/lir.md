@@ -356,8 +356,9 @@ the elements of the splice were read before it ran, so a binding it makes reache
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
 may expand to a use of an earlier one, and its own body may use one), and its function `@lir.macro.NAME` is declared in the bodies of
-later macros, which may call it (`cases/lir/macros/position.lir`). A body holds blocks only: it declares nothing else, and calls nothing
-of the C library or of the module. `(require-macros "FILE")` defines, in the requiring module, the
+later macros, which may call it (`cases/lir/macros/position.lir`); a body may call its own function too, which is the module's own
+`define`, so a macro recurses over the forms it is given directly (`cases/lir/macros/self-recursive.lir`). A body holds blocks only: it
+declares nothing else, and calls nothing of the C library or of the module. `(require-macros "FILE")` defines, in the requiring module, the
 macros of the library `FILE`, a text of `define-macro` and `require-macros` forms and nothing else (`expected define-macro or
 require-macros, found declare`): a library is not a module, there is nothing to link its items into (ADR 0024). `FILE` is read as written
 when absolute, else beside the requiring file (`cases/lir/macros/x.lir` requires `"../../../lib/lir/defun.lir"`), or relative to the
@@ -408,8 +409,47 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.text s) : ptr`, `(lir.sexp.len s) : i64` | a symbol's or a string's bytes (NUL-terminated) and count |
 | `(lir.sexp.int s) : i64`, `(lir.sexp.flt s) : double` | an integer's or a float's value |
 | `(lir.sexp.is s cstr) : i1` | whether `s` is the symbol with that text |
-| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the module |
+| `(lir.sexp.gensym cstr) : ptr` | a fresh symbol `PREFIX.N`, `N` counting up through the program: one counter per program read (the loader's, given to every module's session, ADR 0013: no global state), so the names two modules of a program make never coincide (`cases/lir/macros/gensym-program.lir`) |
+| `(lir.sexp.expand form) : ptr` | the form expanded through the module's macros as the expander would (outermost first, then the children), as an object; null when that expansion fails, and its error is then the use's (below) |
+| `(lir.sexp.set l i x) : ptr` | item `i` of the list `l` replaced by `x`, the dual of `nth`; `l` (out of range: nothing) |
 | `(lir.sexp.fail at message) : ptr` | the expansion fails with `macro NAME: MESSAGE` at the object `at` (null: at the use); returns null, for the macro to return |
+
+**Expansion from a macro, and macro-time state.** A lowering macro delegates: `lir.sexp.expand` hands a form back to the expander, which
+expands it through the macros the module has at that point (a use of the calling macro included) and returns the result as objects; a
+macro runs on the worker of its module for this (the one thread its reader macros run on, §4.8), parked while the expander answers,
+and a nested use of the module's macros runs on the same worker inside that hook (`call-nest`, §11; a macro of an imported module on its
+own module's worker). When the
+nested expansion fails, the macro gets null and the nested error, where it is, is the use's error whatever the macro then returns
+(`cases/lir/macros/expand-delegate.lir`, `reject-expand-fails.lir`); a reader macro (§4.8) runs while the text is read and has no
+expansion to call: null (`cases/lir/readers/expand-null.lir`). 
+**macro-import.** `(macro-import "FILE")` compiles the lIR module `FILE` into the macro session of the module that writes it (as the
+library `lir.sexp` is), once per session by its canonical path, and declares its structs, its external `define`s and `global`s in the
+bodies of the macros defined after it, as `lir.sexp.*` are; the module is read and expanded as a module of its own (its `import`s are
+macro-imported into the session the same way, their interfaces its declarations) and checked as one, and an error in it is
+`macro-import: FILE:L:C: error: ..` at the direction; a module that imports itself through others is `macro-import: FILE imports itself`.
+Its globals are the session's state for the module's expansion: written by one macro run, read by the next of the same module, gone with
+the session at the end of the module (`cases/lir/macros/macro-import.lir`); a macro of an imported module runs in its own module's session
+(§4.7) and sees that module's, and an importer never sees them. So a type checker is ordinary runtime lIR that thin macros call. The three
+directions that bring a file: `require-macros` brings macros (and reader macros) to the module's text; `import` (§4.7) brings a module into
+the program and its interface to the importer; `macro-import` brings a module into the macro session only: it is neither linked into the
+program nor exported, and a library may hold it beside `define-macro`.
+
+**module-macro.** `(module-macro NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
+parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
+of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
+`define-macro` or `module-macro` written there is data the macro sees); at the end of the text `NAME` is applied to them as its `...`
+argument and its result is one top-level form, expanded as any is, a `begin` splice usually, whose spliced directions then take effect in
+order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that is no top-level form is the parser's error at the direction
+(`reject-module-result.lir`). A library may hold the direction, so a `require-macros` arms it and the text after is the macro's
+(`module-library.lir`); a library that arms one when one is armed already (a library required by the library that armed) is
+`module-macro: the module has a module macro already` at its direction (`reject-module-twice.lir`), and once one is armed a direction in the
+module's own text is data the macro sees. A `module-macro` the result splices arms again and takes the rest of the splice, applied in turn.
+Each module of a program (§4.7) has its own.
+
+**include.** `(include "FILE")` reads the file's text in place, under the module's readtable, its forms as if written there, each a
+top-level form of the module (a direction, a macro use, an item), the objects a macro gets naming `FILE` as their file; once per module
+by canonical path, in the set `require-macros` uses, a file that includes itself being `include: FILE includes itself`; an error in it is
+`include: FILE:L:C: error: ..` at the include (`cases/lir/macros/include.lir`, `reject-include-self.lir`, `reject-include-error.lir`).
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
 list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a
@@ -473,8 +513,7 @@ namespace as its declarations are: defining or declaring one of them is `duplica
 the forms after it (`duplicate macro NAME` if the importer has one); the macros it took through `require-macros` or `import` are not
 (`cases/lir/imports/reject-transitive-macro.lir`). An imported macro runs in its module's session: it is used, `(NAME ..)`, and is not
 `@lir.macro.NAME` in the importer's macro bodies (§4.6 declares those for the importer's own session). `lir.sexp.gensym` counts per
-session: a name an imported macro makes and one the importer's own macro makes may coincide (`x.1` twice), which the checker refuses in
-one function (§5.3) and which distinct prefixes avoid; one counter per program is a later step.
+program (§4.6): a name an imported macro makes and one the importer's own macro makes never coincide.
 
 **The program's rules.** Each module is admitted in load order, the named module last, and its items meet the names the program has:
 
