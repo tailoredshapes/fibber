@@ -1,6 +1,7 @@
 #!/bin/bash
 # compiler/tests/shared/stackcheck.sh STAGE2 [library|planted|depth]..: the stack check in a shared library and in an ordinary program that catches
-# (docs/design/stack-check.md). Linux x86-64; run from the repository root.
+# (docs/design/stack-check.md). Linux and macOS (the export is read with nm -D from ELF, nm -gU from Mach-O; LLVM_LIBDIR names libLLVM-21's directory,
+# default /usr/lib/llvm-21/lib: mk/config.mk sets Homebrew's on macOS); run from the repository root.
 #   library   stackfns.fib built as a library with its header (which must declare fib_status and fib_error), stackhost.c calls the recursions past the stack of the
 #             host's main thread, of a second thread, of threads with 256 KiB and 64 MiB stacks, of 8 threads at once and of 60 started in turn: every call returns,
 #             `fib_status` says 1 and `fib_error` says `stack overflow`, the call after answers, an allocating recursion is the same, another trap is a status too
@@ -27,8 +28,9 @@ if part library; then
   for sym in "int32_t fib_status(void);" "int64_t fib_error(uint8_t* out, int64_t out_cap);"; do
     if grep -qF "$sym" "$t/stackfns.h"; then echo "ok    header declares $sym"; else echo "FAIL  header lacks $sym"; fail=1; fi
   done
-  syms=$(nm -D --defined-only "$t/libstackfns.so")
-  if printf '%s\n' "$syms" | grep -q ' T fib_status$'; then echo "ok    fib_status is exported"; else echo "FAIL  fib_status not exported"; fail=1; fi
+  # the dynamic symbols a library defines: ELF's dynamic table, or Mach-O's external defined symbols (which carry a leading underscore)
+  if [ "$(uname -s)" = Darwin ]; then syms=$(nm -gU "$t/libstackfns.so"); want=' T _fib_status$'; else syms=$(nm -D --defined-only "$t/libstackfns.so"); want=' T fib_status$'; fi
+  if printf '%s\n' "$syms" | grep -q "$want"; then echo "ok    fib_status is exported"; else echo "FAIL  fib_status not exported"; fail=1; fi
   timeout 300 "$t/host" "$t/libstackfns.so" > "$t/host.out" 2>&1; rc=$?
   cat "$t/host.out"
   if [ $rc -eq 0 ] && ! grep -q '^FAIL' "$t/host.out"; then echo "ok    the host survived every overflow (exit 0)"; else echo "FAIL  host exit $rc"; fail=1; fi
@@ -59,7 +61,7 @@ if part jitexit; then
   # The compiler builds a program in live mode (FIB_LIVE=1): its macros and defs run as JIT code whose program is freed while the compiler's own threads, which ran it, are
   # alive. A pthread-key destructor pointing into that code killed the compiler at a thread's exit (`fatal signal 11`, found by the tsan gate stages); the key's destructor is
   # libc's free outside a library.
-  FIB_LIVE=1 timeout 900 "$s2" build "$root/compiler/lairf.fib" -I "$root/compiler" -I "$root/lib" -L /usr/lib/llvm-21/lib -l LLVM-21 -o "$t/lairf" > "$t/jit.out" 2>&1; rc=$?
+  FIB_LIVE=1 timeout 900 "$s2" build "$root/compiler/lairf.fib" -I "$root/compiler" -I "$root/lib" -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$t/lairf" > "$t/jit.out" 2>&1; rc=$?
   if [ $rc -eq 0 ]; then echo "ok    a compiler run in live mode ends cleanly (exit 0)"; else echo "FAIL  live-mode build exit $rc: $(tail -n 2 "$t/jit.out")"; fail=1; fi
 fi
 exit $fail
