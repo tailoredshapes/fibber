@@ -6,7 +6,7 @@
 #   2. test.py: everything over a real socket against test-app.fib with test-spec.fib loaded by --with (its docstring lists the checks),
 #      about two minutes
 # Exit 0 when every check holds. The mutants of scripts/mutant-live.sh (stale-never, rerun-old-registry, test-on-attach-thread,
-# sink-shared-run) must make it fail.
+# status-waits-for-run, sink-shared-run) must make it fail.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
