@@ -116,6 +116,26 @@ upper case and are not words. The placeholders: `NAME PNAME LABEL STR
 INT FLT N T LO HI`. In prose, and in lIR's messages, a word is named by
 its canonical name (`load`, `inline`).
 
+**The old spelling (transitional, for one release).** Until the tree's
+lIR is converted and a seed reads the new spelling, the parser can also
+read the old one and gives it the same tree: lower-case words, `@f`,
+`%struct.S`, `(ptr 1)`, `(fn ..)`, `inline`, `preservemost`, `inf` and
+`nan`, the vector type `<N x T>` as one token, `[N x T]` and `{ T.. }`;
+with it the old rules come back (the reserved words of the old §5.3, `@`
+and `%` refused at the start of a name, and the macro names of the old
+§4.6). `lair` reads the new spelling only unless it is given
+`--old-spelling` or `FIB_LIR_SPELLING=old` (`--new-spelling` and `new` the
+other way), and `lair cases` and `lair fuzz` pass the choice on to the
+processes they start (`lair fuzz` and `fuzz-one` admit the old spelling
+unless told otherwise: their generator writes it). `fibc` admits the old
+spelling, since its own lIR texts (the runtime, the templates) and the
+inline `lir` bodies of `lib/` stay old until the seed reads the new; the
+build exports
+`FIB_LIR_SPELLING=old` for its `lair` runs (`mk/config.mk`). The printer
+writes the new spelling only, and messages keep the old (`@f`,
+`%struct.s`) until they move with the case headers. The old spelling is
+dropped in the release after the seed that reads the new.
+
 ```
 type   ::= I1 | I8 | I16 | I32 | I64 | FLOAT | DOUBLE | PTR
          | (PTR (ADDRSPACE 1))             ; a managed reference: LLVM's ptr addrspace(1), non-integral (§6.14)
@@ -1860,13 +1880,15 @@ lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair expand FILE.lir             ; print the module with its macros expanded, as lIR text (§4.6): the input of a backend with no compile-time runtime
 lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
 lair words                       ; the words of lIR (§2): each word's text and its canonical name, one per line
+lair --old-spelling ..           ; admit the old spelling beside the new (§2, transitional); --new-spelling refuses it, the default
 ```
 
 `FIB_TARGET_CPU` names the CPU code is generated for when the module has
 no `target` form (§4.5): unset, empty or `host` mean the host's CPU and
 features; any other value names a CPU with no extra features.
-`FIB_LIR_FACTS` is the check mode of the facts (§6.13) and `FIB_LIR_OWN`
-the mode of the ownership verifier (§6.14.5).
+`FIB_LIR_FACTS` is the check mode of the facts (§6.13), `FIB_LIR_OWN`
+the mode of the ownership verifier (§6.14.5), and `FIB_LIR_SPELLING`
+(`old` or `new`) whether the old spelling is admitted (§2).
 
 ## 13. Cases
 

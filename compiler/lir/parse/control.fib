@@ -111,14 +111,16 @@
 (defun is-atom? :private (s: Sexp) -> bool
   (match s ((SxAtom _ _) true) (_ false)))
 
+;; `(CALL (GLOBAL f) a..)`, `(TAILCALL (GLOBAL f) a..)` (`@f` in the old spelling).
 (defun direct-call :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
   (if (= (count args) 0)
       (err pos (str name " needs a function name @f"))
-      (let ((head (nth args 0)) (a (atom-or-empty (nth args 0))))
-        (if (and (starts-with? a "@") (> (str-len a) 1))
-            (try-let ((xs (operands sub (vec-from args 1))))
-              (Ok (expr-new (KCall (CalDirect (str-slice a 1 (str-len a))) xs (= name "tailcall")) pos)))
-            (err (sexp-pos head) (str name " needs a function name @f, found " (sexp-describe head)))))))
+      (let ((head (nth args 0)))
+        (match (global-ref head)
+          ((some f)
+           (try-let ((xs (operands sub (vec-from args 1))))
+             (Ok (expr-new (KCall (CalDirect f) xs (= name "tailcall")) pos))))
+          (nil (err (sexp-pos head) (str name " needs a function name @f, found " (sexp-describe head))))))))
 
 (defun indirect-call :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
   (if (< (count args) 2)

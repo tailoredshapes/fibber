@@ -6,6 +6,8 @@
 # Environment: FIBC (a stage 2 or the seed), LLVM_LIB (default /usr/lib/llvm-21/lib), NODE, CHECK_JOBS (programs at once, default 2).
 # Exit 0 when everything held.
 set -u
+# The tree's lIR is in the old spelling until it is converted (spec/lir.md 2, transitional): lairf admits it (mk/config.mk sets the same).
+export FIB_LIR_SPELLING=${FIB_LIR_SPELLING:-old}
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../../.." && pwd)
 faults=0; [ "${1:-}" = --faults ] && { faults=1; shift; }
 out=${1:?usage: check.sh [--faults] OUTDIR}; mkdir -p "$out"

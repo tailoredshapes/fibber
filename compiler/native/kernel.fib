@@ -33,14 +33,21 @@
 (defun ptx-byte? :private (b: i8) -> bool
   (or (and (>= b 48i8) (<= b 57i8)) (and (>= b 65i8) (<= b 90i8)) (and (>= b 97i8) (<= b 122i8)) (= b 95i8) (= b 36i8)))
 
-;; The `@` references of `text` with their names made PTX names.
+;; A reference in printed lIR: `(GLOBAL name)` (spec/lir.md 3).
+(def REF: str "(GLOBAL ")
+
+;; Whether a reference starts at byte i.
+(defun ref-at? :private (text: str i: i64) -> bool
+  (and (= (str-byte-at text i) 40i8) (starts-with? (str-slice text i (min (str-len text) (+ i (str-len REF)))) REF)))
+
+;; The references of `text` with their names made PTX names.
 (defun ptx-refs (text: str) -> str
-  (let ((n (str-len text)))
+  (let ((n (str-len text)) (k (str-len REF)))
     (loop ((i 0) (from 0) (out []))
       (cond (>= i n) (s/join "" (conj out (str-slice text from n)))
-            (= (str-byte-at text i) 64i8)
-              (let ((j (name-end text (+ i 1) n)))
-                (recur j j (conj out (str-slice text from (+ i 1)) (ptx-name (str-slice text (+ i 1) j)))))
+            (ref-at? text i)
+              (let ((j (name-end text (+ i k) n)))
+                (recur j j (conj out (str-slice text from (+ i k)) (ptx-name (str-slice text (+ i k) j)))))
             :else (recur (+ i 1) from out)))))
 
 ;; The item with its own name made a PTX name.
@@ -66,18 +73,18 @@
 
 (defun device-stack-text :private (name: str) -> str
   (if (= name "fib.stack-init")
-      "(define internal (fib_stack_init void) ((ptr p) (i32 tid))\n  (block entry (call @fib_init_hdr p tid (i32 4)) (ret)))\n"
-      "(define internal (fib_stack_end void) ((ptr p))\n  (block entry (ret)))\n"))
+      "(DEFINE INTERNAL (fib_stack_init VOID) ((PTR p) (I32 tid))\n  (BLOCK entry (CALL (GLOBAL fib_init_hdr) p tid (I32 4)) (RET)))\n"
+      "(DEFINE INTERNAL (fib_stack_end VOID) ((PTR p))\n  (BLOCK entry (RET)))\n"))
 
-;; The `@name` references in the text of one item.
+;; The `(GLOBAL name)` references in the text of one item.
 (defun refs-in (text: str) -> (Vec str)
-  (let ((n (str-len text)))
+  (let ((n (str-len text)) (k (str-len REF)))
     (loop ((i 0) (out []))
       (if (>= i n)
           out
-          (if (= (str-byte-at text i) 64i8)
-              (let ((j (name-end text (+ i 1) n)))
-                (recur j (conj out (str-slice text (+ i 1) j))))
+          (if (ref-at? text i)
+              (let ((j (name-end text (+ i k) n)))
+                (recur j (conj out (str-slice text (+ i k) j))))
               (recur (+ i 1) out))))))
 
 (defun name-end :private (text: str i: i64 n: i64) -> i64
@@ -148,8 +155,8 @@
 ;; The device version of a trap entry: its signature, a call of `llvm.trap`, `unreachable`.
 (defun device-trap-text :private (f: LFunction) -> str
   (let ((params (. (. f ty) params)))
-    (str "(define internal (" (ptx-name (. f name)) " void) (" (s/join " " (mapv (fn (i: i64) (str "(" (type-str (nth params i)) " a" i ")")) (vec (range (count params)))))
-         ")\n  (block entry (trap) (unreachable)))\n")))
+    (str "(DEFINE INTERNAL (" (ptx-name (. f name)) " VOID) (" (s/join " " (mapv (fn (i: i64) (str "(" (print/type-text (nth params i)) " a" i ")")) (vec (range (count params)))))
+         ")\n  (BLOCK entry (TRAP) (UNREACHABLE)))\n")))
 
 ;; The kernel entry: external, `kernelcc`, named for the driver.
 (defun entry-text :private (f: LFunction k: str) -> str

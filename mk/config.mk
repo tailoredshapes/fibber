@@ -66,6 +66,9 @@ LIMIT_STDLIB ?= 1800
 
 # The environment every fibc of the build sees: the tree's library, scratch under build/, no LD_LIBRARY_PATH (a stage 2 links LLVM itself).
 export FIB_LIB := $(ROOT)/lib
+# The tree's lIR (rt/, cases/lir, the tests' .lir) is in the old spelling until it is converted (spec/lir.md 2, transitional): every lairf of the
+# build admits it (lairf alone refuses it by default; `lairf --old-spelling` is the same switch).
+export FIB_LIR_SPELLING := old
 # TMPDIR is outside the tree on purpose: with TMPDIR inside the worktree, cases/stdlib/8283 fails in a shard (expected 0, got 4294967296) and passes
 # with TMPDIR elsewhere (found in MAKE-1; reported, not explained). SCRATCH holds it, and the tool scripts' scratch.
 SCRATCH ?= $(HOME)/.cache/fibber-scratch/mk-$(shell echo $(ROOT) | { md5sum 2> /dev/null || md5 -r; } | cut -c1-8)

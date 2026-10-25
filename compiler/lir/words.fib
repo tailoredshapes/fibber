@@ -1,10 +1,15 @@
 ;; compiler/lir/words.fib: the one table of the words lIR owns (spec/lir.md section 2, "Spelling"): every item head, instruction head,
 ;; modifier, type word, literal head and flag, as the AST names it (its canonical name: lower case, what lir.ast, lir.intrin, the checker
 ;; and the backends compare) and as the text spells it (upper case: `ADD`, `ATOMIC-LOAD`, `ACQ_REL`; a few respelled: `fn` is
-;; `FUNCTION`). The parser, the printer, the name and label rules and the macro name check are to read it (the respelling's step 2), so
-;; that a word is added here and nowhere else; compiler/tests/lir/words.sh holds the table equal to the upper-case atoms of
+;; `FUNCTION`). The parser (lir.parse.names `word-of`), the printer (lir.print), the name and label rules and the macro form-name check
+;; all read it, so a word is added here and nowhere else; compiler/tests/lir/words.sh holds the table equal to the upper-case atoms of
 ;; the spec's grammar.
-
+;;
+;; The spelling mode (spec/lir.md 2, transitional for one release). Until the repository is converted (the respelling's steps 4 to 7), the
+;; parser can admit the old spelling beside the new: lower-case words, `@f`, `%struct.s`, `(ptr 1)`, `(fn ..)`, `<N x T>`, `[N x T]`,
+;; `{ T.. }`. `FIB_LIR_SPELLING=old` admits it, `new` refuses it; unset, a process admits it unless it says otherwise: lairf refuses it by
+;; default (`lairf --old-spelling` admits it), fibc admits it, since its own lIR texts (the runtime, the templates) and the inline `lir`
+;; bodies of lib/ are old until the seed reads the new. The mode is held in an atom: the parser's functions carry no context of their own.
 (ns lir.words
   (:require [fib.string :as s]))
 
@@ -64,6 +69,45 @@
 
 (defun words-table () -> (Vec Word) table)
 
+;; ---------------------------------------------------------------- the spelling mode
+
+(def mode-unset: i64 -1)
+(def mode-new: i64 0)
+(def mode-old: i64 1)
+
+(def spelling-mode: (Atom i64) (atom mode-unset))
+
+;; `FIB_LIR_SPELLING`: `old` admits the old spelling, `new` refuses it, anything else leaves the process's default.
+(defun mode-from-env :private () -> i64
+  (let ((v (unwrap-or (sys-getenv "FIB_LIR_SPELLING") "")))
+    (cond (= v "new") mode-new (= v "old") mode-old :else mode-unset)))
+
+;; Whether the parser admits the old spelling beside the new: the mode set, else the environment's, else admitted (fibc's default).
+(defun old-admitted? () -> bool
+  (let ((m @spelling-mode))
+    (if (= m mode-unset)
+        (let ((v (mode-from-env)))
+          (do (reset! spelling-mode (if (= v mode-unset) mode-old v)) (not (= v mode-new))))
+        (= m mode-old))))
+
+;; A process's default when neither a flag nor `FIB_LIR_SPELLING` says: lairf calls it with `false` (the new spelling only) before its
+;; flags are read.
+(defun default-spelling! (admit-old: bool) -> unit
+  (let ((v (mode-from-env)))
+    (do (reset! spelling-mode (if (= v mode-unset) (if admit-old mode-old mode-new) v)) ())))
+
+;; Sets the mode for the process: `on` admits the old spelling, `off` refuses it (`lairf --old-spelling`, `--new-spelling`).
+(defun admit-old-spelling! (on: bool) -> unit
+  (do (reset! spelling-mode (if on mode-old mode-new)) ()))
+
+;; `f` run with the old spelling admitted, the mode restored after: for a text of lair's own that is still in the old spelling (the macro
+;; session's libraries, native.macros) read while a module is parsed in the strict mode.
+(defun admitting-old (f: (fn () a) :borrow) -> a
+  (let ((was (old-admitted?)))
+    (do (admit-old-spelling! true)
+        (let ((r (f)))
+          (do (admit-old-spelling! was) r)))))
+
 ;; ---------------------------------------------------------------- lookups
 
 ;; Whether the first byte of `text` is an upper-case ASCII letter: no word's text starts otherwise, so a lower-case atom skips the map.
@@ -71,14 +115,17 @@
   (and (> (str-len text) 0)
        (let ((b (zext i64 (str-byte-at text 0)))) (and (>= b 65) (<= b 90)))))
 
-;; The canonical name of the word `text` spells (`ADD` is `add`); nil for an atom that is not a word, which is then a name.
+;; The canonical name of the word `text` spells in the current mode: its text (`ADD`), or, while the old spelling is admitted, its canonical
+;; name itself (`add`); nil for an atom that is not a word, which is then a name.
 (defun keyword-of (text: str) -> (Option str)
-  (if (upper-first? text) (get by-text text) nil))
+  (if (upper-first? text)
+      (get by-text text)
+      (if (and (old-admitted?) (contains? by-name text)) (some text) nil)))
 
 ;; The text of the canonical name `name`, which the printer writes; a name that is no word comes back as it is.
 (defun word-text (name: str) -> str
   (match (get by-name name) ((some t) t) (nil name)))
 
-;; Whether `text` is the text of a word, which is no name and no label (`reserved word ADD used as a name`).
+;; Whether `text` is the text of a word: refused as a name or a label in every mode (`reserved word ADD used as a name`).
 (defun word-text? (text: str) -> bool
   (and (upper-first? text) (contains? by-text text)))

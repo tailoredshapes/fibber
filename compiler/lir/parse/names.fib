@@ -4,8 +4,11 @@
 ;; The Rust `parse/mod.rs` is the parent of the other parse files and they call its helpers; fibber has no parent module, so the helpers are
 ;; here, at the bottom of the parse modules' dependency order. `&[Sexp]` is a `(Vec Sexp)` (a copy of the operands after the head).
 (ns lir.parse.names
-  (:use lir.diag lir.types lir.ast lir.sexp))
+  (:use lir.diag lir.types lir.ast lir.sexp)
+  (:require [lir.words :as words]))
 
+;; The words the old spelling reserves as names (spec/lir.md 5.3 before the respelling): lower-case words that are not instruction heads.
+;; Under the new spelling a name is refused only when it is the text of a word (`ADD`); these are refused while the old is admitted.
 (def reserved-words: (Set str)
   #{"null" "void" "unordered" "monotonic" "acquire" "release" "acq_rel" "seq_cst" "singlethread" "weak" "inbounds" "volatile" "align"
     "zeroinitializer" "private" "internal" "external" "hidden"})
@@ -13,9 +16,11 @@
 (defun scalar? :private (s: str) -> bool
   (match (scalar-keyword s) ((some _) true) (nil false)))
 
-;; A reserved word (parse/names.rs `is_reserved`): a type keyword or one of the reserved words.
+;; A reserved word: the text of a word of lir.words in every mode (`reserved word ADD used as a name`); a type keyword or one of the
+;; reserved words of the old spelling while it is admitted (parse/names.rs `is_reserved`).
 (defun reserved? (s: str) -> bool
-  (or (contains? reserved-words s) (scalar? s)))
+  (or (words/word-text? s) (words/word-text? (strip-minus s))
+      (and (words/old-admitted?) (or (contains? reserved-words s) (scalar? s)))))
 
 ;; The text without a leading `-`.
 (defun strip-minus (s: str) -> str
@@ -28,14 +33,59 @@
 
 (defun looks-numeric :private (s: str) -> bool
   (let ((body (strip-minus s)))
-    (or (digit-first? body) (= body "inf") (= body "nan"))))
+    (or (digit-first? body) (and (words/old-admitted?) (or (= body "inf") (= body "nan"))))))
+
+;; Whether the old spelling's sigils start `s`: `@f` and `%struct.s` are not names while the old spelling is admitted; under the new, `@`
+;; and `%` are characters like any other.
+(defun sigil-first? :private (s: str) -> bool
+  (and (words/old-admitted?) (or (starts-with? s "@") (starts-with? s "%"))))
 
 ;; A valid name at its binding site (parse/names.rs `valid_name`).
 (defun valid-name (s: str pos: i64) -> (Result str Diagnostic)
-  (cond (or (= (str-len s) 0) (starts-with? s "@") (starts-with? s "%") (looks-numeric s) (= s "..."))
+  (cond (or (= (str-len s) 0) (sigil-first? s) (looks-numeric s) (= s "..."))
         (err pos (str "invalid name " s))
         (reserved? s) (err pos (str "reserved word " s " used as a name"))
         :else (Ok s)))
+
+;; ---------------------------------------------------------------- words
+
+;; The canonical name of the word the atom `s` spells (`ADD` and, while the old spelling is admitted, `add` both give `add`); "" for a form
+;; that is not an atom or an atom that is no word, which is then a name. Every keyword position of the parser reads atoms through this.
+(defun word-of (s: Sexp) -> str
+  (match (sexp-atom s)
+    ((some a) (canon a))
+    (nil "")))
+
+;; `keyword-of` as text: the canonical name, or "" for no word.
+(defun canon (text: str) -> str
+  (match (words/keyword-of text) ((some k) k) (nil "")))
+
+;; The word the atom spells, else the atom's text (for a message: `unknown field vendor`); "" for no atom.
+(defun word-or-atom (s: Sexp) -> str
+  (let ((w (word-of s))) (if (= w "") (atom-or-empty s) w)))
+
+;; Whether the form is an atom spelling the word `w` (its canonical name).
+(defun atom-word? (s: Sexp w: str) -> bool
+  (= (word-of s) w))
+
+;; The entry of `m` for the word the atom `s` spells; nil for no word or no entry.
+(defun word-get (m: (Map str a) s: Sexp) -> (Option a)
+  (let ((k (word-of s)))
+    (if (= k "") nil (get m k))))
+
+;; The name of the global or function the form refers to: `(GLOBAL f)`, or the atom `@f` while the old spelling is admitted; nil otherwise.
+(defun global-ref (s: Sexp) -> (Option str)
+  (match s
+    ((SxAtom a _) (if (and (words/old-admitted?) (starts-with? a "@") (> (str-len a) 1)) (some (str-slice a 1 (str-len a))) nil))
+    ((SxList items _) (if (and (= (count items) 2) (atom-word? (nth items 0) "global")) (sexp-atom (nth items 1)) nil))
+    (_ nil)))
+
+;; The name of the struct type the form names: `(STRUCT s)`, or the atom `%struct.s` while the old spelling is admitted; nil otherwise.
+(defun struct-ref (s: Sexp) -> (Option str)
+  (match s
+    ((SxAtom a _) (if (and (words/old-admitted?) (starts-with? a "%struct.") (> (str-len a) 8)) (some (str-slice a 8 (str-len a))) nil))
+    ((SxList items _) (if (and (= (count items) 2) (atom-word? (nth items 0) "struct")) (sexp-atom (nth items 1)) nil))
+    (_ nil)))
 
 ;; `op expects N operands, found M` unless `args` has exactly `n` (parse/mod.rs `arity`).
 (defun arity (op: str args: (Vec Sexp) n: i64 pos: i64) -> (Result unit Diagnostic)
@@ -49,10 +99,10 @@
     ((some a) (Ok a))
     (nil (err (sexp-pos s) (str "expected " what ", found " (sexp-describe s))))))
 
-;; A label: an atom that is a valid name (parse/mod.rs `label`).
+;; A label: an atom that is neither empty nor the text of a word, nor (old spelling) a sigilled atom (parse/mod.rs `label`).
 (defun label (s: Sexp) -> (Result str Diagnostic)
   (try-let ((a (atom-text s "a block label")))
-    (if (or (starts-with? a "@") (starts-with? a "%") (= (str-len a) 0))
+    (if (or (sigil-first? a) (= (str-len a) 0) (words/word-text? a))
         (err (sexp-pos s) (str "invalid label " a))
         (Ok a))))
 

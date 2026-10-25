@@ -8,7 +8,7 @@
 ;; consults (native.macros.readers runs them).
 (ns native.macros
   (:use lir.diag lir.sexp lir.ast lir.types native.error)
-  (:require [lir.parse.items :as items] [lir.parse.names :as names] [native.jit :as jit] [native.call :as call]
+  (:require [lir.parse.items :as items] [lir.parse.names :as names] [lir.words :as words] [native.jit :as jit] [native.call :as call]
             [native.macros.objects :as obj] [native.macros.lib :as lib] [native.macros.readlib :as readlib]
             [native.macros.readers :as readers] [native.macros.readforms :as rf] [llvm.ffi :as ffi] [native.timing :as timing]))
 
@@ -38,6 +38,8 @@
 
 (def max-params: i64 8)
 (def max-steps: i64 512)
+;; The form heads of the old spelling a macro may not be named as (spec/lir.md 4.6), while that spelling is admitted (lir.words): under the
+;; new spelling every word is upper case and a name that is one is refused by `valid-name` before this set is looked at.
 (def form-names: (Set str) #{"define" "declare" "declare-global" "defstruct" "global" "constant" "target" "define-macro" "require-macros" "import" "begin" "block" "let"
                              "define-reader-macro" "define-dispatch-macro" "define-token-reader" "define-reader-class" "define-reader-depth"})
 
@@ -67,9 +69,10 @@
         ((some s) (do (jit/session-free (. s jit))
                       (when (timing/enabled?) (eprintln (str "time lir.macros " (quot @(. env ns) 1000000) " ms"))))))))
 
+;; The word at the head of a form (`define-macro`, `begin`, .. as lir.words canonically names them), "" for none.
 (defun head-of :private (form: Sexp) -> str
   (match form
-    ((SxList its _) (if (empty? its) "" (names/atom-or-empty (nth its 0))))
+    ((SxList its _) (if (empty? its) "" (names/word-of (nth its 0))))
     (_ "")))
 
 ;; One top-level form: a macro's definition, a library of them, an import, a splice, or a form expanded and parsed. A macro use is applied
@@ -196,11 +199,12 @@
 (defun lair-str :private (r: (Result a LairError)) -> (Result a str)
   (match r ((Ok v) (Ok v)) ((Err e) (Err (lair-error-str e)))))
 
-;; A fast-codegen session with the library in it, and the runner's two entries.
+;; A fast-codegen session with the library in it, and the runner's two entries. The two libraries are lair's own lIR text in the old
+;; spelling until the conversion (lir.words: step 4 of the respelling), so they are read with it admitted whatever the module's mode.
 (defun session-new :private () -> (Result Session str)
   (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
-            (_ (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))
-            (_ (lair-str (jit/session-add-source j "lir.read" (readlib/lib-source))))
+            (_ (words/admitting-old (fn () (lair-str (jit/session-add-source j "lir.sexp" (lib/lib-source))))))
+            (_ (words/admitting-old (fn () (lair-str (jit/session-add-source j "lir.read" (readlib/lib-source))))))
             (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
             (at (lair-str (jit/session-address j "lir.sexp.failure-at"))))
     (Ok (Session j take at))))
@@ -219,7 +223,7 @@
 (defun macro-name :private (env: Env s: Sexp) -> (Result str Diagnostic)
   (try-let ((a (names/atom-text s "a macro name"))
             (n (names/valid-name a (sexp-pos s))))
-    (cond (contains? form-names n) (err (sexp-pos s) (str "macro " n ": the name of a form"))
+    (cond (and (words/old-admitted?) (contains? form-names n)) (err (sexp-pos s) (str "macro " n ": the name of a form"))
           (some? (get @(. env macros) n)) (err (sexp-pos s) (str "duplicate macro " n))
           :else (Ok n))))
 
@@ -248,18 +252,20 @@
 
 ;; `(define (FNAME ptr) ((ptr P)..) BLOCK..)`: the macro as an ordinary function of its session, `lir.macro.NAME` for a macro.
 (defun macro-define :private (fname: str ps: Params blocks: (Vec Sexp) pos: i64) -> Sexp
-  (SxList (into [(SxAtom "define" pos)
-                 (SxList [(SxAtom fname pos) (SxAtom "ptr" pos)] pos)
-                 (SxList (mapv (fn (p: str) (SxList [(SxAtom "ptr" pos) (SxAtom p pos)] pos)) (. ps names)) pos)]
-                blocks)
-          pos))
+  (let ((ptr (words/word-text "ptr")))
+    (SxList (into [(SxAtom (words/word-text "define") pos)
+                   (SxList [(SxAtom fname pos) (SxAtom ptr pos)] pos)
+                   (SxList (mapv (fn (p: str) (SxList [(SxAtom ptr pos) (SxAtom p pos)] pos)) (. ps names)) pos)]
+                  blocks)
+            pos)))
 
-;; `(declare lir.macro.NAME ptr (ptr..))` of every macro defined so far in the session `s`, as text: a macro's body may call an earlier
+;; `(DECLARE lir.macro.NAME PTR (PTR..))` of every macro defined so far in the session `s`, as text: a macro's body may call an earlier
 ;; macro's function. A macro of an imported module is in that module's session: it is used, not called (spec/lir.md 4.7).
 (defun macro-declares :private (env: Env s: Session) -> str
-  (str-join-with "\n"
-    (mapv (fn (m: Macro) (str "(declare lir.macro." (. m name) " ptr (" (str-join-with " " (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) "ptr")) "))"))
-          (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros)))))))
+  (let ((ptr (words/word-text "ptr")))
+    (str-join-with "\n"
+      (mapv (fn (m: Macro) (str "(" (words/word-text "declare") " lir.macro." (. m name) " " ptr " (" (str-join-with " " (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) ptr)) "))"))
+            (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros))))))))
 
 ;; The items of a macro's module: the library's declarations, the earlier macros', then the definition.
 (defun macro-module :private (env: Env s: Session def: Sexp) -> (Result LModule Diagnostic)
