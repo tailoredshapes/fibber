@@ -396,9 +396,9 @@ expanded module: the way to see what a macro made), `lair cases`, and the librar
 front end hands lair as a tree (§11, `jit-add-module`, `build-executable-module`) has no macros: the tree is the parsed form, and
 `define-macro` is not an item of it; fibber's emitter makes such trees, so nothing of fibber's compile goes through this section. A
 backend without a compile-time runtime (lir2js, lir2c: the reader and the checker without LLVM, so nothing to run a macro's body) consumes
-**expanded lIR**, the text `lair expand FILE.lir` prints (§12): the module read, expanded and parsed, printed through the printer one
-top-level form per line, with no `define-macro` or `require-macros` left in it; a module with no macros prints as parsed. Their
-differential checks (`compiler/tests/js/diff.sh`, `compiler/tests/c-backend/diff.sh`) feed a file that defines or requires macros through
+**expanded lIR**, the text `lair expand FILE.lir` prints (§12): the program read, expanded, its imports joined (§4.7) and parsed, printed through the printer one
+top-level form per line, with no `define-macro`, `require-macros` or `import` left in it; a module with none prints as parsed. Their
+differential checks (`compiler/tests/js/diff.sh`, `compiler/tests/c-backend/diff.sh`) feed a file that defines or requires macros, or imports, through
 `lair expand` first, and when the expansion is refused that refusal is the verdict the backend is compared with: a `reject` case a macro
 refuses is never seen by the backend. A file with no macros goes to the backend as it is, so that a diagnostic's position is the file's. The
 first library is `lib/lir/defun.lir`: `(defun NAME ((P T)..) -> R block+)` is `(define (NAME R) ((T P)..) block+)`, in lIR over

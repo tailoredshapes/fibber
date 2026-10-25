@@ -74,6 +74,7 @@ $X.nanosleep = (req) => {
 $X.sysconf = (n) => n === 84 ? 1n : $unsupported(`sysconf(${n})`);
 $X.sched_yield = () => 0;
 $X.getpid = () => process.pid;
+$X.abs = (x) => Math.abs(x | 0) | 0;
 $X.madvise = () => 0;
 $X.exit = (c) => { throw new $Exit('exit', c); };
 $X.abort = () => $signal('SIGABRT');
