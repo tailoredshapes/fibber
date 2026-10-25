@@ -8,7 +8,7 @@ What is tested: the socket (0700 directory, 0600 file, the path on standard erro
 program's own defs read and changed live while its worker runs; the warm engine (LE5: hello's `warm`, the first input's figures);
 type, inspect (LE4: a lookup in under 20 ms, `value: true`), an expression in under 150 ms, status; new functions, records and closures kept in an
 atom; a function defined again is swapped (LV2: compiler/tests/live/swap.py is the swap's own test); a session def defined again (defonce keeps it, def
-makes it again: LT4); the refusals (live/Main, the checker's); 1,000 malformed lines; a second client waiting; the terminal and
+makes it again: LT4); the refusals (live/Main, the checker's); 1,000 malformed lines; two requests in one write; a second client waiting; the terminal and
 --json clients; `not-live`; a wrong uid refused (planted: FIB_LIVE_OWN_UID); a program that does not check; the end of the program
 through the socket, its output and exit as `fibc run`'s."""
 import json, os, random, shutil, signal, socket, stat, subprocess, sys, tempfile, time
@@ -191,6 +191,16 @@ check('1000 malformed lines answered', answered == 1000, answered)
 check('alive after junk', (c.ask(op='hello') or {}).get('pid') == a.p.pid and c.value('@counter') == '3')
 check('unknown op', (c.ask(op='nope') or {}).get('error', {}).get('code') == 'unknown-op')
 check('ping', (c.ask(op='ping') or {}).get('pong') is True)
+
+# ---- two requests in one write: the second line is buffered by the read of the first and answered without more bytes (serve.sock
+# `conn-line-ready?`); a loop that polls the descriptor before each line waits for bytes that never come
+c.s.settimeout(5)
+try:
+    c.s.sendall(b'{"op":"ping","id":"p1"}\n{"op":"status","id":"p2"}\n')
+    pipelined = [json.loads(c.line()).get('id') for _ in range(2)]
+except (socket.timeout, TypeError, ValueError) as e: pipelined = repr(e)
+c.s.settimeout(300)
+check('two pipelined requests answered', pipelined == ['p1', 'p2'], pipelined)
 
 # ---- a second client waits until the first is done (one request at a time)
 c2 = Client(a.sock, timeout=20)
