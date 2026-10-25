@@ -416,7 +416,17 @@ macro runs on a worker of its session for this, parked while the expander answer
 nested expansion fails, the macro gets null and the nested error, where it is, is the use's error whatever the macro then returns
 (`cases/lir/macros/expand-delegate.lir`, `reject-expand-fails.lir`); a reader macro (§4.8) runs while the text is read and has no
 expansion to call: null. 
-
+**macro-import.** `(macro-import "FILE")` compiles the lIR module `FILE` into the macro session of the module that writes it (as the
+library `lir.sexp` is), once per session by its canonical path, and declares its structs, its external `define`s and `global`s in the
+bodies of the macros defined after it, as `lir.sexp.*` are; the module is read and expanded as a module of its own (its `import`s are
+macro-imported into the session the same way, their interfaces its declarations) and checked as one, and an error in it is
+`macro-import: FILE:L:C: error: ..` at the direction; a module that imports itself through others is `macro-import: FILE imports itself`.
+Its globals are the session's state for the module's expansion: written by one macro run, read by the next of the same module, gone with
+the session at the end of the module (`cases/lir/macros/macro-import.lir`); a macro of an imported module runs in its own module's session
+(§4.7) and sees that module's, and an importer never sees them. So a type checker is ordinary runtime lIR that thin macros call. The three
+directions that bring a file: `require-macros` brings macros (and reader macros) to the module's text; `import` (§4.7) brings a module into
+the program and its interface to the importer; `macro-import` brings a module into the macro session only: it is neither linked into the
+program nor exported, and a library may hold it beside `define-macro`.
 
 
 
