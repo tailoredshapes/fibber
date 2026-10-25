@@ -154,16 +154,19 @@
                     (nil (recur))
                     ((some d) (some d)))))))
 
-;; The next form of the text, for a reader macro that reads what follows it (`lir.read.form`, spec/lir.md 4.7): read through the table, a
-;; discard passed over; the end of the text or a closer is an error where it stands.
-(defun read-next-form (rd: Reader run: Runner) -> (Result Sexp Diagnostic)
-  (loop ()
+;; The next form of the text, for a reader macro that reads what follows it (`lir.read.form`, spec/lir.md 4.8): read through the table, a
+;; discard passed over. The end of the text or a closer is an error where it stands, unless a discard was just passed: then there is no
+;; form (nil) and the closer is left for the macro, so `[1 #_2]` reads through `lir.read.form`.
+(defun read-next-form (rd: Reader run: Runner) -> (Result (Option Sexp) Diagnostic)
+  (loop ((passed false))
     (let ((lx (. rd lx)) (b (lex-peek lx)) (base @(. rd top)))
-      (cond (< b 0) (err (lex-pos lx) "unexpected end of input")
+      (cond (and (< b 0) passed) (Ok nil)
+            (< b 0) (err (lex-pos lx) "unexpected end of input")
+            (and (>= (closer-code b) 0) passed) (Ok nil)
             (>= (closer-code b) 0) (err (lex-pos lx) (str "unexpected " (byte-text b)))
             :else (match (read-form rd run)
                     ((some d) (Err d))
-                    (nil (if (> @(. rd top) base) (Ok (pop-form rd)) (recur))))))))
+                    (nil (if (> @(. rd top) base) (Ok (some (pop-form rd))) (recur true))))))))
 
 ;; The form on the top of the stack, taken off it.
 (defun pop-form :private (rd: Reader) -> Sexp

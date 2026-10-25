@@ -591,7 +591,7 @@ and an import gives the importer none of the imported module's bindings, as it g
 every macro's body:
 
 ```
-(defstruct lir.read.stream (ptr i64 i64 i64 i64 ptr ptr ptr ptr i64))  ; text, length, offset, line, column, file, mailbox, hook, failure message, failure position
+(defstruct lir.read.stream (ptr i64 i64 i64 i64 ptr ptr ptr ptr i64 i64))  ; text, length, offset, line, column, file, mailbox, hook, failure message, failure position, failed
 ```
 
 | Function | Does |
@@ -599,8 +599,9 @@ every macro's body:
 | `(lir.read.peek s) : i64` | the byte at the stream, -1 at the end of the text; nothing is consumed |
 | `(lir.read.next s) : i64` | that byte, consumed: a newline starts the next line at column 1, a UTF-8 continuation byte leaves the column, any other byte advances it |
 | `(lir.read.position s) : i64` | the position of the stream, `line << 32 \| column`, what `lir.read.fail` takes |
-| `(lir.read.skip s) : i64` | whitespace, commas and comments (§1, the reader's own definition) consumed; the byte after them, -1 at the end |
-| `(lir.read.form s) : ptr` | the next form of the text, read through the readtable, discards passed over: what a `[` macro calls until it sees `]`. Null when it cannot be read (the error is then the module's, above) |
+| `(lir.read.skip s) : i64` | whitespace, commas and comments (§1 and the classes, the reader's own definition) consumed; the byte after them, -1 at the end |
+| `(lir.read.form s) : ptr` | the next form of the text, read through the readtable, discards passed over: what a `[` macro calls until it sees `]`. Null when it cannot be read (the error is then the module's, above, and `lir.read.failed` says so), and null with nothing recorded when a discard stood before a closer or the end of the text (`[1 #_2]`: the closer is left for the macro to look at, `cases/lir/readers/discard-closer.lir`) |
+| `(lir.read.failed s) : i1` | whether a failure is recorded on the stream: the macro's own (`lir.read.fail`) or a form's that `lir.read.form` could not read; a macro that got null tells no form from a failure by it |
 | `(lir.read.fail s at message) : ptr` | the read fails with `reader macro C: MESSAGE` at the position `at`, or at the character for 0; returns null, for the macro to return |
 
 The reader's cursor is the stream's: the macro runs with the stream where the reader was, and when it returns the reader goes on from
