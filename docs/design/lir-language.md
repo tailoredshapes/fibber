@@ -1,8 +1,19 @@
 # lIR is the language; fibber is macros and functions on it
 
-Current status: **Proposed**. The direction is the owner's (below); the stages, the forms and the order are proposals awaiting
-the decisions in section 7. Nothing here is implemented except where a stage says so. Findings cite file:line on main at
-`c1ec7a0a` (2026-10-25); the measured numbers say where they came from.
+Current status: **Proposed**, with stage 2 decided and under way. The direction is the owner's (below); the stages, the forms and
+the order are proposals awaiting the decisions in section 7, except D4 to D10, which the owner took as recommended on 2026-10-25.
+Nothing here is implemented except where a stage says so. Findings cite file:line on main at `c1ec7a0a` (2026-10-25); the
+measured numbers say where they came from.
+
+**Stage 2, steps 1 and 2 landed** (2026-10-25): spec/lir.md 6.14 is the specification (the managed type `(ptr 1)`, the kinds,
+the forms, `unsafe`, the `ownership` binding, the ten rules, erasure); `cases/lir/own` holds a must-reject case per rule and
+must-accept cases that lower and run through a small runtime in lIR; `compiler/lir/own.fib` and `compiler/lir/own/` are the
+verifier, run inside `lir.check` on every path, in the mode `FIB_LIR_OWN` names (`report` the default until step 5); erasure is
+`lir.own.erase`, the last pass before LLVM or a printer, after the slot `lir.own.opt`. Two refinements over section 5 below, both
+in the spec: a stack value is ended by `dealloc-stack` (SIL's `dealloc_stack`), not by `destroy-value`, so that erasure stays a
+local rewrite that needs no kinds; and the owner's pointer to Rust's MIR was weighed (6.14, "Why SIL's words and not MIR's"): MIR's
+`Drop`, NLL scopes and `StorageLive`/`StorageDead` are here under SIL's names, and MIR's `move`/`copy` operand words are thicker
+than an SSA value needs, so `copy-value` stays an instruction and a move is a plain use at an owned position.
 
 ## 1. The direction
 
@@ -127,8 +138,8 @@ The sizes are estimates from reading the code, not measurements. An agent-week i
 - async resume, moved onto lIR functions.
 
 **Stage 2: ownership in lIR, verified.** Medium to large; section 5 has the design. It ships in this order:
-1. spec text and must-reject cases (from `lir-audit/borrow`);
-2. the verifier, with planted mutants it must catch;
+1. spec text and must-reject cases (from `lir-audit/borrow`); *landed*: spec/lir.md 6.14, `cases/lir/own`;
+2. the verifier, with planted mutants it must catch; *landed* in report mode: `compiler/lir/own.fib`, `FIB_LIR_OWN`;
 3. the emitter emits the forms, with erasure byte-equal to today's lIR and violations counted but not failing;
 4. the violations fixed one per commit;
 5. the verifier gates;
