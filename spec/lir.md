@@ -70,12 +70,14 @@ exponent, or `inf`, `-inf`, `nan`.
 
 ```
 type   ::= i1 | i8 | i16 | i32 | i64 | float | double | ptr
+         | (ptr 1)                          ; a managed reference: LLVM's ptr addrspace(1), non-integral (§6.14)
          | <N x elem>                       ; elem: an integer type, float, double or ptr; 1 ≤ N ≤ 1024
          | %struct.NAME                     ; a named struct, defined by defstruct
          | { type* }                        ; an anonymous (literal) struct
          | [N x type]                       ; an array of N elements, N ≥ 0 (§2.1)
 rtype  ::= type | void                      ; function results only
-fntype ::= (fn cc? rtype (type* ...?))      ; a function type, for indirect calls
+ptype  ::= type | (owned (ptr 1))           ; a parameter's type, with its ownership kind (§6.14.2)
+fntype ::= (fn cc? rtype (ptype* ...?))     ; a function type, for indirect calls
 cc     ::= ccc | tailcc | kernelcc          ; kernelcc: a GPU kernel's entry (§6.9a, accepted 2026-10-07)
 ```
 
@@ -147,18 +149,22 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
 
 ```
 module ::= item*
-item   ::= (defstruct NAME (type*))
+item   ::= (defstruct mutable? NAME (type*))       ; mutable: its fields may be written without uniqueness evidence (§6.14.5 rule 8)
          | (global mod* NAME type init)            ; mutable
          | (constant mod* NAME type init)          ; read-only
          | (declare-global hidden? NAME type)      ; a variable defined elsewhere (§4.4)
-         | (declare hidden? cc? NAME rtype (type* ...?))   ; a function defined elsewhere
-         | (define mod* cc? (NAME rtype) ((type PNAME)*) block+)
+         | (declare hidden? cc? NAME rtype (ptype* ...?))  ; a function defined elsewhere
+         | (define mod* cc? (NAME rtype) (param*) block+)
          | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
+         | (ownership (retain @f) (release @f) (unique @f) (alloc @f) (stack-init @f) (stack-end @f) (header %struct.NAME))
+                                                   ; what the ownership forms lower to (§6.14.6)
+param  ::= (type PNAME) | ((ptr 1) owned PNAME)    ; a parameter; `owned` is its ownership kind (§6.14.2)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
          | inline                                  ; a function the optimiser always inlines (§4.3)
          | noinline | cold                         ; LLVM's function attributes of those names (§4.3), `define` only
          | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
+         | unsafe                                  ; the fence of §6.14.4 is open inside the function, `define` only
 block  ::= (block LABEL instr+)
 ```
 
@@ -724,12 +730,36 @@ liar's ADR 021 "safe lIR" is removed: there is no `own`, `ref`,
 `refmut`, `rc` type, no `alloc own`, `borrow`, `drop`, `move`,
 `rc-alloc`, `rc-clone`, `rc-drop`, `rc-count`, `rc-ptr`,
 `heap-struct`, `free` instruction, no `array-*`, `ptr-array-*` or
-`heap-array*` instruction. They compiled to nothing checked (`own`
-became an ordinary stack slot and `drop` nothing, `lir-audit/borrow/`),
-and every one is expressible with `declare`d C functions, `alloca`,
-`load`, `store`, `getelementptr` and `icmp`/`br`. Ownership is fibber's
-concern (spec/ownership.md), decided before lIR is emitted. Using one
-of these names is `unknown instruction`.
+`heap-array*` instruction. Using one of these names is `unknown
+instruction`. ADR 021 was only ever Proposed, and it failed in five
+ways (the audit is `lir-audit/borrow/`, re-established as
+`cases/lir/audit/borrow-*.lir`):
+
+1. its checker (`lir-core/src/borrow.rs`) was called from one test and
+   never from `lair` or its code generator, so nothing it rejected was
+   ever refused;
+2. it walked blocks in source order with one map and no join at a CFG
+   merge, so it was not flow-sensitive (`drop_in_branch_use_other`,
+   `leak_in_branch` could not be decided);
+3. its forms lowered to nothing: `alloc own` became an `alloca` (an
+   "owned heap value" on the stack), `drop` a no-op, `move` and `borrow`
+   the identity (`borrow/uaf.lir` printed `after drop: 42`);
+4. `rc` and `ptr` parameters were exempt ("RC has its own tracking",
+   which did not exist), so `borrow/rc.lir` read freed memory after a
+   double `rc-drop`;
+5. raw `load` and `store` on owned values were allowed, so an alias of an
+   owned pointer outlived its drop (`use_after_drop_via_alias`); the safe
+   and unsafe worlds were never separated by type, and a front end that
+   emitted plain `ptr` was asked nothing.
+
+Ownership is in lIR again, differently (§6.14; **Decided**, owner,
+2026-10-25: lIR is the language, lair the only compiler, and a front end
+that emits counts emits them as lIR's forms, which lair verifies). The
+answers to the five failures: the verifier runs inside `lir.check` on
+every path, is a dataflow over the CFG with a merge rule, every form
+lowers to the runtime call the front end wrote before, counted
+references are the primary case, and the managed type `(ptr 1)` is
+distinct from `ptr`, with a named, counted escape.
 
 ### 6.11 Constants in instructions
 
@@ -813,6 +843,317 @@ Not in lIR: `exact` on divisions and shifts, TBAA, `noalias` scopes,
 `!invariant.load` (false under fibber's in-place reuse of a unique
 object's memory, docs/design/lir-facts.md 4). Each would be added the
 same way, as LLVM's own form.
+
+### 6.14 Ownership
+
+**Decided** (owner, 2026-10-25; docs/design/lir-language.md section 5,
+with the decisions D4 to D10 as that section recommends; the design input
+is `/tank/data/fibber-scratch/lir-language/ownership-in-lir.md`). The
+borrow and count constructs of fibber are lIR forms, and a verifier in
+lair rejects lIR that sidesteps them, whoever wrote it: fibber infers
+(borrowed or owned, stack or heap, tail calls) and lair verifies, as javac
+infers and the JVM verifier checks. The shape is Swift SIL's ownership
+SSA: ownership is a property of SSA values, set by the defining
+instruction or the parameter's kind, and it is erased before LLVM, so
+after erasure the lIR is exactly what a front end wrote before this
+section existed (§6.14.7). Rule 2 of lir-language.md section 3 is kept
+where LLVM has a word: the type is LLVM's address space, the casts are
+LLVM's `addrspacecast`; where LLVM has none, the words are SIL's.
+
+**Why SIL's words and not MIR's** (owner, 2026-10-25: "I think rust has
+an IR that we can borrow from"). Rust's MIR is the other IR with a
+borrow checker and optimisation before LLVM, and three of its four
+devices are here under other names: `Drop` is `destroy-value`, borrow
+scopes come from liveness (NLL) rather than from written scopes, and
+`StorageLive`/`StorageDead` of a stack slot are `alloc-stack` and its
+`destroy-value`. The fourth, `move x` and `copy x` written on every
+operand, is thicker than what an SSA value needs: MIR's operands are
+places that may be read again, so each use must say whether it ends the
+place's value; here an operand is an SSA value whose kind and position
+already say it. A use at an owned position (a call's `owned` parameter,
+`ret`, `store init`) is MIR's `move`, with no count change and no word;
+MIR's `copy x` is the one instruction `copy-value`, an instruction rather
+than an operand word because the copy, a retain, is a new value that may
+be used more than once. What MIR has and this section refuses is drop
+elaboration: rule 3 demands that predecessors agree at a merge, so there
+are no drop flags, which is thinner than MIR and is what fibber's join
+rule already produces. lIR keeps LLVM's shape, values and `alloca`, not
+MIR's places.
+
+**Where it sits.** The owner's constraint (2026-10-25: lIR is "designed
+to be as thin as possible to make optimizing it before final
+transformation to LLVM IR"): the forms stay in the tree through lIR's own
+passes and are erased last. Three functions on the tree, in this order
+and each on its own: `lir.own/verify-module` (the rules of §6.14.5, run
+inside `lir.check`), `lir.own.opt/optimise-module` (lIR-to-lIR rewrites
+on the explicit forms: a `copy-value`/`destroy-value` pair cancelling, an
+owned argument made guaranteed, an `is-unique` proven away; today the
+identity, the slot where they will live), then `lir.own.erase/erase-module`
+(§6.14.7), called by `native.lower` and by the C, JS and WGSL printers
+immediately before they read the tree, and by nothing earlier.
+
+#### 6.14.1 The managed type
+
+`(ptr 1)` is a counted reference that may be null: LLVM's `ptr
+addrspace(1)`, address space 1 being non-integral (`ni:1`), so a value
+of it has no integer. It is first-class: a value, parameter, result,
+`phi`, `select`, `load`, `store`, array element or `defstruct` field; not
+a vector element. It is a different type from `ptr`: no instruction
+accepts one where the other is expected (`call to @f: argument 1 has
+type (ptr 1), expected ptr`). The null of it is written `((ptr 1) null)`.
+`ptrtoint`, `inttoptr` and `bitcast` never take it (`ptrtoint cannot
+convert (ptr 1): a managed reference has no integer value`, `inttoptr
+needs a ptr result type, found (ptr 1)`, `bitcast cannot convert (ptr
+1)`); `icmp` compares two of them. An atomic operation on it is `atomic
+operation on (ptr 1)`: the atoms of the runtime read and write `ptr`
+inside `unsafe` (§6.14.4). A `kernelcc` function never takes one (`@k
+is kernelcc: a kernel takes scalars and ptr, found (ptr 1)`).
+
+A `defstruct` says which of its fields are counted by giving them this
+type: `(defstruct P (%struct.fib.hdr i64 (ptr 1)))`. The text says what
+is counted, which types.md §8.1 had the fibber type decide.
+
+#### 6.14.2 Kinds
+
+Every value of type `(ptr 1)` has a **kind**, fixed by what defines it:
+
+| Kind | Meaning | Defined by |
+|---|---|---|
+| `owned` | carries one count and must be consumed exactly once on every path | `alloc-object`, `copy-value`, `load copy`, `load take`, a call whose result is `(ptr 1)`, an `owned` parameter, a `phi` whose incoming values are owned or none |
+| `guaranteed` | borrowed: valid while its **roots** are live, never consumed | a parameter without `owned` (its root is itself, live for the whole function), `load borrow` (roots: the base's), a `phi` of guaranteed and none values (roots: the union), a `select` (roots: the union; an owned arm is itself a root) |
+| `none` | needs no count work: usable as owned and as guaranteed any number of times | `((ptr 1) null)`; `(addrspacecast (ptr 1) p)` in an `unsafe` function (the author vouches for it) |
+| `stack` | a scope-local object of this frame, ended by exactly one `dealloc-stack` | `alloc-stack` |
+| `interior` | the address of a field or element of an object, usable only as the address operand of a load, store, atomic or further `getelementptr` | `getelementptr` whose base is `(ptr 1)` (roots: the base's; an owned or stack base is itself the root) |
+
+The **roots** of a value are the owned, stack or guaranteed-parameter
+values it was derived from. A parameter is written `((ptr 1) owned p)`
+or `((ptr 1) p)`; in a `declare` and in a function type the kind wraps the
+type, `(owned (ptr 1))` against `(ptr 1)` (`owned needs (ptr 1), found
+i64`; `owned is a parameter kind, not a type` anywhere but a parameter).
+A result of type `(ptr 1)` is always owned. The kinds are part of a
+function's type: a `tailcall` under `ccc` needs them identical (§7.3), an
+`indirect-call` is checked against the kinds it writes, and a `(let ((y
+x)) ..)` of a managed `x` names the same value.
+
+#### 6.14.3 Forms
+
+| Form | Rule | Result |
+|---|---|---|
+| `(alloc-object %struct.T tid)` | `T` a struct whose first field is the header struct (§6.14.6); `tid : i32`, what the runtime's `alloc` receives | `(ptr 1)`, owned, and **fresh** (§6.14.5 rule 8) |
+| `(alloc-object %struct.T tid n)` | as above; `T`'s last field is `[0 x E]` and `n : i64` the number of its elements | `(ptr 1)`, owned, fresh |
+| `(alloc-stack %struct.T tid)` | as `alloc-object`, in this frame | `(ptr 1)`, stack |
+| `(dealloc-stack s)` | ends the stack value `s` (SIL's `dealloc_stack`, MIR's `StorageDead`): a form of its own, so that erasure needs no kinds | void |
+| `(copy-value v)` | `v : (ptr 1)`, any kind but interior | `(ptr 1)`, owned |
+| `(destroy-value v)` | consumes `v`: owned or none | void |
+| `(is-unique v)` | `v : (ptr 1)`; on the true edge of a `br` on it, `v` has uniqueness evidence | `i1` |
+| `(load copy (ptr 1) a)` | `a` an interior address, or any `ptr` in an `unsafe` function | `(ptr 1)`, owned |
+| `(load borrow (ptr 1) a)` | `a` an interior address | `(ptr 1)`, guaranteed, rooted as `a` |
+| `(load take (ptr 1) a)` | as `load copy`; the slot is left null; `a`'s object must be mutable here (rule 8) | `(ptr 1)`, owned |
+| `(store init v a)` | `v : (ptr 1)` consumed; `a` as for `load copy`; the slot held nothing counted | void |
+| `(store assign v a)` | as `store init`, and the slot's old value is released; `a`'s object must be mutable here | void |
+| `(store borrow v a)` | `v` guaranteed or none, not consumed; `a` an interior address of a stack object (rule 6) | void |
+| `(addrspacecast ptr v)`, `(addrspacecast (ptr 1) p)` | in an `unsafe` function only (rule 9); `v : (ptr 1)` is used, not consumed, and the `ptr` made of it is untracked; the `(ptr 1)` made of `p : ptr` is `none` | `ptr` or `(ptr 1)` |
+
+A plain `load` of `(ptr 1)`, or a plain `store` of a `(ptr 1)` value, is
+refused everywhere (rule 9: `a managed value is loaded with copy, borrow
+or take`, `a managed value is stored with init, assign or borrow`), which
+is what keeps an alias from outliving a count. The words after `load`
+and `store` are read by their count: `(load copy (ptr 1) a)` has three
+operands and a plain load two, `(store init v a)` three and a plain store
+two, so a local named `copy` or `init` stays a name. `(getelementptr T p
+i..)` with `p : (ptr 1)` is `(ptr 1)` (LLVM keeps the address space) of
+kind interior; outside `unsafe` it may not address the header (rule 9).
+The type operand of the managed loads is `(ptr 1)` (`load copy needs (ptr
+1), found ptr`).
+
+#### 6.14.4 The fence: `unsafe`
+
+`(define unsafe ..)` marks a function in which the managed world meets
+raw memory: `addrspacecast` between `ptr` and `(ptr 1)`, the managed
+loads and stores through a plain `ptr`, and the address of the header are
+allowed there and nowhere else. Ownership is still verified inside an
+`unsafe` function: only those three things are unlocked. `unsafe` is a
+`define` modifier (`declare cannot be unsafe`, `global cannot be unsafe:
+unsafe is for a function`), once (`duplicate modifier unsafe`), and the
+gate counts the `unsafe` functions of the runtime against a ratchet
+(lir-language.md stage 2, step 5). `ptrtoint` of `(ptr 1)` is refused in
+`unsafe` too: it is a type error, not a fence.
+
+#### 6.14.5 The verifier
+
+`lir.own` runs inside `lir.check` (§10) after the type rules, on every
+path lair compiles (AOT, the JIT, live mode, macros, the C, JS and WGSL
+backends): a check that can be skipped is no check (lir-language.md
+section 3, rule 3). It is one forward dataflow per function over the
+CFG `lir.check` built, keeping for each owned and stack value whether it
+is live or consumed at each point, and for each fresh value whether its
+uniqueness evidence holds. A function with no `(ptr 1)` value and no
+ownership form costs one walk. The rules, each with its diagnostic
+(`FILE:LINE:COL: error: ownership rule N: ..` at the form at fault):
+
+1. **Linearity.** An owned value is consumed exactly once on every path
+   from its definition to a `ret` or a tail call. The consuming uses are
+   `destroy-value`, an `owned` argument position of a call, `ret`, `store
+   init` and `store assign`, and being the incoming value of a `phi` (the
+   edge consumes it). A second consume on one path is `ownership rule 1:
+   owned x is consumed twice`; a path reaching `ret` with it live is
+   `ownership rule 1: owned x is leaked at ret`, or on an edge into a
+   block its definition does not dominate `ownership rule 1: owned x is
+   leaked on the edge from A to B`. `unreachable` discharges everything,
+   the process having stopped. A stack value is linear too, its one
+   consume being `dealloc-stack` (`stack s is ended twice`, `stack s is
+   not ended at ret`).
+2. **No use after consume.** No use of a value is reachable from a
+   consuming use of it without a new definition: `ownership rule 2: x
+   used after it was consumed`. Within one instruction the consuming
+   positions take effect before the others, so `(call @f x x)` with the
+   first parameter owned is this error.
+3. **Merge agreement.** At every block entry the predecessors agree on
+   live or consumed for every value, so there are no drop flags:
+   `ownership rule 3: x is live from A and consumed from B at block L`. A
+   `phi` of `(ptr 1)` whose incoming values are owned on one edge and
+   guaranteed on another is `ownership rule 3: phi in L mixes owned (from
+   A) and guaranteed (from B) values`; a front end retains on the
+   guaranteed edge instead.
+4. **Borrow containment.** Every use of a guaranteed or interior value
+   happens while all of its roots are live (the scope is inferred from
+   liveness, NLL-style, with no `begin-borrow` or `end-borrow`): a use
+   reachable from a consume of a root is `ownership rule 4: x used after
+   its root r was consumed`.
+5. **Guaranteed values never escape.** A guaranteed value is never
+   consumed, never returned, never stored except by `store borrow`, and
+   never passed at an `owned` position: `ownership rule 5: guaranteed x
+   consumed by destroy-value` (`.. returned`, `.. stored`, `.. passed at
+   owned position 2 of call to @f`). `copy-value` first is the way out,
+   which is fibber's `consume(Borrowed) = retain`.
+6. **Stack values do not escape.** A stack value may be used as
+   guaranteed; it is never returned, stored except by `store borrow`,
+   passed at an owned position, copied (`ownership rule 6: stack s
+   copied`, `.. returned`, `.. stored`, `.. passed at owned position`),
+   a `phi` operand (`stack s is a phi operand`) or the operand of
+   `destroy-value` (`stack s consumed by destroy-value: a stack value is
+   ended by dealloc-stack`; and `dealloc-stack of owned x` the other way
+   round). `(store borrow g a)`
+   into a stack object `s` is accepted only if `s` is ended before every
+   consume of `g`'s roots on every path: `ownership rule 6: stack s still
+   holds a borrow of r, which is consumed here`.
+7. **Tail calls.** At a `tailcall` or `indirect-tailcall`, after its
+   owned arguments are consumed, no owned or stack value of the frame is
+   live (`ownership rule 7: x is live at the tail call`), and every
+   guaranteed argument has only guaranteed parameters and none as roots
+   (`ownership rule 7: argument 1 depends on the frame through x`;
+   types.md §6.10's frame independence).
+8. **Mutation needs evidence.** A `store` of any kind, an atomic write,
+   or a `load take` through an interior address of a managed object
+   needs the object to be **mutable here**: it is a stack object, its
+   struct is `(defstruct mutable ..)` (cells, atoms, task frames), or it
+   has uniqueness evidence: it is fresh from `alloc-object`, or the
+   block is reached through the true edge of a `br` whose condition is
+   `(is-unique x)`, and the evidence has not been lost. Evidence is lost
+   at the first `copy-value` of the value, at a call it is an argument of
+   (the callee may have copied it), at a `store borrow` of it and at a
+   merge with a path without it (D8: evidence is checked from the start,
+   and the gate's ratchet for it comes after the counts'). `ownership
+   rule 8: store into x without uniqueness evidence`, `load take from x
+   without uniqueness evidence`.
+9. **The fence.** `addrspacecast` outside an `unsafe` function
+   (`ownership rule 9: addrspacecast outside unsafe`), the managed loads
+   and stores through a plain `ptr` outside one (`load copy through a
+   ptr outside unsafe`), the header addressed outside one (`the header of
+   x is addressed outside unsafe`: a `getelementptr` whose type is the
+   header struct or whose second index is 0 into a struct whose first
+   field is it), a plain `load` or `store` of a managed value (§6.14.3),
+   and an interior address anywhere but as an address (`interior address
+   x returned`, `.. stored`, `.. passed to @f`, `.. consumed`).
+10. **Signatures.** A call is checked against the callee's kinds: an
+    owned position consumes, a guaranteed one borrows, a `(ptr 1)` result
+    is owned. The one place a module can write a signature that is not
+    the callee's is an indirect call whose callee is written `@f`:
+    `ownership rule 10: indirect-call through @f writes (fn void ((ptr
+    1))), but @f is (fn void ((owned (ptr 1))))`. The functions of the
+    `ownership` form must have the types §6.14.6 gives.
+
+The verifier does not reclaim cycles among `mutable` objects, prove the
+bounds of an interior address, check sharing between threads, or prove
+that the counts are the minimal ones: those stay fibber's (ownership.md
+§6, types.md §6.12).
+
+**The mode.** `FIB_LIR_OWN` chooses what lair does with a violation:
+`report` (the default while fibber's emitter is being moved onto the
+forms, lir-language.md stage 2 steps 3 and 4) counts the violations per
+rule and prints one summary line to standard error, `lir.own: N
+violations in M functions (rule 1: A, rule 4: B)`, and accepts the
+module; `verify` makes each violation an error of the module, as any
+other diagnostic of §10; `off` runs nothing. Any other value is refused:
+`FIB_LIR_OWN must be verify, report or off, found X`. The errors of
+§6.14.1 to §6.14.4 and §6.14.6 (types, the grammar, the binding) are
+errors in every mode. `report` is temporary: step 5 of the stage removes
+it, and the planted mutants of `cases/lir/own` fail the case suite with
+a verifier whose rule is disabled.
+
+#### 6.14.6 The binding: what the forms lower to
+
+A module that uses `(ptr 1)` or any form of §6.14.3 names, once, the
+runtime functions the forms lower to, so that lair hard-codes no runtime
+name (`the module uses (ptr 1) but has no ownership form`, `a module has
+at most one ownership form`):
+
+```
+(ownership (retain @fib.retain) (release @fib.release) (unique @fib.unique?) (alloc @fib.alloc)
+           (stack-init @fib.stack-init) (stack-end @fib.stack-end) (header %struct.fib.hdr))
+```
+
+Each field is required (`ownership form needs (retain @f)`, `ownership:
+unknown field x`, `ownership: duplicate retain`). The functions are
+`unsafe` defines or declares (`ownership: @f must be an unsafe define or a
+declare`) with these types (`ownership: retain must be (fn void (ptr)),
+@f is (fn void (i64))`): `retain`, `release` and `stack-end` `(fn void
+(ptr))`, `unique` `(fn i1 (ptr))`, `alloc` `(fn ptr (i64 i32))`,
+`stack-init` `(fn void (ptr i32))`. They take `ptr`, since they are
+called after erasure. `header` names a defined struct: the first field of
+every object struct, addressable only in `unsafe` (rule 9).
+
+Not yet in lIR: a `global` or `constant` in address space 1, whose
+address would be a `none` value (the immortal literal objects, vtables
+and `def` values of types.md §8.2). Until it is specified, an immortal
+object reaches a managed position through `addrspacecast` in an `unsafe`
+function.
+
+#### 6.14.7 Erasure
+
+After the verifier, and before LLVM, the C, JS or WGSL printer, lair
+erases the section: the result is a module of §2 to §6.13 that checks
+under §10 and is what the front end wrote before this section. `@RETAIN`
+and the others are the module's `ownership` form; `S` is the size of
+`%struct.T` by LLVM's layout for the target (each field at the natural
+alignment of its type, the whole rounded up to the largest, pointers the
+target's width, as emit.layout computes it); fresh names are ones the
+function does not bind.
+
+| Form | Erased to |
+|---|---|
+| `(ptr 1)`, `(owned (ptr 1))`, `((ptr 1) null)` | `ptr`, `ptr`, `(ptr null)`, everywhere a type or literal is written |
+| `(x (alloc-object %struct.T tid))` | `(x (call @ALLOC (i64 S) tid))` |
+| `(x (alloc-object %struct.T tid n))` | `(x (call @ALLOC (add (i64 S) (mul (i64 E) n)) tid))`, `E` the size of the element of `T`'s last field |
+| `(x (alloc-stack %struct.T tid))` | `(x (alloca %struct.T))` in the entry block, before everything else there, and `(call @STACK-INIT x tid)` where the form stood |
+| `(x (copy-value v))` | `(call @RETAIN v)` where the binding stood, and `v` for `x` after it |
+| `(copy-value v)` as a statement or an operand | `(call @RETAIN v)`, or `(let ((t v)) (call @RETAIN t) t)` |
+| `(destroy-value v)` | `(call @RELEASE v)` |
+| `(dealloc-stack s)` | `(call @STACK-END s)` |
+| `(is-unique v)` | `(call @UNIQUE v)` |
+| `(x (load copy (ptr 1) a))` | `(x (load ptr a))` then `(call @RETAIN x)`; as an operand `(let ((t (load ptr a))) (call @RETAIN t) t)` |
+| `(load borrow (ptr 1) a)` | `(load ptr a)` |
+| `(x (load take (ptr 1) a))` | `(x (load ptr a))` then `(store (ptr null) a)`; as an operand `(let ((t (load ptr a))) (store (ptr null) a) t)` |
+| `(store init v a)`, `(store borrow v a)` | `(store v a)` |
+| `(store assign v a)` | `(let ((o (load ptr a))) (store v a) (call @RELEASE o))` |
+| `(addrspacecast T v)` | `v` |
+| `unsafe`, `mutable`, the `ownership` form | dropped |
+
+An `alloc-object`, `alloc-stack`, `copy-value`, `load copy` or `load
+take` that is not the value of a binding is bound to a fresh name first.
+Erasure is a rewrite of the tree (`lir.own.erase/erase-module`), the last
+pass before LLVM or a printer; the liro cache keys on the text before
+it, with the forms in it.
 
 ## 7. Calls, variadic functions and tail calls
 
@@ -945,6 +1286,7 @@ error of each function but checks every function. The main groups:
 | facts | §6.13: the words, `assume`'s operand, the range of a load, literal operands that break a fact |
 | calls | §7: arity, argument types, variadic promotion, tail-call rules, `main` |
 | target | §4.5: at most one `target` form and its two strings |
+| ownership | §6.14: the managed type and the forms (types), the `ownership` form (module), then `lir.own`, the verifier's ten rules, in the mode `FIB_LIR_OWN` names |
 
 After the checker, `lair` lowers the module and runs the LLVM verifier
 (`LLVMVerifyModule`). A verifier failure after a successful check is an
@@ -1091,6 +1433,8 @@ lair cases DIR..                 ; run a case suite (§13)
 `FIB_TARGET_CPU` names the CPU code is generated for when the module has
 no `target` form (§4.5): unset, empty or `host` mean the host's CPU and
 features; any other value names a CPU with no extra features.
+`FIB_LIR_FACTS` is the check mode of the facts (§6.13) and `FIB_LIR_OWN`
+the mode of the ownership verifier (§6.14.5).
 
 ## 13. Cases
 
@@ -1106,6 +1450,8 @@ verdict before the implementation decides it (method.md rule 3):
 ;; ir: TEXT                 ; the verified LLVM IR must contain TEXT
 ;; ir-not: TEXT             ; ... and must not
 ;; paths: jit | aot         ; restrict to one path (default: both)
+;; facts: use | trap | ignore   ; the check mode of the facts the case runs under (§6.13)
+;; own: verify | report | off   ; the mode of the ownership verifier the case runs under (§6.14.5)
 ;; audit: …                 ; the lir-audit file it comes from and what liar did
 ;; stage: 2                 ; only the fibber `lair` implements this; the Rust `lair` skips the case
 ```
