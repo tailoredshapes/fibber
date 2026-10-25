@@ -440,6 +440,10 @@ order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that 
 module's own text is data the macro sees. A `module-macro` the result splices arms again and takes the rest of the splice, applied in turn.
 Each module of a program (§4.7) has its own.
 
+**include.** `(include "FILE")` reads the file's text in place, under the module's readtable, its forms as if written there, each a
+top-level form of the module (a direction, a macro use, an item), the objects a macro gets naming `FILE` as their file; once per module
+by canonical path, in the set `require-macros` uses, a file that includes itself being `include: FILE includes itself`; an error in it is
+`include: FILE:L:C: error: ..` at the include (`cases/lir/macros/include.lir`, `reject-include-self.lir`, `reject-include-error.lir`).
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
 list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a

@@ -45,14 +45,14 @@
 (def max-steps: i64 512)
 ;; The directions and forms a macro may not be named as: the one list of lIR's directions beside the parser's items (lir.parse.items `item`).
 (def form-names: (Set str) #{"define" "declare" "declare-global" "defstruct" "global" "constant" "target" "define-macro" "require-macros" "import" "begin" "block" "let"
-                             "define-reader-macro" "define-dispatch-macro" "define-token-reader" "macro-import" "module-macro"})
+                             "define-reader-macro" "define-dispatch-macro" "define-token-reader" "macro-import" "module-macro" "include"})
 
 ;; The module's own file counts as being loaded: a library that requires it is a cycle.
 (defun env-new :private (file: str) -> Env
   (Env file (file-cstr file) (cell (map-empty)) (cell nil) (cell (set-empty)) (cell (if (= file "") (set-empty) #{(canonical file)})) (cell 0)
        (readers/readers-new) (cell 0) (cell nil) (cell [])))
 
-;; The environment of a file read for the module of `env` (a library): the file's own name, everything else the module's.
+;; The environment of a file read for the module of `env` (a library, an included file): the file's own name, everything else the module's.
 (defun env-sub :private (env: Env path: str) -> Env
   (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq) (. env hook) (. env collected)))
 
@@ -101,6 +101,7 @@
           (= head "import") (import-form env importer form)
           (= head "macro-import") (macro-import env form)
           (= head "module-macro") (module-macro env form)
+          (= head "include") (include env items importer form)
           (reader-form? head) (define-reader env head form)
           :else (match (top-result env form)
                   ((Err d) (some d))
@@ -634,3 +635,34 @@
                            ((Ok r) (match (top-form env items importer r)
                                      ((some d) (some d))
                                      (nil (recur (+ steps 1)))))))))))))
+
+;; ---------------------------------------------------------------- include (spec/lir.md 4.6)
+
+;; `(include "FILE")`: the file's text read in place under the module's readtable, its forms as if written here (positions name FILE),
+;; once per module by canonical path; a file that includes itself is a cycle.
+(defun include :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
+  (match form
+    ((SxList its pos)
+     (if (not (= (count its) 2))
+         (some (Diagnostic pos "include expects one string, the file"))
+         (match (nth its 1)
+           ((SxStr bs _) (include-file env items importer (resolve env (str-from-bytes bs)) pos))
+           (other (some (Diagnostic (sexp-pos other) (str "include expects a string, found " (sexp-describe other))))))))
+    (_ (some (Diagnostic (sexp-pos form) "include expects one string, the file")))))
+
+(defun include-file :private (env: Env items: (Cell (Vec LItem)) importer: Importer path: str pos: i64) -> (Option Diagnostic)
+  (let ((key (canonical path)))
+    (cond (set-contains? @(. env loaded) key) nil
+          (set-contains? @(. env loading) key) (some (Diagnostic pos (str "include: " path " includes itself")))
+          :else (match (read-file path)
+                  (nil (some (Diagnostic pos (str "include: cannot read " path))))
+                  ((some text)
+                   (let ((sub (env-sub env path)))
+                     (do (set! (. env loading) (conj @(. env loading) key))
+                         (let ((r (readers/read-with (. env readers) text path (fn (f: Sexp) (top-form sub items importer f)))))
+                           (do (set! (. env loading) (disj @(. env loading) key))
+                               (set! (. env loaded) (conj @(. env loaded) key))
+                               (match r
+                                 (nil nil)
+                                 ((some d) (some (Diagnostic pos (str "include: " path ":" (diag-str d))))))))))))))
+)
