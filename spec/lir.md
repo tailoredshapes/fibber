@@ -314,7 +314,7 @@ after the last name, `Pₙ` is bound to the list of the arguments past the first
 as `...` ends a variadic parameter list in a `declare`; `...` must follow a name (`... must follow a parameter name`) and be last
 (`... must be the last parameter`). A macro has at most 8 parameters, what the host's call bridge passes (`a macro takes at most 8 parameters`);
 the names are valid names (§5.3), each once (`duplicate parameter P`). `NAME` is a valid name that is not one of `define declare declare-global
-defstruct global constant target define-macro require-macros import block let` (`macro NAME: the name of a form`), and is defined once
+defstruct global constant target define-macro require-macros import begin block let` (`macro NAME: the name of a form`), and is defined once
 (`duplicate macro NAME`). A macro may be named as an instruction is; it then shadows it.
 
 **Use.** Once defined, `(NAME a₁ .. aₘ)` anywhere in a later form of the module, at the top level or inside one, is a use: the macro is called
@@ -329,6 +329,16 @@ result whose head is a macro 512 times in a row is `macro NAME: the expansion do
 lIR is the parser's or the checker's ordinary error: a form the macro made carries no position of its own and is reported at the use; a
 form the macro passed through (an argument, or part of one) keeps its position. The module a macro-free text parses to is the same as
 before this section existed, and the reader hands each of its forms to the parser without a walk.
+
+**Splices.** A top-level form headed `begin`, written or returned by a macro used at the top level, is a splice: its elements are each
+expanded and parsed as a top-level form, in order, in its place. So a macro may expand to several items (a `defrecord` is a `defstruct`,
+a constructor and the accessors), a spliced `define-macro` defines its macro for the forms after it, a splice in a splice is flattened,
+and `(begin)` is nothing. The word is Scheme's: a top-level `begin` splices its definitions there (Common Lisp's top-level `progn` is the
+same); LLVM has no spelling for it, so it is lIR's own, as `define-macro` is, and nothing new is invented. A macro use is applied before
+anything in its result is expanded, so the splice is seen whole. Inside a function `begin` is no instruction: a macro used there whose
+result is a splice is `macro NAME: a splice (begin ..) is a top-level form, not an instruction` at the use, and a written one is `unknown
+instruction begin`. `begin` is among the names a macro may not have. The cases are `cases/lir/macros/splice-*.lir` and
+`reject-splice-in-body.lir`.
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
 may expand to a use of an earlier one, and its own body may use one), and its function `@lir.macro.NAME` is declared in the bodies of
