@@ -1,0 +1,114 @@
+;; compiler/emit/lower/facts.fib: the lIR facts (spec/lir.md 6.13) the emitter proves by construction. Each is emitted only where the
+;; argument written beside it holds; each is re-tested under FIB_LIR_FACTS=trap (the gate's `cases-trap`), where a false one is a trap
+;; with its message, not undefined behaviour.
+;;
+;; 1. The tail read of the prelude's `vec-nth` (lib/prelude.fib): `(array-get tail j)`, `j = i - (cnt - len(tail))`, is reached only
+;;    under the guard `i < cnt and i >= cnt - len(tail)`, and the Vec invariant (types §8.3: the tail holds the last len(tail) of the cnt
+;;    elements, so 0 <= cnt - len(tail) <= cnt) gives 0 <= j < len(tail). The bounds test of that read is replaced by the fact
+;;    `(assume (icmp ult j len))` (emit.lower.builtins `array-index`). `vec-tail` marks the body, and every array index in it takes the
+;;    fact: vec-nth has that one array read and no other (its comment in the prelude says to keep it so).
+;; 2. A step of an integer that a dominating test bounds: in the then-branch of `(if (< b y) ..)` (or `(> y b)`), where `b` is an immutable
+;;    binding of a signed integer type and `y` a value of the same type, `b < y <= max`, so `(+ b 1)` (or `(+ 1 b)`) cannot overflow and
+;;    is `(add nsw ..)` with no overflow test; dually `(> b y)` makes `(- b 1)` a `(sub nsw ..)`. The value of an immutable binding never
+;;    changes, so the fact holds wherever that value is used, in a closure too. A loop variable is the same value for the whole iteration
+;;    (only its loop's `recur` writes it, and a `recur` ends the iteration). Conjunctions (`and`, elaborated to `(if A B false)`) give the
+;;    facts of both tests. This is the counted loop of fibber code and of the fused range loops (compiler/expand/fuserange.fib).
+(ns emit.lower.facts
+  (:use types.ty types.ast types.decls types.init own.program emit.value emit.ir emit.program emit.lower.cx)
+  (:require [emit.node :as nx]) (:require [lir.ast :as la]))
+
+;; Whether `key` is the body of the prelude's `vec-nth` (fact 1).
+(defun vec-tail-body? (g: Globals key: BodyKey) -> bool
+  (match key
+    ((BodyFun f) (and (= (. (g-fun g f) name) "vec-nth") (= (g-module-name g (. (g-fun g f) module)) "fib.prelude")))
+    (_ false)))
+
+;; The tail read of vec-nth: the fact `(assume (icmp ult i n))` in place of the bounds test, then the element's address `ptr`.
+(defun tail-index (cx: LowerCx i: V n: V ptr: la/LExpr) -> la/LExpr
+  (do (fb-stmt (. cx b) (nx/intrinsic "assume" 0 nil [(nx/compare-int la/IUlt (v-expr i) (v-expr n))] nil))
+      (v-expr (fb-val (. cx b) ptr LirPtr))))
+
+;; ---------------------------------------------------------------- fact 2
+
+;; The name of the method of `Ord` a call head is ("<", ">", ..), "" for anything else.
+(defun ord-method :private (cx: LowerCx h: Expr) -> str
+  (match (. h kind)
+    ((EGlobal (GMethod proto idx))
+     (let ((pd (g-proto (program-g (. cx p)) proto)))
+       (if (and (= (. pd name) "Ord") (= (. pd module) module-builtin) (< idx (count (. pd methods))))
+           (. (nth (. pd methods) idx) name)
+           "")))
+    (_ "")))
+
+;; The binding of `e` when it is an immutable local of a signed integer type.
+(defun int-binding :private (cx: LowerCx e: Expr) -> (Option i64)
+  (match (. e kind)
+    ((ELocal b)
+     (let ((k (. (g-binding (program-g (. cx p)) b) kind)))
+       (if (and (or (= k BkParam) (= k BkLet) (= k BkPattern) (= k BkLoop)) (int-typed? cx e)) (some b) nil)))
+    (_ nil)))
+
+(defun int-typed? :private (cx: LowerCx e: Expr) -> bool
+  (match (lcx-ty cx e)
+    ((Ok (TCon (KScalar s) _)) (scalar-is-int s))
+    (_ false)))
+
+(defun arg-expr :private (a: Arg) -> (Option Expr)
+  (match a ((ArgExpr e) (some e)) (_ nil)))
+
+;; The facts a test shows when it is true: each a binding and whether it is below (true) or above (false) another value of its type.
+(defun guard-facts (cx: LowerCx c: Expr) -> (Vec (Pair i64 bool))
+  (match (. c kind)
+    ((ECall h args)
+     (let ((m (ord-method cx h)))
+       (if (and (or (= m "<") (= m ">")) (= (count args) 2))
+           (match (arg-expr (nth args 0))
+             ((some x) (match (arg-expr (nth args 1))
+                         ((some y) (into (side cx x (= m "<")) (side cx y (= m ">"))))
+                         (nil [])))
+             (nil []))
+           [])))
+    ((EIf a b f) (if (literal-false-expr? f) (into (guard-facts cx a) (guard-facts cx b)) []))
+    (_ [])))
+
+(defun side :private (cx: LowerCx e: Expr below: bool) -> (Vec (Pair i64 bool))
+  (match (int-binding cx e) ((some b) [(Pair b below)]) (nil [])))
+
+(defun literal-false-expr? :private (e: Expr) -> bool
+  (match (. e kind) ((ELit (LitBool v)) (not v)) (_ false)))
+
+;; Runs `body` with the facts of `c` known, then forgets the ones it added.
+(defun with-guard (cx: LowerCx c: Expr body: (fn () (Result (Option (Pair str V)) str))) -> (Result (Option (Pair str V)) str)
+  (let ((fs (guard-facts cx c)))
+    (if (empty? fs)
+        (body)
+        (let ((below0 @(. cx below)) (above0 @(. cx above)))
+          (do (doseq [f fs] (if (. f snd)
+                                (set! (. cx below) (conj @(. cx below) (. f fst)))
+                                (set! (. cx above) (conj @(. cx above) (. f fst)))))
+              (let ((r (body)))
+                (do (set! (. cx below) below0) (set! (. cx above) above0) r)))))))
+
+(defun one? :private (e: Expr) -> bool
+  (match (. e kind) ((ELit (LitInt v _)) (= v 1)) (_ false)))
+
+(defun local-in? :private (e: Expr s: (Set i64)) -> bool
+  (match (. e kind) ((ELocal b) (contains? s b)) (_ false)))
+
+;; Whether the integer `method` (`+` or `-`) being lowered, the call `cx` is at, is a step fact 2 proves cannot overflow.
+(defun step-no-wrap? (cx: LowerCx method: str) -> bool
+  (match @(. cx at)
+    ((some e) (match (. e kind)
+                ((ECall _ args)
+                 (if (= (count args) 2)
+                     (match (arg-expr (nth args 0))
+                       ((some x) (match (arg-expr (nth args 1))
+                                   ((some y) (cond (= method "+") (or (and (local-in? x @(. cx below)) (one? y))
+                                                                      (and (one? x) (local-in? y @(. cx below))))
+                                                   (= method "-") (and (local-in? x @(. cx above)) (one? y))
+                                                   :else false))
+                                   (nil false)))
+                       (nil false))
+                     false))
+                (_ false)))
+    (nil false)))

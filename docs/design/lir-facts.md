@@ -368,3 +368,35 @@ The compiler is itself persistent-Vec code, so steps 1 and 3 should speed up F t
   closures' indirect calls are a separate cost, owned by the closure specialisation and count elision work
   (vectorisation.md section 7 items 2 and 4); they also keep LLVM from reasoning across the loop body.
 * `regions` and `encode+write` were not studied (under 70 ms together).
+
+## 11. Implemented (2026-10-25)
+
+spec/lir.md 6.13 has the forms and the check mode. The emitter proves two kinds of fact by construction (compiler/emit/lower/facts.fib
+has the argument for each); every one is re-tested by the gate's `cases-trap`, where a false one traps with `lIR fact violated`:
+
+1. **The tail read of `vec-nth`** (plan item 3): its bounds test becomes `(assume (icmp ult j len))`, by the guard and the Vec invariant.
+2. **Bounded steps** (plan item 4, its first part): `(+ b 1)` in the then-branch of `(< b y)` (and `(- b 1)` under `(> b y)`), `b` an
+   immutable integer binding, is `(add nsw ..)` with no overflow test: the counted loops of fibber code and of the fused range loops.
+   The cutter emits 80 of them.
+
+Measured on the cutter (`/tank/data/fibber-scratch/facts/cut/time.sh`, 5 interleaved runs, outputs byte-identical to main's; median
+wall s; `a` is fact 1 alone, `b` fact 2 alone; two rounds, the second pinned with `taskset -c 6`, load 2.8 to 4.1):
+
+| build | before | a | b | both |
+|---|---|---|---|---|
+| `--whole-program`, round 1 | 1.055 | 1.016 | 1.067 | 1.007 |
+| `--whole-program`, round 2 | 1.032 | 0.997 | 1.072 | 1.009 |
+| default, round 1 | 1.859 | 1.880 | 1.847 | 1.790 |
+| default, round 2 | 1.897 | 1.816 | 1.871 | 1.839 |
+
+Fact 1 is worth about 0.03 to 0.04 s in the whole-program build (section 5 predicted 0.06 s), fact 2 nothing measurable: LLVM proves
+the increments itself (section 4), so the fact only replaces an overflow test LLVM had already folded. Both are within the run-to-run
+spread of about 0.08 s; the direction of fact 1 held in both rounds. The cutter built under `FIB_LIR_FACTS=trap` runs in 1.36 s with
+the same output.
+
+Not done: the interval facts of section 5 that pay (`nth` range tests at provable sites, the blur's index arithmetic). They need what
+section 8 lists: a lower bound for a loop variable (an induction fact: the start and the sign of the step), a relation between a
+guard's `(count v)` and the `cnt` field vec-nth loads after it is put in line (the same immutable `v`, across the call), the callee's
+loop range carried into a specialised literal (`sum`'s `lo <= i < hi` into `f`), the count fusion knows for a `mapv` over a `range`,
+and the dominating checked product of the blur. Each is a fact the front end can state as an `assume` at the call site; the work is
+the analysis that proves it.
