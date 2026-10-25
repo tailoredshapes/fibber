@@ -6,7 +6,7 @@
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
             [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries]
-            [lir.words :as words])
+            [lir.words :as words] [lir.respell :as respell])
   (:use lir.ast lir.types))
 
 (extern exit :private (i32) -> unit)
@@ -24,6 +24,7 @@
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
   lair expand FILE.lir            ; the module with its macros expanded, as lIR text (for a backend with no compile-time runtime)
+  lair respell FILE.lir [--in-place|--check]   ; the text in the new spelling (spec/lir.md 2), comments and layout kept; --check: exit 1 and the differing lines when it is not already
   lair words                      ; the words of lIR: TEXT and canonical name, one per line (lir.words)
   lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
@@ -69,6 +70,21 @@
         (match (imports/load-program src (nth rest 0))
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok p) (do (print-raw (lprint/print-module (. p module))) (Ok 0)))))))
+
+;; `respell FILE [--in-place|--check]` (spec/lir.md 2): the text rewritten in the new spelling at the token level (lir.respell), the old
+;; spelling admitted for the read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that differ and
+;; exit 1 when it is not already in the new spelling).
+(defun respell-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (let ((files (vec (filter (fn (a: str) (not (starts-with? a "--"))) rest)))
+        (in-place (some? (first (filter (fn (a: str) (= a "--in-place")) rest))))
+        (check (some? (first (filter (fn (a: str) (= a "--check")) rest)))))
+    (if (or (not (= (count files) 1)) (and in-place check) (not (= (+ (count files) (if in-place 1 0) (if check 1 0)) (count rest))))
+        (Err usage)
+        (try-let [src (read-src (nth files 0))
+                  out (match (words/admitting-old (fn () (respell/respell-text src))) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d (nth files 0)))))]
+          (cond check (if (= out src) (Ok 0) (do (print-raw (respell/respell-diff src out)) (Ok 1)))
+                in-place (if (write-file (nth files 0) out) (Ok 0) (Err (str (nth files 0) ": cannot write")))
+                :else (do (print-raw out) (Ok 0)))))))
 
 ;; `words`: the table of lir.words, `TEXT name` per line.
 (defun words-cmd :private (rest: (Vec str)) -> (Result i64 str)
@@ -308,6 +324,7 @@
               (= cmd "emit-llvm") (emit-llvm-cmd rest)
               (= cmd "dump-ast") (dump-ast-cmd rest)
               (= cmd "expand") (expand-cmd rest)
+              (= cmd "respell") (respell-cmd rest)
               (= cmd "words") (words-cmd rest)
               (= cmd "cases") (cases-cmd rest)
               (= cmd "fuzz-one") (fuzz-one-cmd rest)

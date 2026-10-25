@@ -1,0 +1,172 @@
+;; compiler/lir/respell/tree.fib: the token-level view of an lIR text that `lairf respell` rewrites (spec/lir.md 2, the audit's step 3): every
+;; token with its byte span, the forms over the tokens (a tree of token indices, nothing parsed), the edits (a token's new text, a gap's
+;; new text) and the assembly of the output, which copies every byte the edits do not name: comments, commas, layout and the case headers
+;; survive. The `;; error:` headers are the one comment the tool rewrites (`header-line`).
+(ns lir.respell.tree
+  (:use lir.diag lir.sexp.lexer)
+  (:require [fib.string :as s]))
+
+;; A token: its kind (0 `(`, 1 `)`, 2 `{`, 3 `}`, 4 `[`, 5 `]`, 6 an atom, 7 a string, 8 a vector type `<N x T>`), its text (the atom's;
+;; a vector type's lanes), the element text of a vector type, its byte span and its position.
+(defstruct RTok (kind: i64 text: str elem: str from: i64 to: i64 pos: i64))
+
+(def tk-open: i64 0)
+(def tk-close: i64 1)
+(def tk-brace-open: i64 2)
+(def tk-brace-close: i64 3)
+(def tk-bracket-open: i64 4)
+(def tk-bracket-close: i64 5)
+(def tk-atom: i64 6)
+(def tk-str: i64 7)
+(def tk-vec: i64 8)
+
+;; A form over the tokens: an atom (or string, or vector type) by its token, or a list (`kind` 0 `()`, 1 `{}`, 2 `[]`) with the tokens of
+;; its brackets and its items.
+(defenum RForm
+  (RAtom tok: i64)
+  (RList kind: i64 open: i64 items: (Vec RForm) close: i64))
+
+;; The tokens of `src` with their spans: the lexer of lir.sexp, which must read the old spelling (lir.words: the caller admits it).
+(defun tokenise (src: str) -> (Result (Vec RTok) Diagnostic)
+  (let ((lx (lexer-new src)))
+    (loop ((out []))
+      (let ((b (lex-peek lx)) (from (lex-offset lx)))
+        (if (< b 0)
+            (Ok out)
+            (match (lex-next lx)
+              ((Err d) (Err d))
+              ((Ok nil) (Ok out))
+              ((Ok (some t)) (recur (conj out (rtok t from (lex-offset lx)))))))))))
+
+(defun rtok :private (t: Token from: i64 to: i64) -> RTok
+  (match (. t tok)
+    ((TokOpen) (RTok tk-open "" "" from to (. t pos)))
+    ((TokClose) (RTok tk-close "" "" from to (. t pos)))
+    ((TokBraceOpen) (RTok tk-brace-open "" "" from to (. t pos)))
+    ((TokBraceClose) (RTok tk-brace-close "" "" from to (. t pos)))
+    ((TokBracketOpen) (RTok tk-bracket-open "" "" from to (. t pos)))
+    ((TokBracketClose) (RTok tk-bracket-close "" "" from to (. t pos)))
+    ((TokAtom a) (RTok tk-atom a "" from to (. t pos)))
+    ((TokStr _) (RTok tk-str "" "" from to (. t pos)))
+    ((TokVecType n e) (RTok tk-vec n e from to (. t pos)))))
+
+;; ---------------------------------------------------------------- the forms
+
+;; The forms of the whole token vector: the top-level forms in order; an unbalanced bracket is an error at its token.
+(defun forms-of (toks: (Vec RTok)) -> (Result (Vec RForm) Diagnostic)
+  (let ((i (cell 0)))
+    (loop ((out []))
+      (if (>= @i (count toks))
+          (Ok out)
+          (match (form-at toks i)
+            ((Err d) (Err d))
+            ((Ok f) (recur (conj out f))))))))
+
+(defun opener-kind :private (k: i64) -> i64
+  (cond (= k tk-open) 0 (= k tk-brace-open) 1 (= k tk-bracket-open) 2 :else -1))
+
+(defun closer-kind :private (k: i64) -> i64
+  (cond (= k tk-close) 0 (= k tk-brace-close) 1 (= k tk-bracket-close) 2 :else -1))
+
+;; The form starting at token `@i`, `i` moved past it.
+(defun form-at :private (toks: (Vec RTok) i: (Cell i64)) -> (Result RForm Diagnostic)
+  (let ((t (nth toks @i)) (k (opener-kind (. t kind))))
+    (cond (>= k 0) (list-at toks i k)
+          (>= (closer-kind (. t kind)) 0) (err (. t pos) "unexpected closing bracket")
+          :else (do (set! i (+ @i 1)) (Ok (RAtom (- @i 1)))))))
+
+(defun list-at :private (toks: (Vec RTok) i: (Cell i64) kind: i64) -> (Result RForm Diagnostic)
+  (let ((open @i))
+    (do (set! i (+ @i 1))
+        (loop ((items []))
+          (if (>= @i (count toks))
+              (err (. (nth toks open) pos) "unexpected end of input: unclosed list")
+              (let ((t (nth toks @i)) (c (closer-kind (. t kind))))
+                (cond (= c kind) (do (set! i (+ @i 1)) (Ok (RList kind open items (- @i 1))))
+                      (>= c 0) (err (. t pos) "mismatched closing bracket")
+                      :else (match (form-at toks i)
+                              ((Err d) (Err d))
+                              ((Ok f) (recur (conj items f)))))))))))
+
+;; ---------------------------------------------------------------- the edits
+
+;; The new text of a token, by its index ("" drops it and the gap before it), and the new text of the gap before a token.
+(defstruct Edits (texts: (Cell (Map i64 str)) gaps: (Cell (Map i64 str))))
+
+(defun edits-new () -> Edits (Edits (cell {}) (cell {})))
+
+(defun set-text! (ed: Edits i: i64 text: str) -> unit
+  (set! (. ed texts) (assoc @(. ed texts) i text)))
+
+(defun set-gap! (ed: Edits i: i64 text: str) -> unit
+  (set! (. ed gaps) (assoc @(. ed gaps) i text)))
+
+;; The text with the edits applied: for each token the gap before it (from the source, or as edited; dropped with a dropped token) and
+;; the token (from the source, or as edited); the tail after the last token. Comments are in the gaps: `header-line` rewrites the
+;; `;; error:` ones.
+(defun assemble (src: str toks: (Vec RTok) ed: Edits) -> str
+  (let ((parts (cell [])))
+    (do (loop ((i 0) (at 0))
+          (if (>= i (count toks))
+              (set! parts (conj @parts (headers (str-slice src at (str-len src)))))
+              (let ((t (nth toks i))
+                    (text (match (get @(. ed texts) i) ((some s) s) (nil (str-slice src (. t from) (. t to)))))
+                    (gap (match (get @(. ed gaps) i) ((some s) s) (nil (headers (str-slice src at (. t from)))))))
+                (do (if (= text "") () (set! parts (conj (conj @parts gap) text)))
+                    (recur (+ i 1) (. t to))))))
+        (str-join @parts))))
+
+;; ---------------------------------------------------------------- the case headers
+
+;; Every `;; error:` line of a gap rewritten (`header-line`); the gap otherwise as it is, its newlines included.
+(defun headers :private (gap: str) -> str
+  (if (s/includes? gap ";; error:")
+      (let ((n (str-len gap)))
+        (str-join (loop ((i 0) (from 0) (out []))
+                    (cond (>= i n) (conj out (header-line (str-slice gap from n)))
+                          (= (zext i64 (str-byte-at gap i)) 10) (recur (+ i 1) (+ i 1) (conj (conj out (header-line (str-slice gap from i))) "\n"))
+                          :else (recur (+ i 1) from out)))))
+      gap))
+
+;; `;; error: TEXT` with the old spellings a message may quote respelled: `@f` to `(GLOBAL f)`, `%struct.s` to `(STRUCT s)`, `(ptr 1)` to
+;; `(PTR (ADDRSPACE 1))`. The rest of the message is as it was: the messages themselves move with the headers (the audit's step 4).
+(defun header-line (line: str) -> str
+  (if (starts-with? line ";; error:")
+      (sigils (s/replace line "(ptr 1)" "(PTR (ADDRSPACE 1))"))
+      line))
+
+;; Whether byte `b` may be part of a name quoted in a message.
+(defun name-byte? :private (b: i64) -> bool
+  (not (or (< b 33) (= b 40) (= b 41) (= b 58) (= b 44) (= b 59) (= b 39) (= b 34) (= b 96))))
+
+;; The end of the name starting at byte `i`.
+(defun name-end :private (line: str i: i64) -> i64
+  (loop ((k i))
+    (if (and (< k (str-len line)) (name-byte? (zext i64 (str-byte-at line k)))) (recur (+ k 1)) k)))
+
+;; `@name` and `%struct.name` at the start of a word, respelled.
+(defun sigils :private (line: str) -> str
+  (let ((n (str-len line)))
+    (loop ((i 0) (from 0) (out []))
+      (if (>= i n)
+          (str-join (conj out (str-slice line from n)))
+          (let ((b (zext i64 (str-byte-at line i)))
+                (word-start (or (= i 0) (not (name-byte? (zext i64 (str-byte-at line (- i 1))))))))
+            (cond (and word-start (= b 64) (< (+ i 1) n) (name-byte? (zext i64 (str-byte-at line (+ i 1)))))
+                  (let ((e (name-end line (+ i 1))))
+                    (recur e e (conj out (str (str-slice line from i) "(GLOBAL " (str-slice line (+ i 1) e) ")"))))
+                  (and word-start (= b 37) (starts-with? (str-slice line i n) "%struct.") (< (+ i 8) n) (name-byte? (zext i64 (str-byte-at line (+ i 8)))))
+                  (let ((e (name-end line (+ i 8))))
+                    (recur e e (conj out (str (str-slice line from i) "(STRUCT " (str-slice line (+ i 8) e) ")"))))
+                  :else (recur (+ i 1) from out)))))))
+
+;; ---------------------------------------------------------------- the check's diff
+
+;; The lines of `a` and `b` that differ, as `-` and `+` lines with their numbers: the tool changes no line count, so the lines pair up.
+(defun diff-lines (a: str b: str) -> str
+  (let ((la (s/split-lines a)) (lb (s/split-lines b)) (n (max (count la) (count lb))))
+    (str-join (loop ((i 0) (out []))
+                (if (>= i n)
+                    out
+                    (let ((x (if (< i (count la)) (nth la i) "")) (y (if (< i (count lb)) (nth lb i) "")))
+                      (recur (+ i 1) (if (= x y) out (conj out (str (+ i 1) ": -" x "\n" (+ i 1) ": +" y "\n"))))))))))
