@@ -3,7 +3,7 @@
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
         emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.freeze emit.lower.simd emit.lower.simdmem emit.lower.catch emit.lower.gpu emit.lower.facts)
-  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt] [types.targets :as tt]))
+  (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 ;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
 (defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
   (match (get a i)
@@ -462,17 +462,6 @@
                      (builtin-mem cx name a))))))
 
 ;; ---- the unsafe primitives
-
-;; The alignment of a raw-pointer access (`load-f32` and kin, syntax 3.15): byte alignment on a CPU target, where an unaligned address is allowed;
-;; on a kernel target the scalar's own size, because the kernel subset indexes elements, never bytes, and a byte-aligned f32 on a GPU is four byte
-;; loads (docs/design/gpu.md 3.3). The emitter writes the alignment it means, and lair lowers `(align N)` as written on every target.
-(defun raw-align :private (t: LirTy) -> (Option i64)
-  (if (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE"))
-      (match t ((LirFloat) (some 4)) ((LirDouble) (some 8)) (_ (some 1)))
-      (some 1)))
-
-(defun raw-align-of :private (t: (Option LirTy)) -> (Option i64)
-  (match t ((some lt) (raw-align lt)) (nil (some 1))))
 
 (defun load-ty :private (name: str) -> (Option LirTy)
   (match name

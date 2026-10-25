@@ -168,7 +168,7 @@ impossible when `release` is the scope exit of `with-buffer`. Section 10 schedul
 
 Alignment: the kernel subset indexes elements, never bytes. The emitter writes `(align 1)` for a raw-pointer access of a float on a CPU
 target (spec/syntax.md 3.15: unaligned addresses are allowed there); on NVPTX a byte-aligned f32 load is four `ld.global.b8`, so on a kernel
-target the emitter writes the scalar's own size, `(align 4)` for `load-f32`/`store-f32` and `(align 8)` for the f64 pair (emit.lower.builtins
+target the emitter writes the scalar's own size, `(align 4)` for `load-f32`/`store-f32` and `(align 8)` for the f64 pair (emit.lower.gpu
 `raw-align`), and the PTX has `ld.global.b32`. lair lowers `(align N)` as written on every target (since 2026-10-25; until then it read
 `(align 1)` on a scalar as the scalar's size on a kernel target, `kernel-align`, spec/lir.md 6.9a).
 

@@ -21,6 +21,18 @@
 (defun kernel-target? :private () -> bool
   (tt/kernel-triple? (sys-getenv "FIB_TARGET_TRIPLE")))
 
+;; The alignment of a raw-pointer access (`load-f32` and kin, syntax 3.15), for emit.lower.builtins: byte alignment on a CPU target, where an
+;; unaligned address is allowed; on a kernel target the scalar's own size, because the kernel subset indexes elements, never bytes, and a
+;; byte-aligned f32 on a GPU is four byte loads (docs/design/gpu.md 3.3). The emitter writes the alignment it means; lair lowers `(align N)` as
+;; written on every target.
+(defun raw-align (t: LirTy) -> (Option i64)
+  (if (kernel-target?)
+      (match t ((LirFloat) (some 4)) ((LirDouble) (some 8)) (_ (some 1)))
+      (some 1)))
+
+(defun raw-align-of (t: (Option LirTy)) -> (Option i64)
+  (match t ((some lt) (raw-align lt)) (nil (some 1))))
+
 ;; The kind of index a builtin reads: its slot in the host state (0 local, 3 group, 6 group-size, 9 num-groups) and its special register.
 (defun index-slot :private (name: str) -> i64
   (cond (= name "gpu/local-id") 0 (= name "gpu/group-id") 3 (= name "gpu/group-size") 6 :else 9))
