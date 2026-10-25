@@ -1,0 +1,24 @@
+;; expect: accept
+;; out: 7 8
+;; spec/lir.md 4.6, splices, and 4.8: (both A B) expands to (begin A B) with A a define-reader-macro binding ! to (i64 7): a spliced reader
+;; form binds for the text read after the top-level form that spliced it (main reads !), as a written one does; B, read before the splice
+;; ran, is an ordinary define.
+(declare printf i32 (ptr ...))
+(define-macro both (a b)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "begin")))
+      (call @lir.sexp.push l a)
+      (call @lir.sexp.push l b)
+      (ret l))))
+(both (define-reader-macro "!" (s)
+        (block entry
+          (let ((l (call @lir.sexp.list (i64 0))))
+            (call @lir.sexp.push l (call @lir.sexp.symbol (string "i64")))
+            (call @lir.sexp.push l (call @lir.sexp.integer (i64 7)))
+            (ret l))))
+      (define (eight i64) () (block entry (ret (i64 8)))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%lld %lld\n") ! (call @eight))
+    (ret (i32 0))))

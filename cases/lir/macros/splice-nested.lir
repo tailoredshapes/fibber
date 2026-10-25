@@ -1,0 +1,23 @@
+;; expect: accept
+;; out: 1 2 3 4
+;; spec/lir.md 4.6, splices: (nest A B C) expands to (begin (begin A) (begin (begin B) C)), flattened in order; a written top-level
+;; (begin ..) splices too, and (begin) is nothing.
+(declare printf i32 (ptr ...))
+(define-macro nest (a b c)
+  (block entry
+    (let ((out (call @lir.sexp.list (i64 0))) (l1 (call @lir.sexp.list (i64 0))) (l2 (call @lir.sexp.list (i64 0))) (l3 (call @lir.sexp.list (i64 0)))
+          (bg (call @lir.sexp.symbol (string "begin"))))
+      (call @lir.sexp.push l1 bg) (call @lir.sexp.push l1 a)
+      (call @lir.sexp.push l3 bg) (call @lir.sexp.push l3 b)
+      (call @lir.sexp.push l2 bg) (call @lir.sexp.push l2 l3) (call @lir.sexp.push l2 c)
+      (call @lir.sexp.push out bg) (call @lir.sexp.push out l1) (call @lir.sexp.push out l2)
+      (ret out))))
+(nest (define (one i32) () (block entry (ret (i32 1))))
+      (define (two i32) () (block entry (ret (i32 2))))
+      (define (three i32) () (block entry (ret (i32 3)))))
+(begin)
+(begin (define (four i32) () (block entry (ret (i32 4)))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%d %d %d %d\n") (call @one) (call @two) (call @three) (call @four))
+    (ret (i32 0))))
