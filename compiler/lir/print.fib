@@ -177,7 +177,9 @@
     ((KBarrier) "(barrier)")
     ((KSreg r) (str "(sreg " r ")"))
     ((KIntrin name flags ty args align)
-     (form (concat-parts [[name] (fm-words flags) (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args) (align-words align)])))
+     (if (= name "load")
+         (range-load-text ty args align)
+         (form (concat-parts [[name] (op-flag-words flags) (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args) (align-words align)]))))
     ((KCall callee args tail) (print-call callee args tail))
     ((KRet v) (match v ((some x) (form ["ret" (print-expr x)])) (nil "(ret)")))
     ((KBr l) (form ["br" l]))
@@ -190,6 +192,12 @@
     ((KLet bs body)
      (form (concat-parts [["let" (form (vec (map binding-text bs)))] (exprs-text body)])))
     (_ "")))
+
+;; `(load (range LO HI) (align N)? T p)` (spec/lir.md 6.13): the bounds are the literals args 1 and 2 (lir.ast).
+(defun range-load-text :private (ty: (Option LType) args: (Vec LExpr) align: (Option i64)) -> str
+  (let ((bound (fn (e: LExpr) (match (expr-int-literal e) ((some v) (lit-str v)) (nil (print-expr e))))))
+    (form (concat-parts [["load" (form ["range" (bound (nth args 1)) (bound (nth args 2))])] (align-words align)
+                         [(type-str (unwrap-or ty ty-i32)) (print-expr (nth args 0))]]))))
 
 (defun binding-text :private (b: LBinding) -> str (form [(. b name) (print-expr (. b value))]))
 

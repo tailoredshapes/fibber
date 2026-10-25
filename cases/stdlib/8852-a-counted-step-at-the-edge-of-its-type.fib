@@ -1,0 +1,40 @@
+;; spec:   spec/lir.md 6.13 (facts), types §8.12 (checked arithmetic)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: + - < > and loop
+;; A step that a dominating test bounds is emitted as the fact `add nsw` (`sub nsw`) instead of the checked add (emit.lower.facts 2):
+;; in the then-branch of `(< i hi)`, `i < hi <= max`, so `(+ i 1)` cannot overflow. These loops run that step right up to the edge of
+;; its type, where a wrong fact would be: to the maximum of i64 and of i32 (`(+ i 1)` and `(+ 1 i)`), down to the minimum (`(- i 1)`
+;; under `(> i lo)`), and under a conjunction. `k` is the argument count, 0 here, so that no bound is a constant LLVM could fold.
+;; Under FIB_LIR_FACTS=trap (the gate's cases-trap) every one of those steps is tested and none traps. Checks (bits): 0 i64 up to
+;; the maximum, 1 i32 up to its maximum, 2 i64 down to the minimum, 3 the step written `(+ 1 i)`, 4 a conjunction of two tests.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun up (lo: i64 hi: i64) -> (Pair i64 i64)
+  (loop ((i lo) (n 0)) (if (< i hi) (recur (+ i 1) (+ n 1)) (Pair i n))))
+
+(defun up32 (lo: i32 hi: i32) -> i32
+  (loop ((i lo)) (if (< i hi) (recur (+ i 1i32)) i)))
+
+(defun down (hi: i64 lo: i64) -> (Pair i64 i64)
+  (loop ((i hi) (n 0)) (if (> i lo) (recur (- i 1) (+ n 1)) (Pair i n))))
+
+(defun up-left (lo: i64 hi: i64) -> i64
+  (loop ((i lo)) (if (> hi i) (recur (+ 1 i)) i)))
+
+(defun between (lo: i64 hi: i64 floor: i64) -> i64
+  (loop ((i lo)) (if (and (> i floor) (< i hi)) (recur (+ i 1)) i)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k (count (args)))
+        (max 9223372036854775807)
+        (min (- -9223372036854775807 1)))
+    (do (check c (= (up (- max (+ 3 k)) (- max k)) (Pair max 3)))
+        (check c (= (up32 (- 2147483644i32 (trunc i32 k)) (- 2147483647i32 (trunc i32 k))) 2147483647i32))
+        (check c (= (down (+ min (+ 3 k)) (+ min k)) (Pair min 3)))
+        (check c (= (up-left (- max (+ 2 k)) (- max k)) max))
+        (check c (= (between (- max (+ 5 k)) (- max k) (- 0 k)) max))
+        (checks-result c))))

@@ -1,0 +1,167 @@
+;; compiler/native/lower/facts.fib: the facts of lIR (spec/lir.md 6.13) in LLVM, by the check mode of the lowering (Lx `facts`, lir.facts):
+;; `use` gives each fact to LLVM (`nsw`/`nuw` on the instruction, `llvm.assume`, `!range` on the load); `trap` computes the operation without
+;; the fact and tests it instead, calling the module's `lir.fact.check` with the outcome and a message naming the fact and where it is; `ignore`
+;; never reaches here (native.lower strips the facts first).
+;;
+;; The test is a call, not a branch, so that the lIR block stays one LLVM block and its phis' predecessors stay right (native.lower.func names
+;; each phi's incoming block by its label); LLVM puts the small checker in line when it optimises.
+(ns native.lower.facts
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin lir.facts native.error native.lower.lx native.lower.types native.lower.build native.lower.consts)
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.metadata :as md]))
+
+(defun type-of :private (v: i64) -> i64 (unsafe (core/LLVMTypeOf v)))
+(defun i1-ty :private (fx: Fx) -> i64 (lx-ty (. fx lx) ty-i1))
+
+(defun call-intrinsic :private (fx: Fx name: str overloads: (Vec i64) args: (Vec i64)) -> i64
+  (b-intrinsic (. fx b) (. (. fx lx) ctx) (. (. fx lx) module) name overloads args))
+
+(defun trap-mode? :private (fx: Fx) -> bool (= (. (. fx lx) facts) facts-trap))
+
+;; The lowered fact `e` whose operands are `vs` (nil: void).
+(defun lower-fact (fx: Fx e: LExpr vs: (Vec i64)) -> (Option i64)
+  (match (. e kind)
+    ((KIntrin name flags ty args align)
+     (let ((c (intrin-class name)))
+       (cond (= c "ibin") (some (if (trap-mode? fx) (trap-ibin fx e name flags vs) (use-ibin fx name flags vs)))
+             (= c "assume") (do (if (trap-mode? fx) (check fx (nth vs 0) e "(assume)") (do (call-intrinsic fx "llvm.assume" [] [(nth vs 0)]) ()))
+                                nil)
+             :else (some (range-load fx e ty args vs align)))))
+    (_ nil)))
+
+(defun opcode-of :private (name: str) -> i32
+  (cond (= name "add") (opcode-add) (= name "sub") (opcode-sub) (= name "mul") (opcode-mul) :else (opcode-shl)))
+
+(defun use-ibin :private (fx: Fx name: str flags: i64 vs: (Vec i64)) -> i64
+  (let ((v (b-binop (. fx b) (opcode-of name) (nth vs 0) (nth vs 1))))
+    (unsafe
+      (do (if (= (bit-and flags ifl-nsw) 0) () (md/LLVMSetNSW v 1i32))
+          (if (= (bit-and flags ifl-nuw) 0) () (md/LLVMSetNUW v 1i32))
+          v))))
+
+;; An `i1` that is true when any lane of `bad` (an i1 or a vector of them) is.
+(defun any-lane :private (fx: Fx bad: i64) -> i64
+  (if (= (unsafe (core/LLVMGetTypeKind (type-of bad))) 13i32)
+      (call-intrinsic fx "llvm.vector.reduce.or" [(type-of bad)] [bad])
+      bad))
+
+(defun not-i1 :private (fx: Fx x: i64) -> i64
+  (b-binop (. fx b) (opcode-xor) x (core/const-int (i1-ty fx) 1 false)))
+
+;; Whether the operation wrapped as the flag `signed` (nsw) or not (nuw) forbids: the overflow bit of `llvm.[su]OP.with.overflow`; for a shift,
+;; whether shifting the result back gives a different value (LLVM's definition of `shl nsw`/`shl nuw`).
+(defun wrapped :private (fx: Fx name: str signed: bool a: i64 b: i64 r: i64) -> i64
+  (if (= name "shl")
+      (let ((back (b-binop (. fx b) (if signed (opcode-ashr) (opcode-lshr)) r b)))
+        (any-lane fx (b-icmp (. fx b) 33i32 back a)))
+      (let ((ov (call-intrinsic fx (str "llvm." (if signed "s" "u") name ".with.overflow") [(type-of a)] [a b])))
+        (any-lane fx (b-extract-value (. fx b) ov 1)))))
+
+(defun trap-ibin :private (fx: Fx e: LExpr name: str flags: i64 vs: (Vec i64)) -> i64
+  (let ((a (nth vs 0)) (b (nth vs 1))
+        (r (b-binop (. fx b) (opcode-of name) a b))
+        (nsw (not (= (bit-and flags ifl-nsw) 0)))
+        (nuw (not (= (bit-and flags ifl-nuw) 0))))
+    (do (if nsw (check fx (not-i1 fx (wrapped fx name true a b r)) e (str "(" name " nsw)")) ())
+        (if nuw (check fx (not-i1 fx (wrapped fx name false a b r)) e (str "(" name " nuw)")) ())
+        r)))
+
+;; `(load (range LO HI) T p)`: the load, then `!range !{T LO, T HI}` (use: HI is the lowered literal, 2^(K-1) wraps to the minimum, which is
+;; LLVM's spelling of the signed interval up to the maximum) or the test `LO <= v < HI` signed (trap).
+(defun range-load :private (fx: Fx e: LExpr ty: (Option LType) args: (Vec LExpr) vs: (Vec i64) align: (Option i64)) -> i64
+  (let ((lt (lx-ty (. fx lx) (unwrap-or ty ty-i32)))
+        (l (b-load (. fx b) lt (nth vs 0))))
+    (do (match align ((some n) (unsafe (core/LLVMSetAlignment l (trunc i32 n)))) (nil ()))
+        (if (trap-mode? fx) (range-test fx e l args vs) (range-metadata fx l (nth vs 1) (nth vs 2)))
+        l)))
+
+(defun range-metadata :private (fx: Fx l: i64 lo: i64 hi: i64) -> unit
+  (let ((ctx (. (. fx lx) ctx))
+        (kname (ffi/bytes-new "range"))
+        (ms (unsafe (ffi/words-new [(md/LLVMValueAsMetadata lo) (md/LLVMValueAsMetadata hi)]))))
+    (unsafe
+      (let ((kind (md/LLVMGetMDKindIDInContext ctx kname 5i32))
+            (node (md/LLVMMDNodeInContext2 ctx ms 2)))
+        (do (md/LLVMSetMetadata l kind (md/LLVMMetadataAsValue ctx node))
+            (free kname) (free ms))))))
+
+;; Whether the literal `e` is 2^(K-1) of a K-bit type: the range is open above (no upper test).
+(defun open-top? :private (e: LExpr) -> bool
+  (match (. e kind)
+    ((KInt (TInt k) v) (= (lit-cmp v (lit-pow2 (- k 1))) 0))
+    (_ false)))
+
+(defun range-test :private (fx: Fx e: LExpr l: i64 args: (Vec LExpr) vs: (Vec i64)) -> unit
+  (let ((above (b-icmp (. fx b) 39i32 l (nth vs 1)))
+        (ok (if (open-top? (nth args 2)) above (b-binop (. fx b) (opcode-and) above (b-icmp (. fx b) 40i32 l (nth vs 2)))))
+        (bound (fn (x: LExpr) (match (expr-int-literal x) ((some v) (lit-str v)) (nil "?")))))
+    (check fx ok e (str "(load (range " (bound (nth args 1)) " " (bound (nth args 2)) "))"))))
+
+;; ---------------------------------------------------------------- the checker of the trap mode
+
+;; Where the builder stands, for the message: `@FUNCTION, block LABEL`, and the line and column of the form when it was read from text.
+(defun place :private (fx: Fx e: LExpr) -> str
+  (unsafe
+    (let ((bb (md/LLVMGetInsertBlock (. fx b)))
+          (f (md/LLVMGetBasicBlockParent bb))
+          (slot (ffi/slot-new))
+          (fname (ffi/c-string-at (core/LLVMGetValueName2 f slot)))
+          (label (ffi/c-string-at (md/LLVMGetBasicBlockName bb))))
+      (do (free slot)
+          (str "@" fname ", block " label (if (= (. e pos) 0) "" (str ", at " (pos-str (. e pos)))))))))
+
+;; Calls `lir.fact.check(ok, message, length)`.
+(defun check :private (fx: Fx ok: i64 e: LExpr fact: str) -> unit
+  (let ((msg (str "lIR fact violated: " fact " in " (place fx e) "\n"))
+        (bytes (str-bytes msg))
+        (g (lx-string (. fx lx) bytes))
+        (f (checker fx)))
+    (do (core/build-call (. fx b) (checker-type fx) f [ok g (core/const-int (lx-ty (. fx lx) ty-i64) (array-len bytes) false)] "")
+        ())))
+
+(defun checker-type :private (fx: Fx) -> i64
+  (let ((lx (. fx lx)))
+    (core/function-type (unsafe (core/LLVMVoidTypeInContext (. lx ctx))) [(lx-ty lx ty-i1) (lx-ty lx ty-ptr) (lx-ty lx ty-i64)] false)))
+
+;; The module's `lir.fact.check`, defined on first use: `br ok` to a return, else `write(2, message, length)` (not on a kernel target, which
+;; has no file descriptors) and `llvm.trap`. Internal, so each module that needs it has its own.
+(defun checker :private (fx: Fx) -> i64
+  (let ((lx (. fx lx))
+        (nm (ffi/bytes-new "lir.fact.check"))
+        (found (unsafe (core/LLVMGetNamedFunction (. lx module) nm))))
+    (do (unsafe (free nm))
+        (if (= found 0) (define-checker fx) found))))
+
+(defun define-checker :private (fx: Fx) -> i64
+  (let ((lx (. fx lx))
+        (f (core/add-function (. lx module) "lir.fact.check" (checker-type fx)))
+        (entry (core/append-block (. lx ctx) f "entry"))
+        (ok-bb (core/append-block (. lx ctx) f "ok"))
+        (fail-bb (core/append-block (. lx ctx) f "fail"))
+        (b (unsafe (core/LLVMCreateBuilderInContext (. lx ctx)))))
+    (unsafe
+      (do (core/LLVMSetLinkage f 8i32)
+          (core/LLVMPositionBuilderAtEnd b entry)
+          (core/LLVMBuildCondBr b (core/LLVMGetParam f 0i32) ok-bb fail-bb)
+          (core/LLVMPositionBuilderAtEnd b ok-bb)
+          (core/LLVMBuildRetVoid b)
+          (core/LLVMPositionBuilderAtEnd b fail-bb)
+          (if (. lx kernel) () (write-message lx b f))
+          (b-intrinsic b (. lx ctx) (. lx module) "llvm.trap" [] [])
+          (core/LLVMBuildUnreachable b)
+          (core/LLVMDisposeBuilder b)
+          f))))
+
+;; `write(2, message, length)`, with the target's `size_t` (i32 on a 32-bit target), through whatever `write` the module has or a new
+;; declaration of it.
+(defun write-message :private (lx: Lx b: i64 f: i64) -> unit
+  (let ((word (lx-ty lx (if (. lx ptr32) ty-i32 ty-i64)))
+        (i32t (lx-ty lx ty-i32))
+        (wty (core/function-type word [i32t (lx-ty lx ty-ptr) word] false))
+        (nm (ffi/bytes-new "write"))
+        (found (unsafe (core/LLVMGetNamedFunction (. lx module) nm)))
+        (w (if (= found 0) (core/add-function (. lx module) "write" wty) found))
+        (len (unsafe (core/LLVMGetParam f 2i32)))
+        (n (if (. lx ptr32) (b-cast b (opcode-trunc) len word) len)))
+    (do (unsafe (free nm))
+        (core/build-call b wty w [(core/const-int i32t 2 false) (unsafe (core/LLVMGetParam f 1i32)) n] "")
+        ())))

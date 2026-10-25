@@ -98,6 +98,21 @@
             (= (bit-and flags (nth bits i)) 0) (recur (+ i 1) out)
             :else (recur (+ i 1) (conj out (nth all i)))))))
 
+;; ---------------------------------------------------------------- integer flags (spec/lir.md 6.1, facts)
+
+;; `nsw` and `nuw` on `add sub mul shl`: LLVM's no-wrap flags, kept in the same `flags` word of `KIntrin` as the fast-math bits, above them
+;; (LLVM's fast-math bits stop at 64), so that a flagged integer operation is the intrinsic form named `add` .. `shl` as a flagged `fadd` is.
+(def ifl-nsw: i64 256)
+(def ifl-nuw: i64 512)
+
+(defun int-flag-bit (w: str) -> (Option i64)
+  (cond (= w "nsw") (some ifl-nsw) (= w "nuw") (some ifl-nuw) :else nil))
+
+;; The flag words of `flags`, fast-math and integer, in LLVM's order (`add nuw nsw`).
+(defun op-flag-words (flags: i64) -> (Vec str)
+  (let ((ints (into (if (= (bit-and flags ifl-nuw) 0) [] ["nuw"]) (if (= (bit-and flags ifl-nsw) 0) [] ["nsw"]))))
+    (into ints (fm-words flags))))
+
 ;; ---------------------------------------------------------------- expressions
 
 ;; The callee of a call (ast.rs `Callee`).
@@ -153,6 +168,9 @@
   ;; The intrinsic forms of spec/lir.md 6.1, 6.4 and 6.5 (SIMD wave 2, package P0): `name` is the word (`fma`, `reduce-add`, `gather`), `flags`
   ;; the fast-math bits (`fm-*` below, 0 for none; a `fadd` that carries flags is this form with name "fadd", an unflagged one is `KBin`),
   ;; `ty` the leading type operand of `masked-load` and `gather`, `args` the value operands, `align` the trailing `(align N)`.
+  ;; The facts (spec/lir.md 6.13) are intrinsic forms too, so that every walker that knows `KIntrin` walks them: `(add nsw a b)` is name "add",
+  ;; `flags` `ifl-nsw`, args [a b] (an unflagged `add` stays `KBin`); `(assume c)` is name "assume", args [c], void; `(load (range LO HI) T p)` is
+  ;; name "load", `ty` T, args [p (T LO) (T HI)] (the bounds as integer literals of T), `align` the load's.
   (KIntrin name: str flags: i64 ty: (Option LType) args: (Vec LExpr) align: (Option i64))
   (KCall callee: LCallee args: (Vec LExpr) tail: bool)
   (KRet value: (Option LExpr))

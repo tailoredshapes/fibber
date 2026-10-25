@@ -14,6 +14,9 @@
 ;;   hint         `spin-hint`: no operands, void (spec/lir.md 6.6a): the target's pause instruction, nothing where it has none
 ;;   const        `cache-line`: no operands, an i64 the target decides (spec/lir.md 6.6a); `stack-addr`: no operands, an i64, the stack pointer of the
 ;;                function (spec/lir.md 6.6b, docs/design/stack-check.md)
+;;   ibin         the facts `add sub mul shl` carrying `nsw`/`nuw` (spec/lir.md 6.13): 2 operands, as the unflagged `KBin`
+;;   assume       `assume`: one i1 operand, void (`llvm.assume`)
+;;   rload        `load` with `(range LO HI)`: the type, the pointer and the two bounds (written by lir.parse.memory, never by `parse-intrin`)
 (ns lir.intrin)
 
 
@@ -45,7 +48,9 @@
    "shfl-xor" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.bfly") "shfl-idx" (IntrinInfo "warp" "llvm.nvvm.shfl.sync.idx")
    "ballot" (IntrinInfo "warp" "llvm.nvvm.vote.ballot.sync")
    "spin-hint" (IntrinInfo "hint" "") "cache-line" (IntrinInfo "const" "")
-   "stack-addr" (IntrinInfo "const" "llvm.stacksave")})
+   "stack-addr" (IntrinInfo "const" "llvm.stacksave")
+   "add" (IntrinInfo "ibin" "add") "sub" (IntrinInfo "ibin" "sub") "mul" (IntrinInfo "ibin" "mul") "shl" (IntrinInfo "ibin" "shl")
+   "assume" (IntrinInfo "assume" "llvm.assume") "load" (IntrinInfo "rload" "")})
 
 (defun intrin-info (name: str) -> (Option IntrinInfo) (get intrin-table name))
 
@@ -61,18 +66,26 @@
     (cond (= name "ballot") 1
           (or (= c "hint") (= c "const")) 0
           (= c "warp") 2
-          (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m")) 1
-          (or (= c "f2") (= c "i2") (= c "fbin") (= c "red-f")) 2
+          (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m") (= c "assume")) 1
+          (or (= c "f2") (= c "i2") (= c "fbin") (= c "red-f") (= c "ibin")) 2
           :else 3)))
 
-;; Whether the form takes fast-math flags (spec/lir.md 6.1).
+;; Whether the form takes flag words: fast-math flags (spec/lir.md 6.1), or `nsw`/`nuw` on the integer forms (6.13).
 (defun intrin-flags? (name: str) -> bool
   (let ((c (intrin-class name)))
-    (or (= c "fbin") (= c "red-f") (= name "fma"))))
+    (or (= c "fbin") (= c "red-f") (= name "fma") (= c "ibin"))))
+
+;; Whether the flag words are the integer ones, `nsw` and `nuw`.
+(defun intrin-int-flags? (name: str) -> bool (= (intrin-class name) "ibin"))
+
+;; Whether the form is a fact (spec/lir.md 6.13): droppable, lowered by the check mode.
+(defun intrin-fact? (name: str) -> bool
+  (let ((c (intrin-class name)))
+    (or (= c "ibin") (= c "assume") (= c "rload"))))
 
 ;; Whether the form starts with a type operand.
 (defun intrin-typed? (name: str) -> bool
-  (or (= name "masked-load") (= name "gather")))
+  (or (= name "masked-load") (= name "gather") (= name "load")))
 
 ;; Whether the form may end in `(align N)`.
 (defun intrin-aligned? (name: str) -> bool

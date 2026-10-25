@@ -1,7 +1,7 @@
 ;; compiler/native/lower.fib: lowering a checked lIR module to an LLVM module (crates/lair/src/lower/mod.rs `lower`). OWNER: package L1.
 
 (ns native.lower
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
+  (:use lir.diag lir.types lir.lit lir.ast lir.facts native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
   (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [fib.string :as s] [types.targets :as tt]))
 
 
@@ -19,8 +19,10 @@
                   (= (. (tt/target-row-of-triple triple) pointer-bits) 32) (= (. (tt/target-row-of-triple triple) os) "wasi")
                   (tt/kernel-row? (tt/target-row-of-triple triple))
                   (= (. (tt/target-row-of-triple triple) arch) "aarch64")
-                  (. (tt/target-row-of-triple triple) arch)))
-          (r (module-items lx m)))
+                  (. (tt/target-row-of-triple triple) arch) (facts-mode)))
+          (r (if (< (. lx facts) 0)
+                 (Err (ErrBackend (str "FIB_LIR_FACTS must be use, trap or ignore, found " (unwrap-or (sys-getenv "FIB_LIR_FACTS") ""))))
+                 (module-items lx (if (= (. lx facts) facts-ignore) (strip-module m) m)))))
       (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
           (match r
             ((Err x) (do (owned-dispose owned) (Err x)))

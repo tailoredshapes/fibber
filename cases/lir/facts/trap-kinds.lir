@@ -1,0 +1,34 @@
+;; expect: accept
+;; facts: trap
+;; out: ok 12 2 42 12 7 -3
+;; ir: @llvm.sadd.with.overflow.i64
+;; ir: @llvm.usub.with.overflow.i32
+;; ir: @llvm.umul.with.overflow.i64
+;; ir: @llvm.smul.with.overflow.i64
+;; ir: call void @lir.fact.check
+;; ir-not: = add nsw
+;; ir-not: nuw i64 %
+;; ir-not: !range
+;; ir-not: llvm.assume
+;; Every kind of fact, each one true, under the check mode: each is turned into a test (the overflow intrinsics, the shift back of a `shl`,
+;; the compares of a range) that passes, so the program runs as it would without the facts, and no fact reaches LLVM.
+(declare printf i32 (ptr ...))
+(define (opq i64) ((i64 x))
+  (block entry (let ((s (alloca i64))) (store volatile x s) (ret (load volatile i64 s)))))
+(define (main i32) ()
+  (block entry
+    (let ((a (call @opq (i64 5)))
+          (b (call @opq (i64 7)))
+          (s (add nsw a b))
+          (d (sub nuw (trunc i32 b) (trunc i32 a)))
+          (m (mul nuw nsw (i64 6) b))
+          (w (shl nuw nsw (<2 x i64> 2 3) (insertelement (<2 x i64> 2 2) (sub a (i64 3)) (i32 1))))
+          (p (alloca i64))
+          (q (alloca i8)))
+      (assume (icmp slt a b))
+      (store b p)
+      (store (i8 -3) q)
+      (let ((r (load (range 0 100) i64 p))
+            (t (load (range -3 128) i8 q)))
+        (call @printf (string "ok %lld %d %lld %lld %lld %d\n") s d m (extractelement w (i32 1)) r (sext i32 t))
+        (ret (i32 0))))))

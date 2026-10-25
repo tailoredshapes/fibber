@@ -3,7 +3,7 @@
 ;; strings, with every check types §8.12 requires, and the conversion primitives. The order of the instructions is the Rust's: a fresh
 ;; name asked for earlier shifts every later one of the function. Where the Rust has `"a" | "b" =>` arms this is `case`.
 (ns emit.lower.arith
-  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show emit.lower.simd)
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show emit.lower.simd emit.lower.facts)
   (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 (defun arith-some :private (r: (Result V str)) -> (Result (Option V) str)
@@ -70,8 +70,13 @@
 
 ;; ---- integers
 
-;; `+`, `-`, `*` with the overflow trap of §8.12.
+;; `+`, `-`, `*` with the overflow trap of §8.12; a step a dominating test bounds is the fact `add nsw`/`sub nsw` instead (emit.lower.facts 2).
 (defun int-checked :private (cx: LowerCx method: str t: LirTy a: la/LExpr b: la/LExpr) -> V
+  (if (and (or (= method "+") (= method "-")) (step-no-wrap? cx method))
+      (arith-val cx (nx/intrinsic (if (= method "+") "add" "sub") la/ifl-nsw nil [a b] nil) t)
+      (int-trapping cx method t a b)))
+
+(defun int-trapping :private (cx: LowerCx method: str t: LirTy a: la/LExpr b: la/LExpr) -> V
   (let ((op (cond (= method "+") "sadd-overflow" (= method "-") "ssub-overflow" :else "smul-overflow")))
     (let ((r (arith-val cx (nx/operation op a b) t)))
       (let ((ovf (arith-val cx (nx/extract (v-expr r) 1) LirI1)))

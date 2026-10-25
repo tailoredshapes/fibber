@@ -10,7 +10,7 @@ GATE_STATIC ?= 0
 GATE_WASM ?= 0
 GATE_CONTROL ?= 0
 GATE_BASELINE := scripts/gate-budget.tsv
-FULL_UNORDERED := $(BUILD)/gate-report.ok $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(TOOLS_FULL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok \
+FULL_UNORDERED := $(BUILD)/gate-report.ok $(BUILD)/version.ok $(BUILD)/runtime-drift.ok $(BUILD)/fixed-point.ok $(GOLDEN_STAMPS) $(TOOLS_FULL_STAMPS) $(BUILD)/adr.ok $(BUILD)/docs.ok $(CASES_DIR)/full.ok $(CASES_DIR)/trap.ok \
   $(BUILD)/static.ok $(BUILD)/wasm.ok $(BUILD)/shared-renderer.ok $(if $(wildcard specs),$(BUILD)/specs.ok) $(if $(filter 1,$(GATE_CONTROL)),$(BUILD)/fixed-point-whole.ok)
 # The order make starts the stamps in once F exists: the fixed point first (its chain F.lir, F3, F3.lir is the longest), then by recorded cost,
 # longest first (the baseline), then those the baseline has not seen. Only fixed-point.ok and the tool that runs F3 (jit-selfhosted-threads)
