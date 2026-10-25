@@ -1,0 +1,51 @@
+;; expect: accept
+;; out: 1 1 3
+;; spec/lir.md 4.8: a symbol a macro made stays a symbol at the next macro boundary whatever its text: the reader macro ' makes the symbol
+;; of the text after it (.5, inf), and the macro tag-of sees tag 1, not a float's 3; a float made with lir.sexp.float-text is a float.
+(declare printf i32 (ptr ...))
+(define-macro tag-of (x)
+  (block entry
+    (let ((l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "i64")))
+      (call @lir.sexp.push l (call @lir.sexp.integer (call @lir.sexp.tag x)))
+      (ret l))))
+(define-reader-macro "'" (s)
+  (block entry
+    (let ((buf (alloca i8 (i64 16)))
+          (l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "tag-of")))
+      (br next)))
+  (block next
+    (let ((i (phi i64 (entry (i64 0)) (take i2)))
+          (b (call @lir.read.peek s)))
+      (br (or (icmp slt b (i64 32)) (or (icmp eq b (i64 32)) (icmp eq b (i64 41)))) done take)))
+  (block take
+    (let ((i2 (add i (i64 1))))
+      (store (trunc i8 (call @lir.read.next s)) (getelementptr i8 buf i))
+      (br next)))
+  (block done
+    (store (i8 0) (getelementptr i8 buf i))
+    (call @lir.sexp.push l (call @lir.sexp.symbol buf))
+    (ret l)))
+(define-reader-macro "$" (s)
+  (block entry
+    (let ((buf (alloca i8 (i64 16)))
+          (l (call @lir.sexp.list (i64 0))))
+      (call @lir.sexp.push l (call @lir.sexp.symbol (string "tag-of")))
+      (br next)))
+  (block next
+    (let ((i (phi i64 (entry (i64 0)) (take i2)))
+          (b (call @lir.read.peek s)))
+      (br (or (icmp slt b (i64 32)) (or (icmp eq b (i64 32)) (icmp eq b (i64 41)))) done take)))
+  (block take
+    (let ((i2 (add i (i64 1))))
+      (store (trunc i8 (call @lir.read.next s)) (getelementptr i8 buf i))
+      (br next)))
+  (block done
+    (store (i8 0) (getelementptr i8 buf i))
+    (call @lir.sexp.push l (call @lir.sexp.float-text buf))
+    (ret l)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "%lld %lld %lld\n") '.5 'inf $2.5)
+    (ret (i32 0))))

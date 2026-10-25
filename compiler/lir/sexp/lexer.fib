@@ -25,11 +25,51 @@
 (def tok-bracket-open: Tok TokBracketOpen)
 (def tok-bracket-close: Tok TokBracketClose)
 
-;; The text, and the cursor: byte offset, line and column, three cells.
-(defstruct Lexer (src: str n: i64 i: (Cell i64) line: (Cell i64) col: (Cell i64)))
+;; The character classes a readtable sets (spec/lir.md 4.8): per ASCII byte, and per Unicode scalar from 128 up, 0 for lIR's own
+;; treatment, 1 whitespace, 2 constituent (part of an atom), 3 terminating (ends an atom); `active` once any is set, so a lexer with none
+;; pays one load per token. A class changes what is skipped between forms and where an atom ends, nothing else.
+(defstruct Classes (ascii: (Cell (Array i8)) unicode: (Cell (Map i64 i64)) active: (Cell bool)))
+
+(def class-whitespace: i64 1)
+(def class-constituent: i64 2)
+(def class-terminating: i64 3)
+
+(defun classes-new () -> Classes
+  (Classes (cell (array 128 0i8)) (cell (map-empty)) (cell false)))
+
+(defun classes-set! (c: Classes scalar: i64 class: i64) -> unit
+  (do (if (< scalar 128)
+          (let ((a (. c ascii))) (array-set! &a scalar (trunc i8 class)))
+          (set! (. c unicode) (assoc @(. c unicode) scalar class)))
+      (set! (. c active) true)))
+
+;; The text, the cursor (byte offset, line and column, three cells) and the classes.
+(defstruct Lexer (src: str n: i64 i: (Cell i64) line: (Cell i64) col: (Cell i64) classes: Classes))
 
 (defun lexer-new (src: str) -> Lexer
-  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1)))
+  (lexer-with src (classes-new)))
+
+(defun lexer-with (src: str classes: Classes) -> Lexer
+  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1) classes))
+
+;; The UTF-8 character at byte j: `scalar | width << 32` (a byte that is no lead byte: itself, width 1).
+(defun scalar-at :private (lx: Lexer j: i64) -> i64
+  (let ((b (byte-at lx j)))
+    (cond (< b 192) (bit-or b (shl 1 32))
+          (< b 224) (bit-or (bit-or (shl (bit-and b 31) 6) (cont lx (+ j 1))) (shl 2 32))
+          (< b 240) (bit-or (bit-or (bit-or (shl (bit-and b 15) 12) (shl (cont lx (+ j 1)) 6)) (cont lx (+ j 2))) (shl 3 32))
+          :else (bit-or (bit-or (bit-or (bit-or (shl (bit-and b 7) 18) (shl (cont lx (+ j 1)) 12)) (shl (cont lx (+ j 2)) 6)) (cont lx (+ j 3))) (shl 4 32)))))
+
+(defun cont :private (lx: Lexer j: i64) -> i64
+  (let ((b (byte-at lx j))) (bit-and (if (< b 0) 0 b) 63)))
+
+;; The class of the character at byte j and its width: `class | width << 8`, class 0 when none is set.
+(defun class-at :private (lx: Lexer j: i64) -> i64
+  (let ((b (byte-at lx j)))
+    (if (< b 128)
+        (bit-or (zext i64 (array-get @(. (. lx classes) ascii) b)) 256)
+        (let ((sw (scalar-at lx j)))
+          (bit-or (unwrap-or (get @(. (. lx classes) unicode) (bit-and sw 4294967295)) 0) (shl (shr sw 32) 8))))))
 
 ;; The byte at offset i as 0 to 255, or -1 past the end.
 (defun byte-at :private (lx: Lexer i: i64) -> i64
@@ -89,6 +129,32 @@
 ;; The cursor after the whitespace, commas and comments at the front. One pass over bytes held in locals, written back once: the cells are
 ;; read and written at the end, not at every byte (the profile of `lairf check` on the 19 MB file: 30 ns a byte before this).
 (defun skip-space (lx: Lexer) -> unit
+  (if @(. (. lx classes) active) (skip-space-with lx) (skip-space-fast lx)))
+
+;; `skip-space` under the classes: a whitespace character is passed, a constituent or terminating one stops, and a character with no class
+;; is treated as the fast path treats it.
+(defun skip-space-with :private (lx: Lexer) -> unit
+  (loop ()
+    (let ((j @(. lx i)) (b (byte-at lx j)))
+      (if (< b 0)
+          ()
+          (let ((cw (class-at lx j)) (c (bit-and cw 255)) (w (shr cw 8)))
+            (cond (= c class-whitespace) (do (dotimes (k w) (bump lx)) (recur))
+                  (not (= c 0)) ()
+                  (= b 59) (do (skip-comment lx) (recur))
+                  (default-space? lx j b) (do (dotimes (k (if (< b 128) 1 (ws-len lx j))) (bump lx)) (recur))
+                  :else ()))))))
+
+(defun skip-comment :private (lx: Lexer) -> unit
+  (loop ()
+    (let ((b (byte-at lx @(. lx i))))
+      (if (or (< b 0) (= b 10)) () (do (bump lx) (recur))))))
+
+;; Whether the character at j (its lead byte b) is whitespace to lIR's own lexer.
+(defun default-space? :private (lx: Lexer j: i64 b: i64) -> bool
+  (if (< b 128) (or (= b 32) (= b 44) (and (>= b 9) (<= b 13))) (> (ws-len lx j) 0)))
+
+(defun skip-space-fast :private (lx: Lexer) -> unit
   (let ((src (. lx src)) (n (. lx n)))
     (loop ((j @(. lx i)) (line @(. lx line)) (col @(. lx col)))
       (let ((b (if (< j n) (zext i64 (str-byte-at src j)) -1)))
@@ -132,15 +198,35 @@
 ;; The offset where the atom starting at j ends, and nothing else: an atom has no newline in it (a newline is whitespace), so its width
 ;; in columns is the count of non-continuation bytes, which `columns` gives. ASCII bytes are classified here; a byte from 128 up asks `ws-len`.
 (defun atom-end :private (lx: Lexer j: i64) -> i64
+  (if @(. (. lx classes) active) (atom-end-with lx j) (atom-end-fast lx j)))
+
+(defun atom-end-fast :private (lx: Lexer j: i64) -> i64
   (let ((src (. lx src)) (n (. lx n)))
     (loop ((k j))
       (if (< k n)
           (let ((b (zext i64 (str-byte-at src k))))
             (if (< b 128)
-                (if (or (= b 32) (and (>= b 9) (<= b 13)) (= b 40) (= b 41) (= b 123) (= b 125) (= b 91) (= b 93) (= b 34) (= b 59) (= b 44))
-                    k
-                    (recur (+ k 1)))
+                (if (default-delimiter? lx k b) k (recur (+ k 1)))
                 (if (> (ws-len lx k) 0) k (recur (+ k 1)))))
+          k))))
+
+;; Whether the character at k (its lead byte b) ends an atom to lIR's own lexer.
+(defun default-delimiter? :private (lx: Lexer k: i64 b: i64) -> bool
+  (if (< b 128)
+      (or (= b 32) (and (>= b 9) (<= b 13)) (= b 40) (= b 41) (= b 123) (= b 125) (= b 91) (= b 93) (= b 34) (= b 59) (= b 44))
+      (> (ws-len lx k) 0)))
+
+;; `atom-end` under the classes: the first character is the atom's whatever its class; after it a constituent continues the atom, a
+;; whitespace or terminating character ends it, and a character with no class ends it when the fast path would.
+(defun atom-end-with :private (lx: Lexer j: i64) -> i64
+  (let ((n (. lx n)))
+    (loop ((k (+ j (shr (class-at lx j) 8))))
+      (if (< k n)
+          (let ((cw (class-at lx k)) (c (bit-and cw 255)) (w (shr cw 8)))
+            (cond (= c class-constituent) (recur (+ k w))
+                  (not (= c 0)) k
+                  (default-delimiter? lx k (byte-at lx k)) k
+                  :else (recur (+ k w))))
           k))))
 
 (defun lex-atom :private (lx: Lexer start: i64) -> (Result (Option Token) Diagnostic)
