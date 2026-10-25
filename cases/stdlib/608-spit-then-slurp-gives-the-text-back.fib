@@ -4,8 +4,9 @@
 ;; audit:  clean
 ;; roots:  ../../lib support
 ;; covers: slurp spit try-slurp
-;; The files of the case are /tmp/fibstdlib-608-*.txt, named by the case's number
-;; so that no two cases share one. Each file is written more than once with
+;; The files of the case are /tmp/fibstdlib-608-PID-*.txt, named by the case's number
+;; so that no two cases share one and by the process id so that no two runs of the
+;; case at once share one; both are removed at the end. Each file is written more than once with
 ;; different text and read back after each write, and the first text of each is
 ;; not the last text the previous run left there (the empty text, and "short"),
 ;; so a write that does nothing cannot pass on the strength of a file an earlier
@@ -13,16 +14,16 @@
 ;; written, never a translation of them. spit answers whether the whole text
 ;; was written; the empty text makes an empty file, which is the string "" and
 ;; not a failure to read.
-(ns main (:use fib.core fib.seq fib.print tl.check))
-
-(def path-a: str "/tmp/fibstdlib-608-a.txt")
-(def path-b: str "/tmp/fibstdlib-608-b.txt")
+(ns main (:use fib.core fib.seq fib.print tl.check) (:require [fib.os :as os]))
 
 (defun ok-text (r: (Result str str) want: str) -> bool
   (match r ((Ok s) (= s want)) ((Err _) false)))
 
 (defun main () -> i64
   (let ((c (checks))
+        (prefix (str "/tmp/fibstdlib-608-" (os/process-id)))
+        (path-a (str prefix "-a.txt"))
+        (path-b (str prefix "-b.txt"))
         (first-text "alpha\nbeta\n")
         (second-text "line one\r\nz\0z é 日本語 😀\n\n")
         (long-text (loop ((i 0) (acc "")) (if (< i 400) (recur (+ i 1) (str-concat acc "0123456789")) acc))))
@@ -40,4 +41,6 @@
         (check c (= (slurp path-b) long-text))
         (check c (spit path-b "short"))
         (check c (= (slurp path-b) "short"))
+        (os/remove-file path-a)
+        (os/remove-file path-b)
         (checks-result c))))
