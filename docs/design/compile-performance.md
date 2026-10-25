@@ -47,6 +47,9 @@ BENCH_FIBC=F GATE_OUT=DIR FIB_LIRO_CACHE=DIR2 [FIB_LIRO_MODE=whole|FIB_LIRO_IMPO
 | `FIB_LIRO_SPLIT=hash\|ns1\|ns2\|ns3` | group by function-name hash (default) or by the first 1 to 3 dotted segments of the namespace |
 | `FIB_LIRO_IMPORT=T`, `FIB_LIRO_IMPORT_DEPTH=D` | copy callees of at most T expression nodes into each unit that calls them as internal definitions (D rounds, default 2); the glue unit gets none |
 | `FIB_LIRO_STATS=1` | also prints items and definitions per unit |
+| `FIB_LIRO_THIN=1` | ThinLTO: each unit is bitcode with its summary; the thin link and backends run in fibc (section "ThinLTO in process") |
+| `FIB_LIRO_THIN_JOBS=N`, `FIB_LIRO_THIN_IMPORT=T` | backend threads (default one per core); LLVM's import threshold (default 100 instructions) |
+| `FIB_LIRO_THIN_REPORT=FILE`, `FIB_LIRO_THIN_TEMPS=DIR` | each unit's module hash and the units it imports from; each unit as its backend reads it, after the importing |
 
 Code: `compiler/native/liro/parallel.fib` (workers: `pmap-range` over the units, each in its own LLVM context and target machine), `partition.fib` (split and copies), `build.fib`. Test: `parallel_checks` in `compiler/tests/native/liro/check.py` (default cache-off stays whole-program; jobs 1, 4, 4 give identical executables; splits and copies run correctly). `make quick`, `make adr` and `build/tools/sh-native-liro.ok` pass.
 
@@ -358,11 +361,11 @@ Findings for small programs: a cold partitioned build is slower (0.6 s) than who
 - The profile run itself (161 s wall) ran at load 11 to 22; use the matrix for times. `i160` and `i80ns3x32` builds ran at load up to 33.
 - A second machine (the Ryzen 5800X) is not in this document; see the commit message.
 - Whole-program builds are deterministic only for a fixed output name: the module name (the `FILE` symbol) is the output file name, so `-o F1` and `-o F2` differ in 8 bytes of the symbol table. Partitioned builds name modules `liro-unit-N` and do not have the dependence.
-- Not tried: splitting by call-graph affinity, and the opt-in with the cache on. ThinLTO: see the next section.
+- Not tried: splitting by call-graph affinity, and the opt-in with the cache on. ThinLTO: see the next two sections.
 
 ## ThinLTO spike (`FIB_LIRO_THIN=1`, 2026-10-24)
 
-Opt-in, Linux only, default unchanged. Each cached unit is ThinLTO bitcode with a module summary instead of an object: lower, then
+Superseded by the next section (the gold plugin route is gone). Opt-in, Linux only, default unchanged. Each cached unit is ThinLTO bitcode with a module summary instead of an object: lower, then
 `thinlto-pre-link<On>,embed-bitcode<thinlto;emit-summary>` through `LLVMRunPasses`, and the bytes of the `llvm.embedded.object` global
 that FatLTO's pass leaves are the summary bitcode (LLVM-C has no summary writer; the pass is ELF-only and a Mach-O module is a fatal
 error). The link adds `-Wl,-plugin,/usr/lib/llvm-21/lib/LLVMgold.so` with `O`, `mcpu`, `jobs=6` and `cache-dir=<liro cache>/thinlto`;
@@ -406,3 +409,119 @@ bench checksums equal; 540 cases (all of `cases/ownership`, every tenth of `case
 out-of-memory traps (195, 7881), where ThinLTO, `i80` and whole-program all delete the unused `alloc`/`free` pair and exit 7 where the
 default build and `fibc run` trap. A compiler built through ThinLTO emits the same lIR for `compiler/fibc.fib` as the others.
 Scripts and logs: `/tank/data/fibber-scratch/thinlto/` (`runs.sh`, `cutbuilds.sh`, `compbuilds.sh`, `case1.sh`, `logs/`).
+
+## ThinLTO in process (`FIB_LIRO_THIN=1`, 2026-10-25)
+
+The spike above needed `LLVMgold.so` and a linker that loads it (Linux only), and a one-function edit reran most backends. Both are fixed;
+the default build is unchanged.
+
+**What the LLVM fibc links contains.** The static set of `scripts/llvm-static.sh` had no `LLVMLTO`; `llvm-config --libfiles lto` adds
+`libLLVMLTO.a` (`lto::thinBackend`, the thin link's helpers, the legacy `ThinLTOCodeGenerator`), `libLLVMExtensions.a` and Polly
+(`LTOBackend.cpp` registers Polly as a pass-builder extension, so `libPolly.a` and `libPollyISL.a` come with it). `libLLVMipo` already has
+`FunctionImport`, `libLLVMAnalysis` `ModuleSummaryAnalysis`, `libLLVMBitWriter` the summary writer. The shared `libLLVM-21.so` and
+Homebrew's `libLLVM.dylib` contain all of it. The C API does not: `llvm-c/BitWriter.h` writes bitcode without a summary, and
+`llvm-c/lto.h` (`thinlto_*`) is libLTO, built from `tools/lto` as its own shared library (`libLTO.so`, `libLTO.dylib`) over the shared
+libLLVM, with no static archive. The same holds on the Mac (llvm@21 21.1.8: `libLLVMLTO.a`, `libLTO.dylib`, RTTI on).
+
+**Route.** (a) libLTO's `thinlto_*` API cannot be linked into a static fibc (it would ship a second, shared LLVM) and still needs a
+summary writer, which only the C++ API has. (c) A summary pass on Mach-O plus the system linker depends on a `libLTO.dylib` matching
+LLVM 21 (Apple's is an older LLVM; Homebrew's is outside fibc). So (b): `compiler/llvm/thinlto.cpp`, 360 lines of C++ over the LLVM fibc
+already links, compiled into one object by `scripts/thinlto-shim.sh` (c++ with `llvm-config --cxxflags`, 3 s) and linked whole into fibc
+before the LLVM words (Linux: `libfibthin.so` is an ld script `INPUT(fibthin.o AS_NEEDED(-lstdc++))`; macOS: the object itself named
+`libfibthin.a`, which ld64 takes as an object). fibc names no symbol of the shim: a constructor registers two functions with LLVM's process
+symbol table (`sys::DynamicLibrary::AddSymbol`), `llvm.thinlto` finds them with `LLVMSearchForAddressOfSymbol` and calls them through libc's
+`bsearch` (fibber cannot call an address; `native.call` reaches its own shim the same way). So the documented build command without the
+shim words still builds a working fibc; only `FIB_LIRO_THIN=1` then refuses, with a message. `mk/config.mk`, `mk/release.mk` and
+`scripts/lib/stage2.sh` add the words (`THINLTO_SHIM=off` leaves them out); `llvm-static.sh` adds the `lto` component, so CI installs
+`libpolly-21-dev` (the release workflow already did). The static Linux fibc is 111.5 MB (106.8 MB without the shim and the `lto` component); its dynamic libraries are unchanged (libstdc++,
+libm, libz, libzstd, libgcc_s, libc); the static Mac fibc links only system dylibs (libSystem, libc++, libz, libxml2).
+
+**What it does.** Per unit (cached as before): lower, `thinlto-pre-link<On>`, then the shim names each local constant by its content
+(below) and writes the bitcode with `buildModuleSummaryIndex` and `WriteBitcodeToFile` (summary, module hash, symbol table) on any object
+format. At the link: the combined index; liveness from the program's external definitions; a symbol one unit defines and another names is
+never internalised (the unit's partition is one program; there is no linker to say so); imports (`ComputeCrossModuleImport`), attribute
+propagation, prevailing copies and internalisation as `lto::LTO` does; then `lto::thinBackend` per unit on a thread pool, each writing an
+ordinary object that `cc` links as it links the default build's objects. No plugin, no `-flto` linker, no external tool.
+
+**The incremental cost, explained and fixed.** `FIB_LIRO_THIN_REPORT` showed that with the 16 hash units every code unit imports from 16
+to 18 of the other 18 units, and LLVM's cache key (`computeLTOCacheKey`) holds the hash of every whole module a backend imports from: an
+edit to one unit changes the key of every unit that imports anything from it. On the cutter that predicted the 16 of 19 exactly. The
+shim's key is instead the digest of the unit as its backend reads it, after promotion, internalisation and importing (`PostImportModuleHook`),
+plus the code generation options; the cache directory is under the liro cache, per liro contract (compiler binary, LLVM, target, settings)
+and import threshold, pruned by LLVM's `pruneCache`. Two more causes of reruns that read nothing changed showed up in the dumps
+(`FIB_LIRO_THIN_TEMPS`): units named by their content digest made an edited unit sort elsewhere, and the importers read its globals in a
+different order, so units are named by their place in the partition (`unit-N`); and a local constant referenced by an imported function is
+promoted under a name holding its unit's module hash, so an edit anywhere renamed it in every importer, so local unnamed constants are
+named `fibc.k.DIGEST` (linkonce_odr, hidden; the first unit's copy prevails; unused ones are internalised again). After that, every
+backend that reruns imports a definition that changed: for the `clamp` edit, the 11 units that inline `clamp`.
+
+Backends rerun after one edit (cache on, measured with `FIB_LIRO_STATS=1`):
+
+| edit | spike (gold plugin) | module-hash key, in process | this branch |
+|---|---|---|---|
+| cutter, `clamp` (a leaf called from 11 units) | 15-16 of 19 | 16 of 19 | 11 of 19 (2 of 18 with `FIB_LIRO_SPLIT=ns1`, 8 with `ns2`) |
+| cutter, `parse-opts` default | 15-16 of 19 | 15 of 19 | 1 of 19 (1 with `ns1`, `ns2`) |
+| compiler, `native.link` loop | 17 of 19 | | 1 of 19 (Linux and the Mac) |
+
+A different partition helps the leaf edit because callers then share a unit: hash units spread `clamp`'s callers over 11 units, `ns1`
+keeps all of `fib.*` in one unit and the cutter's own functions hashed by name. Lowering the import threshold would cut reruns only by
+cutting the inlining ThinLTO is for; not pursued.
+
+i7-14700KF, medians of 3 interleaved rounds, one F from this branch for every configuration, `FIB_LIRO_THIN_JOBS=6`. The machine was
+shared: load 2 to 8 during the builds, which inflates single rounds (the `thin-ns1` cold wall of 3.8 s was 2.4 s in a quieter round).
+
+Cutter run time, s (byte-identical outputs in every configuration and round):
+
+| default | i80 | thin | thin ns1 | thin ns2 | whole |
+|---|---|---|---|---|---|
+| 1.90 | 1.24 | 1.23 | 1.18 | 1.19 | 1.09 |
+
+(medians of 5 interleaved runs at load 3 to 4.5; a first round at load about 3 gave 1.78, 1.15, 1.12, 1.05, 1.13, 0.99: the same order.
+The cutter is 8 to 13% slower than whole-program through ThinLTO, where the spike measured 5%; not investigated.)
+
+Cutter builds, wall / CPU s (backends that ran), and size:
+
+| build | default | i80 | thin | thin ns1 | thin ns2 | whole |
+|---|---|---|---|---|---|---|
+| cold | 2.26 / 2.25 | 3.86 / 3.85 | 2.42 / 5.16 (19) | 3.80 / 6.06 (18) | 2.28 / 4.13 (19) | 3.54 / 3.53 |
+| `clamp` edited | 1.21 / 1.20 | 2.72 / 2.71 | 1.60 / 3.51 (11) | 1.54 / 1.71 (2) | 1.59 / 2.27 (8) | 3.49 / 3.48 |
+| `parse-opts` edited | 1.12 / 1.11 | 1.38 / 1.37 | 1.55 / 1.77 (1) | 1.27 / 1.39 (1) | 1.32 / 1.45 (1) | 3.53 / 3.52 |
+| no change | 1.19 / 1.19 | 1.33 / 1.32 | 1.37 / 1.52 (0) | 1.14 / 1.26 (0) | 1.16 / 1.27 (0) | 0.96 / 0.95 |
+| size, KB | 289 | 463 | 430 | 407 | 406 | 345 |
+
+The compiler (`compiler/fibc.fib`, a frozen copy of the tree, edit at `native/link.fib` line 65):
+
+| | default | thin | thin ns2 | whole |
+|---|---|---|---|---|
+| cold build, wall / CPU s | 68.8 / 68.7 | 76.4 / 181.8 | 72.4 / 159.1 | 138.0 / 137.9 |
+| one function edited, wall / CPU s | 37.9 / 37.9 | 44.3 / 49.3 (1 backend) | 39.8 / 43.3 (1) | |
+| no change, wall / CPU s | 35.7 / 35.7 | 37.9 / 42.4 | 34.6 / 38.3 | |
+| peak RSS, MiB | 1745 | 2461 | 2459 | 2856 |
+| executable, MiB | 9.6 | 16.8 | 16.2 | 14.7 |
+| run: `emit compiler/fibc.fib`, s | 32.0 | 25.2 | 25.7 | 24.9 |
+
+The no-change rows are the front end plus, for ThinLTO, the thin link and the per-unit import that the exact key needs (4 to 7 s of CPU
+on the compiler, spread over the backend threads). Every compiler emits the same lIR for `compiler/fibc.fib` (sha1 41f45c2d3a2c).
+
+Correctness: the 540 cases of the spike (all of `cases/ownership`, every tenth of `cases/stdlib`) built default and ThinLTO and run: 538
+agree in exit code and standard output; the two others are the out-of-memory traps 195 and 7881 again (ThinLTO, like `i80` and
+whole-program, deletes the unused `alloc`/`free` pair and exits 7 where the default build traps).
+
+**macOS** (M1 Ultra, macOS 27, Homebrew llvm@21, ld-27037; stage 2 built by `gmake build/F` from the 0.1.17 darwin seed with the shim
+linked): `FIB_LIRO_THIN=1` builds and runs; the compiler built through ThinLTO (19 backends, 88 s wall, 178 s CPU) emits the same lIR for
+`compiler/fibc.fib` as F; after the `native/link.fib` edit 1 of 19 backends ran (61 s wall, the front end); 90 cases (every sixth of the
+540) agree default against ThinLTO. A statically linked Mac stage 2 (`LLVM_LINK=static`, 94 MB) builds a program through ThinLTO with
+Homebrew off the PATH.
+
+**Recommendation.** ThinLTO in process now gives whole-program run time (the compiler within 1% of whole-program, the cutter within
+8 to 13%) for half of whole-program's cold wall on the compiler, and an edit costs one backend plus the front end. Its costs: 2.5x the
+cold CPU of the default build, 1.4x the peak memory, executables about 1.7x the default's (1.1x whole-program's), a C++ compiler in the
+build of fibc, 4.7 MB of LTO and Polly in the static fibc, and the 4 to 7 s of thin link on a no-change compiler build.
+1. Make `FIB_LIRO_THIN=1` the default for executables built with the cache on, with `FIB_LIRO_SPLIT=ns2` as its partition: it removes
+   the 1.3x to 3.6x run-time penalty of the default unit build (ADR 0024's open question) at the cost of a second or two of CPU on small
+   programs. Keep the module-hash-free key and the content-named constants: without them an edit is a cold link.
+2. Keep release builds whole-program (unchanged), and the bootstrap's partitioned `i80` build until a full gate has run with a
+   ThinLTO-built F (this branch only checked that a ThinLTO-built compiler emits the same lIR, on both platforms).
+3. Not done: the shim's own tests in the gate (a case directory built through `FIB_LIRO_THIN=1`, and a planted change to the key that
+   must make a stale object fail), and a Windows/COFF check.
+Scripts and logs: `/tank/data/fibber-scratch/thin2/` (`cutbuilds.sh`, `compbuilds.sh`, `edits.sh`, `case1.sh`, `mac-case.sh`, `logs/`).

@@ -41,8 +41,9 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_SPLIT` | [compiler/native/liro/partition.fib:84](../../compiler/native/liro/partition.fib#L84) |
 | `FIB_LIRO_STATS` | [compiler/fibc.fib:81](../../compiler/fibc.fib#L81) |
 | `FIB_LIRO_THIN` | [compiler/native/liro/context.fib:34](../../compiler/native/liro/context.fib#L34) |
-| `FIB_LIRO_THIN_JOBS` | [compiler/native/liro/build.fib:28](../../compiler/native/liro/build.fib#L28) |
-| `FIB_LIRO_THIN_PLUGIN` | [compiler/native/liro/build.fib:26](../../compiler/native/liro/build.fib#L26) |
+| `FIB_LIRO_THIN_IMPORT` | [compiler/native/liro/thin.fib:34](../../compiler/native/liro/thin.fib#L34) |
+| `FIB_LIRO_THIN_JOBS` | [compiler/native/liro/thin.fib:38](../../compiler/native/liro/thin.fib#L38) |
+| `FIB_LIRO_THIN_REPORT` | [compiler/native/liro/thin.fib:38](../../compiler/native/liro/thin.fib#L38) |
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:39](../../compiler/native/liro/partition.fib#L39) |
 | `FIB_LIVE` | [compiler/driver/testlive.fib:89](../../compiler/driver/testlive.fib#L89) |
 | `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:223](../../compiler/serve/livesess.fib#L223) |
