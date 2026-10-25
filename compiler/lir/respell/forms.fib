@@ -16,7 +16,8 @@
 
 (defun item-head? :private (h: str) -> bool
   (or (= h "define") (= h "declare") (= h "declare-global") (= h "defstruct") (= h "global") (= h "constant") (= h "target") (= h "ownership")
-      (= h "define-macro") (= h "require-macros") (= h "import") (= h "begin")
+      (= h "define-macro") (= h "require-macros") (= h "import") (= h "begin") (= h "dependent-library")
+      (= h "macro-import") (= h "module-macro") (= h "include")
       (= h "define-reader-macro") (= h "define-dispatch-macro") (= h "define-token-reader")))
 
 ;; A word that heads no instruction or literal: a modifier, a convention, a type's head, a flag, an ordering, a predicate, an option, an
@@ -65,11 +66,16 @@
 (defun cc-word? :private (w: str) -> bool
   (or (= w "ccc") (= w "tailcc") (= w "kernelcc") (= w "preservemost")))
 
-;; The leading modifier words (and a convention word after them) respelled; the index of the first item after them.
+;; Whether the form is `(export-name ..)`, the one modifier that is a list (spec/lir.md 4.3).
+(defun export-name? :private (wk: Walk f: RForm) -> bool
+  (= (word-of wk (nth-or-empty (items-of f) 0)) "export-name"))
+
+;; The leading modifier words and `(export-name "NAME")` (and a convention word after them) respelled; the index of the first item after them.
 (defun modifiers! :private (wk: Walk items: (Vec RForm) from: i64) -> i64
   (loop ((i from))
     (let ((w (if (< i (count items)) (word-of wk (nth items i)) "")))
       (cond (modifier-word? w) (do (kw! wk (nth items i)) (recur (+ i 1)))
+            (export-name? wk (nth-or-empty items i)) (do (kw! wk (nth (items-of (nth items i)) 0)) (recur (+ i 1)))
             (cc-word? w) (do (kw! wk (nth items i)) (+ i 1))
             :else i))))
 
@@ -102,7 +108,7 @@
         (or (= h "define-reader-macro") (= h "define-dispatch-macro")) (each-from wk items 3 block!)
         (= h "define-token-reader") (each-from wk items 2 block!)
         (= h "begin") (each-from wk items 1 item!)
-        (or (= h "require-macros") (= h "import")) ()
+        (or (= h "require-macros") (= h "import") (= h "dependent-library") (= h "macro-import") (= h "module-macro") (= h "include")) ()
         :else (each-from wk items 1 generic!)))
 
 (defun ptype! :private (wk: Walk f: RForm) -> unit
