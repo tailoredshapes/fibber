@@ -1,0 +1,88 @@
+;; compiler/llvm/thinlto.fib: in-process ThinLTO, through the C++ shim compiler/llvm/thinlto.cpp (FIB_LIRO_THIN=1,
+;; docs/design/compile-performance.md). LLVM-C can neither write a module summary nor run a ThinLTO link; the shim does both with the C++
+;; API of the LLVM fibc links (the thin link's analyses and lto::thinBackend, libLLVMLTO), so no linker plugin and no libLTO are needed,
+;; on ELF and Mach-O.
+;;
+;; fibc names no symbol of the shim: the shim registers its functions with LLVM's process symbol table when fibc starts, and they are
+;; found here by name (LLVMSearchForAddressOfSymbol); a fibc linked without the shim has none and `available?` is false. A function of
+;; the shim has the shape of a `bsearch` comparison, so it is called through libc's bsearch over one element (fibber cannot call an
+;; address; native.call reaches its own shim the same way); its first argument is a block of words, the request and the results.
+(ns llvm.thinlto (:require [llvm.ffi :as ffi] [llvm.support :as support]))
+
+(extern bsearch :private (ptr ptr i64 i64 ptr) -> ptr)
+
+(def unavailable: str "FIB_LIRO_THIN=1: this fibc was linked without the ThinLTO shim (compiler/llvm/thinlto.cpp; `make` links it, scripts/thinlto-shim.sh)")
+
+;; The address of the shim's function `name`, 0 when it is not linked in.
+(defun entry :private (name: str) -> i64
+  (let ((n (ffi/bytes-new name)))
+    (unsafe (let ((a (support/LLVMSearchForAddressOfSymbol n))) (do (free n) a)))))
+
+;; Whether this fibc has the shim.
+(defun available? () -> bool (!= (entry "fib_thinlto_link") 0))
+
+;; A request block of `n` words, zero.
+(defun block-new :private (n: i64) -> ptr
+  (unsafe (let ((p (alloc (* 8 n)))) (do (dotimes (i n) (store-i64 (ptr+ p (* 8 i)) 0)) p))))
+
+(defun word :private (b: ptr i: i64) -> i64 (unsafe (load-i64 (ptr+ b (* 8 i)))))
+(defun word! :private (b: ptr i: i64 v: i64) -> unit (unsafe (store-i64 (ptr+ b (* 8 i)) v)))
+
+;; Calls the shim's function at `addr` with the block `b`.
+(defun invoke :private (addr: i64 b: ptr) -> unit
+  (unsafe (do (bsearch b b 1 8 (ffi/addr->ptr addr)) ())))
+
+;; The message at address `a` (the shim's, malloc'd), freed.
+(defun take-text :private (a: i64) -> str
+  (let ((s (ffi/c-string-at a))) (do (ffi/free-addr a) s)))
+
+;; The `n` bytes at address `a` (the shim's, malloc'd) as an array; the block is freed.
+(defun take-bytes :private (a: i64 n: i64) -> (Array i8)
+  (let ((p (ffi/addr->ptr a)) (c (cell (array n 0i8))))
+    (unsafe (do (dotimes (i n) (array-set! &c i (load-i8 (ptr+ p i)))) (free p) @c))))
+
+;; The ThinLTO bitcode of the module `m` (an LLVMModuleRef, after `thinlto-pre-link<On>`): the module with its summary and its hash.
+(defun summary-bitcode (m: i64) -> (Result (Array i8) str)
+  (let ((addr (entry "fib_thinlto_summary")))
+    (if (= addr 0)
+        (Err unavailable)
+        (let ((b (block-new 4)))
+          (do (word! b 0 m)
+              (invoke addr b)
+              (let ((r (if (!= (word b 3) 0) (Err (take-text (word b 3))) (Ok (take-bytes (word b 1) (word b 2))))))
+                (do (unsafe (free b)) r)))))))
+
+;; C strings for `xs`, as an array of their addresses; `strings-free` frees them all.
+(defun strings-new :private (xs: (Vec str)) -> ptr
+  (ffi/words-new (mapv (fn (s: str) (ffi/ptr->addr (ffi/bytes-new s))) xs)))
+(defun strings-free :private (p: ptr n: i64) -> unit
+  (do (dotimes (i n) (ffi/free-addr (word p i))) (unsafe (free p))))
+
+;; The `n` strings of the shim's malloc'd array at address `a`, freed.
+(defun take-strings :private (a: i64 n: i64) -> (Vec str)
+  (let ((p (ffi/addr->ptr a)))
+    (let ((xs (mapv (fn (i: i64) (take-text (word p i))) (vec (range n)))))
+      (do (unsafe (free p)) xs))))
+
+;; What to link: the units' bitcode files, the symbols to keep (their IR names: the program's external definitions), the target machine
+;; (an LLVMTargetMachineRef) and -O level, the cache directory ("" for none), the directory for the objects, backend threads (0: LLVM's
+;; default), the import threshold (-1: LLVM's default), a report file ("" for none).
+(defstruct Link (units: (Vec str) keep: (Vec str) tm: i64 opt: i64 cache: str out: str jobs: i64 import-limit: i64 report: str))
+
+;; The objects of a link, in the order of the units, and how many backends ran (the rest came from the cache).
+(defstruct Linked (objects: (Vec str) ran: i64))
+
+;; The thin link and the backends of `l`, in this process.
+(defun link (l: Link) -> (Result Linked str)
+  (let ((addr (entry "fib_thinlto_link")))
+    (if (= addr 0)
+        (Err unavailable)
+        (let ((b (block-new 14)) (n (count (. l units))) (k (count (. l keep)))
+              (units (strings-new (. l units))) (keep (strings-new (. l keep)))
+              (texts (strings-new [(. l cache) (. l out) (. l report)])))
+          (do (word! b 0 n) (word! b 1 (ffi/ptr->addr units)) (word! b 2 k) (word! b 3 (ffi/ptr->addr keep))
+              (word! b 4 (. l tm)) (word! b 5 (. l opt)) (word! b 6 (word texts 0)) (word! b 7 (word texts 1))
+              (word! b 8 (. l jobs)) (word! b 9 (. l import-limit)) (word! b 10 (word texts 2))
+              (invoke addr b)
+              (let ((r (if (!= (word b 11) 0) (Err (take-text (word b 11))) (Ok (Linked (take-strings (word b 12) n) (word b 13))))))
+                (do (strings-free units n) (strings-free keep k) (strings-free texts 3) (unsafe (free b)) r)))))))

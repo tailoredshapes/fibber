@@ -39,12 +39,16 @@ else
 endif
 LLVM_STATIC_DIR := $(BUILD)/llvm-static
 LLVM_STATIC_ARGS := $(LLVM_STATIC_DIR)/args
+# The ThinLTO shim (compiler/llvm/thinlto.cpp, scripts/thinlto-shim.sh: FIB_LIRO_THIN=1's summary writer and in-process thin link): its
+# -L/-l words come before LLVM's in every link of a stage 2. THINLTO_SHIM=off leaves it out (the stage 2 builds; FIB_LIRO_THIN=1 refuses).
+THINLTO_DIR := $(BUILD)/thinlto
+THINLTO_ARGS := $(THINLTO_DIR)/args
 ifeq ($(LLVM_LINK),static)
-  LLVM_ARGS = $$(cat $(LLVM_STATIC_ARGS))
-  LLVM_DEP := $(LLVM_STATIC_ARGS)
+  LLVM_ARGS = $$(cat $(THINLTO_ARGS)) $$(cat $(LLVM_STATIC_ARGS))
+  LLVM_DEP := $(THINLTO_ARGS) $(LLVM_STATIC_ARGS)
 else ifeq ($(LLVM_LINK),shared)
-  LLVM_ARGS := -L $(LLVM_LIBDIR) -l LLVM-21
-  LLVM_DEP :=
+  LLVM_ARGS = $$(cat $(THINLTO_ARGS)) -L $(LLVM_LIBDIR) -l LLVM-21
+  LLVM_DEP := $(THINLTO_ARGS)
 else
   $(error LLVM_LINK is shared or static, not $(LLVM_LINK))
 endif

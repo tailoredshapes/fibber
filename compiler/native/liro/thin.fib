@@ -1,0 +1,45 @@
+;; The thin link of a FIB_LIRO_THIN=1 build (docs/design/compile-performance.md): each unit was cached as ThinLTO bitcode with its summary
+;; (native.aot `aot-emit-thin`); here the shim (llvm.thinlto) imports across the units, runs the rest of the pipeline and generates one
+;; ordinary object per unit, in this process, so `cc` links them as it links the default build's (no linker plugin, no libLTO).
+(ns native.liro.thin
+  (:use lir.ast native.error native.liro.context)
+  (:require [native.target :as target] [llvm.thinlto :as thinlto] [native.liro.hash :as hash] [native.timing :as timing]))
+
+;; The symbols the link keeps: the program's external definitions, as whole-program keeps them (a unit's other definitions are external
+;; only so that the units can name one another; the thin link internalises those no other unit imports).
+(defun kept (m: LModule) -> (Vec str)
+  (vec (keep (fn (it: LItem)
+               (match it
+                 ((ItDefine f) (if (= (. (. f mods) linkage) LkExternal) (some (. f name)) nil))
+                 ((ItGlobal g) (if (= (. (. g mods) linkage) LkExternal) (some (. g name)) nil))
+                 (_ nil)))
+             (. m items))))
+
+(defun env-int :private (name: str default: i64) -> i64
+  (match (sys-getenv name) ((some s) (unwrap-or (parse-long s) default)) (nil default)))
+
+;; The cache of the backends' objects: under the liro cache, in a directory per contract (the compiler, LLVM, target and settings that
+;; the unit keys hold) and import threshold, so that a different fibc never reuses an object; "" when the cache is off. Within it, the
+;; entry is the digest of the unit as its backend reads it, after the importing (compiler/llvm/thinlto.cpp `backendKey`).
+(defun cache-dir :private (c: LiroContext limit: i64) -> (Result str LairError)
+  (if (= (. c cache) "")
+      (Ok "")
+      (try-let [d (error-result (hash/text-digest (str (. c contract) "thin-import=" limit "\n") (. c scratch)))]
+        (Ok (str (. c cache) "/thinlto/" d)))))
+
+;; The objects of the units' bitcode files `units`, in their order. FIB_LIRO_THIN_JOBS backend threads (default: LLVM's, one per core),
+;; FIB_LIRO_THIN_IMPORT the import threshold (default: LLVM's, 100 instructions), FIB_LIRO_THIN_REPORT=FILE the imports of each unit
+;; (compiler/llvm/thinlto.cpp); FIB_LIRO_STATS=1 says how many backends ran.
+(defun link-objects (c: LiroContext original: LModule units: (Vec str) opt: i64) -> (Result (Vec str) LairError)
+  (let ((limit (env-int "FIB_LIRO_THIN_IMPORT" -1)))
+    (try-let [cache (cache-dir c limit) host (target/machine-target opt)]
+      (let ((t (timing/started))
+            (r (thinlto/link (thinlto/Link units (kept original) (. host tm) opt cache (str (. c scratch) "/thin")
+                                           (env-int "FIB_LIRO_THIN_JOBS" 0) limit (unwrap-or (sys-getenv "FIB_LIRO_THIN_REPORT") "")))))
+        (do (target/machine-dispose host)
+            (timing/report "liro.thinlink" t)
+            (match r
+              ((Err m) (Err (ErrBackend m)))
+              ((Ok l) (do (when (= (sys-getenv "FIB_LIRO_STATS") (some "1"))
+                            (eprintln (str "liro: thin backends=" (. l ran) " of " (count units))))
+                          (Ok (. l objects))))))))))

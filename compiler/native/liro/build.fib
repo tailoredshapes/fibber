@@ -3,7 +3,7 @@
   (:use lir.ast native.error native.liro.context)
   (:require [native.aot :as aot] [native.target :as target] [native.link :as link]
             [native.liro.compile :as compile] [native.liro.partition :as partition]
-            [native.liro.contract :as contract] [native.timing :as timing] [native.liro.parallel :as par] [llvm.target :as lt]))
+            [native.liro.contract :as contract] [native.timing :as timing] [native.liro.parallel :as par] [native.liro.thin :as thin]))
 
 (defun eligible? () -> bool
   (and (or (par/opted-in?) (not (= (sys-getenv "FIB_LIRO_CACHE") (some "off"))))
@@ -14,19 +14,11 @@
     (let ((units (if (= (sys-getenv "FIB_LIRO_MODE") (some "whole")) [m] (partition/modules-to-compile m))))
     (let ((result (match (compile-units c m units (. opts opt-level))
                     ((Err e) (Err e))
-                    ((Ok objects) (let ((t (timing/started))
-                                    (r (link/link-paths-with (thin-args c (. opts opt-level)) objects path dirs (. opts libs))))
-                                (do (timing/report "link" t) r))))))
+                    ((Ok compiled) (try-let [objects (if (thin?) (thin/link-objects c m compiled (. opts opt-level)) (Ok compiled))]
+                                     (let ((t (timing/started))
+                                           (r (link/link-paths objects path dirs (. opts libs))))
+                                       (do (timing/report "link" t) r)))))))
       (do (context-close c) result)))))
-
-;; The ThinLTO spike's link: LLVM's gold plugin (GNU ld loads it too) imports across the units, finishes the pipeline and generates code,
-;; with its cache beside the unit cache. FIB_LIRO_THIN_PLUGIN names the plugin, FIB_LIRO_THIN_JOBS its backend threads (default 6).
-(defun thin-args (c: LiroContext opt: i64) -> (Vec str)
-  (if (not (thin?)) []
-      (let ((plugin (unwrap-or (sys-getenv "FIB_LIRO_THIN_PLUGIN") "/usr/lib/llvm-21/lib/LLVMgold.so"))
-            (base [(str "-Wl,-plugin," plugin) (str "-Wl,-plugin-opt=O" (max 1 (min opt 3))) (str "-Wl,-plugin-opt=mcpu=" (lt/host-cpu-name))
-                   (str "-Wl,-plugin-opt=jobs=" (unwrap-or (sys-getenv "FIB_LIRO_THIN_JOBS") "6"))]))
-        (if (= (. c cache) "") base (conj base (str "-Wl,-plugin-opt=cache-dir=" (. c cache) "/thinlto"))))))
 
 (defun compile-units (c: LiroContext original: LModule units: (Vec LModule) opt: i64) -> (Result (Vec str) LairError)
   (try-let [_ (error-result (contract/validate-units original (partition/validation-units original units)))]

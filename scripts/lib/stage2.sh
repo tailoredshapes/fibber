@@ -39,14 +39,18 @@ pick_builder() {
   llvm_link_args
 }
 
-# Sets LLVM_ARGS: the `-L`/`-l` words that link LLVM into a stage 2, by LLVM_LINK (shared or static).
+# Sets LLVM_ARGS: the `-L`/`-l` words that link LLVM into a stage 2, by LLVM_LINK (shared or static), after those of the ThinLTO shim
+# (scripts/thinlto-shim.sh; THINLTO_SHIM=off leaves it out).
 llvm_link_args() {
-  local libdir=${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}
+  local libdir=${LLVM_LIBDIR:-/usr/lib/llvm-21/lib} thin
+  thin=$("$root/scripts/thinlto-shim.sh" "$GATE_OUT/thinlto") || return 2
   case ${LLVM_LINK:-shared} in
     shared) LLVM_ARGS=(-L "$libdir" -l LLVM-21) ;;
     static) read -r -a LLVM_ARGS < <("$root/scripts/llvm-static.sh" "$GATE_OUT/llvm-static") || return 2 ;;
     *) echo "stage2.sh: LLVM_LINK is shared or static, not ${LLVM_LINK}" >&2; return 2 ;;
   esac
+  # shellcheck disable=SC2206
+  LLVM_ARGS=($thin "${LLVM_ARGS[@]}")
 }
 
 # SLOTS_SH runs a command under a slot of the gate's budget (scripts/lib/slots.sh); without GATE_SLOTS it just runs it

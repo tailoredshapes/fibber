@@ -67,4 +67,7 @@ $(BUILD)/version.ok: VERSION compiler/driver/version.fib scripts/check-version.s
 # The merged static LLVM (scripts/llvm-static.sh): an ld script on Linux, a libtool archive on macOS; `args` holds the -L/-l words.
 $(LLVM_STATIC_ARGS): scripts/llvm-static.sh
 	mkdir -p $(@D) && scripts/llvm-static.sh $(@D) > $@.new && mv $@.new $@
+# The ThinLTO shim's object and the -L/-l words that link it whole (scripts/thinlto-shim.sh).
+$(THINLTO_ARGS): compiler/llvm/thinlto.cpp scripts/thinlto-shim.sh
+	mkdir -p $(@D) && scripts/thinlto-shim.sh $(@D) > $@.new && mv $@.new $@
 .PHONY: F fixed-point runtime
