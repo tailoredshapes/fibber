@@ -5,7 +5,8 @@
   (:require [fib.string :as s] [llvm.ffi :as ffi] [native.imports :as imports] [lir.dump :as dump] [lir.print :as lprint] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
-            [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
+            [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries]
+            [lir.words :as words])
   (:use lir.ast lir.types))
 
 (extern exit :private (i32) -> unit)
@@ -21,6 +22,7 @@
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
   lair expand FILE.lir            ; the module with its macros expanded, as lIR text (for a backend with no compile-time runtime)
+  lair words                      ; the words of lIR: TEXT and canonical name, one per line (lir.words)
   lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
   lair fuzz-one [-O n] FILE.lir")
@@ -65,6 +67,13 @@
         (match (imports/load-program src (nth rest 0))
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok p) (do (print-raw (lprint/print-module (. p module))) (Ok 0)))))))
+
+;; `words`: the table of lir.words, `TEXT name` per line.
+(defun words-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (empty? rest))
+      (Err usage)
+      (do (doseq [wd (words/words-table)] (println (str (. wd text) " " (. wd name))))
+          (Ok 0))))
 
 ;; The canonical text of the parsed program (docs/design/lair-ast-dump.md): the module with its macros expanded and its imports joined to
 ;; it (spec/lir.md 4.7); it parses but does not check the module itself (an imported module is checked as it is loaded).
@@ -285,6 +294,7 @@
               (= cmd "emit-llvm") (emit-llvm-cmd rest)
               (= cmd "dump-ast") (dump-ast-cmd rest)
               (= cmd "expand") (expand-cmd rest)
+              (= cmd "words") (words-cmd rest)
               (= cmd "cases") (cases-cmd rest)
               (= cmd "fuzz-one") (fuzz-one-cmd rest)
               (= cmd "fuzz") (fuzz/fuzz-cmd rest)

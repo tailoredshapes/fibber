@@ -1,0 +1,84 @@
+;; compiler/lir/words.fib: the one table of the words lIR owns (spec/lir.md section 2, "Spelling"): every item head, instruction head,
+;; modifier, type word, literal head and flag, as the AST names it (its canonical name: lower case, what lir.ast, lir.intrin, the checker
+;; and the backends compare) and as the text spells it (upper case: `ADD`, `ATOMIC-LOAD`, `ACQ_REL`; a few respelled: `fn` is
+;; `FUNCTION`). The parser, the printer, the name and label rules and the macro name check are to read it (the respelling's step 2), so
+;; that a word is added here and nowhere else; compiler/tests/lir/words.sh holds the table equal to the upper-case atoms of
+;; the spec's grammar.
+
+(ns lir.words
+  (:require [fib.string :as s]))
+
+;; The canonical names, grouped as spec/lir.md presents them. The text of each is its upper case unless `respelled` says otherwise.
+(def names: (Vec str)
+  [;; items (section 4), the reader settings and classes (4.8), the ownership form's fields (6.14.6) and the target form's (4.5)
+   "define" "declare" "declare-global" "defstruct" "global" "constant" "target" "ownership" "block" "let"
+   "define-macro" "require-macros" "import" "begin" "define-reader-macro" "define-dispatch-macro" "define-token-reader"
+   "define-reader-class" "define-reader-depth" "whitespace" "constituent" "terminating"
+   "retain" "release" "unique" "alloc" "stack-init" "stack-end" "header" "cpu" "features"
+   ;; modifiers (4.3, 6.9a, 6.14.4, 6.14.5) and calling conventions (4.2, 6.6b, 6.9a)
+   "private" "internal" "external" "hidden" "inline" "noinline" "cold" "shared" "unsafe" "mutable"
+   "ccc" "tailcc" "kernelcc" "preservemost"
+   ;; types (section 2): the scalars, the heads of the spelled types, the parameter kind, the function type
+   "i1" "i8" "i16" "i32" "i64" "float" "double" "ptr" "void" "addrspace" "struct" "literal-struct" "array" "vector" "owned" "fn"
+   ;; literals (section 3)
+   "null" "inf" "nan" "string" "zeroinitializer"
+   ;; arithmetic, bitwise, comparison, select, conversion, vector and aggregate instructions (6.1 to 6.4)
+   "add" "sub" "mul" "sdiv" "udiv" "srem" "urem" "fadd" "fsub" "fmul" "fdiv" "frem" "fneg" "and" "or" "xor" "shl" "lshr" "ashr" "ctpop"
+   "sadd-overflow" "ssub-overflow" "smul-overflow" "icmp" "fcmp" "select"
+   "trunc" "zext" "sext" "fptrunc" "fpext" "fptosi" "fptoui" "sitofp" "uitofp" "ptrtoint" "inttoptr" "bitcast" "fptosi-sat" "fptoui-sat"
+   "extractelement" "insertelement" "shufflevector" "extractvalue" "insertvalue"
+   ;; predicates (6.2)
+   "eq" "ne" "slt" "sle" "sgt" "sge" "ult" "ule" "ugt" "uge" "oeq" "one" "olt" "ole" "ogt" "oge" "ord" "ueq" "une" "uno"
+   ;; the intrinsic forms (6.1, 6.4, 6.5, 6.6a, 6.6b, 6.9a; lir.intrin has their classes)
+   "fma" "fmuladd" "fsqrt" "fabs" "ffloor" "fceil" "ftrunc" "fround" "froundeven" "fcopysign" "fmin" "fmax" "fminnum" "fmaxnum"
+   "smin" "smax" "umin" "umax" "abs" "cttz" "ctlz"
+   "reduce-add" "reduce-mul" "reduce-and" "reduce-or" "reduce-xor" "reduce-smin" "reduce-smax" "reduce-umin" "reduce-umax"
+   "reduce-fadd" "reduce-fmul" "reduce-fmin" "reduce-fmax" "reduce-fminnum" "reduce-fmaxnum"
+   "masked-load" "masked-store" "gather" "scatter" "shfl-down" "shfl-up" "shfl-xor" "shfl-idx" "ballot"
+   "spin-hint" "cache-line" "stack-addr" "assume"
+   ;; flags: fast-math (6.1) and the facts (6.13)
+   "reassoc" "contract" "arcp" "afn" "nsz" "nsw" "nuw"
+   ;; memory (6.5) and its options, the ownership access words (6.14.3)
+   "alloca" "load" "store" "getelementptr" "volatile" "align" "inbounds" "range" "copy" "borrow" "take" "init" "assign"
+   ;; atomics (6.6): the forms, the scope and weak flags, the orderings and the atomicrmw operations
+   "atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence" "singlethread" "weak"
+   "unordered" "monotonic" "acquire" "acq_rel" "seq_cst" "xchg" "nand" "max" "min"
+   ;; control (6.7, 6.8, 6.9, 6.9a)
+   "ret" "br" "switch" "unreachable" "trap" "barrier" "sreg" "phi" "call" "tailcall" "indirect-call" "indirect-tailcall"
+   ;; the ownership forms (6.14.3)
+   "copy-value" "destroy-value" "is-unique" "alloc-object" "alloc-stack" "dealloc-stack" "addrspacecast"])
+
+;; The words whose text is not their upper case: LLVM's own spelling where lIR had abbreviated it (spec/lir.md 2, 4.3, 6.6b).
+(def respelled: (Map str str) {"fn" "FUNCTION" "inline" "ALWAYSINLINE" "preservemost" "PRESERVE_MOSTCC"})
+
+(defstruct Word (name: str text: str))
+
+(defun text-of-name :private (n: str) -> str
+  (match (get respelled n) ((some t) t) (nil (s/upper-case n))))
+
+;; The table: every word with its canonical name and its text, in the order of `names`.
+(def table: (Vec Word) (mapv (fn (n: str) (Word n (text-of-name n))) names))
+
+(def by-text: (Map str str) (reduce (fn (m: (Map str str) w: Word) (assoc m (. w text) (. w name))) {} table))
+(def by-name: (Map str str) (reduce (fn (m: (Map str str) w: Word) (assoc m (. w name) (. w text))) {} table))
+
+(defun words-table () -> (Vec Word) table)
+
+;; ---------------------------------------------------------------- lookups
+
+;; Whether the first byte of `text` is an upper-case ASCII letter: no word's text starts otherwise, so a lower-case atom skips the map.
+(defun upper-first? :private (text: str) -> bool
+  (and (> (str-len text) 0)
+       (let ((b (zext i64 (str-byte-at text 0)))) (and (>= b 65) (<= b 90)))))
+
+;; The canonical name of the word `text` spells (`ADD` is `add`); nil for an atom that is not a word, which is then a name.
+(defun keyword-of (text: str) -> (Option str)
+  (if (upper-first? text) (get by-text text) nil))
+
+;; The text of the canonical name `name`, which the printer writes; a name that is no word comes back as it is.
+(defun word-text (name: str) -> str
+  (match (get by-name name) ((some t) t) (nil name)))
+
+;; Whether `text` is the text of a word, which is no name and no label (`reserved word ADD used as a name`).
+(defun word-text? (text: str) -> bool
+  (and (upper-first? text) (contains? by-text text)))

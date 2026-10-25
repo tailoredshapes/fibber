@@ -135,6 +135,8 @@ tool_sh-emit-facts := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/emit/facts/check.sh $(
 # the facts of lIR (spec/lir.md 6.13): cases/lir/facts and facts-verify through lairf in the three check modes, the trap mode's controls, and
 # lir2c and lir2js on lIR that carries facts
 tool_sh-native-facts := env LLVMLIB=$(LLVM_LIBDIR) $(T)/native/facts.sh $(F_ABS) | $(T)/native/facts.sh $(wildcard cases/lir/facts/*) $(wildcard cases/lir/facts-verify/*) $(wildcard compiler/lir/*.fib compiler/lir/*/*.fib) $(wildcard compiler/native/lower/*.fib) compiler/native/lower.fib compiler/llvm/metadata.fib compiler/c/module.fib compiler/js/module.fib compiler/native/cases/header.fib compiler/native/cases/verdict.fib
+# the words of lIR (spec/lir.md 2): compiler/lir/words.fib's table equal to the upper-case atoms of the spec's grammar
+tool_sh-lir-words := $(T)/lir/words.sh $(F_ABS) | $(T)/lir/words.sh compiler/lir/words.fib compiler/native/cli.fib spec/lir.md
 tool_sh-native-a64-sibcall := $(T)/native/a64-sibcall.sh $(F_ABS) | $(T)/native/a64-sibcall.sh cases/lir/instr/stackargs-sibcall.lir $(wildcard compiler/native/lower/*.fib)
 tool_sh-harness-proto-run := $(T)/harness-proto/run.sh | $(wildcard $(T)/harness-proto/*) $(wildcard $(T)/harness-proto/cases/*)
 tool_lsp-unit := env LSP_UNIT_OUT=$(TOOLS_OUT)/lsp-unit $(T)/lsp/run.sh | $(wildcard $(T)/lsp/*) $(wildcard $(T)/lsp/fix/*) $(wildcard compiler/lsp/*.fib)
@@ -164,7 +166,7 @@ TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootou
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-shared sh-driver-host-threads sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-mt sh-live-leak sh-live-stackcheck sh-shared-stackcheck sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
   $(PERSIST_STAMPS) sh-emit-resume sh-expand-fuseinline sh-emit-clospec sh-emit-vecfast sh-emit-fnattrs sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
-  sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-facts sh-emit-facts sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
+  sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-facts sh-lir-words sh-emit-facts sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))
 after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1)),$(call after_bar,$(wordlist 2,999999,$(1)))),)
