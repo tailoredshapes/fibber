@@ -2,7 +2,7 @@
 ;; Errors are the Rust's strings (the caller prints them on standard error and exits 1). `fuzz` is package F's (native.fuzz).
 
 (ns native.cli
-  (:require [fib.string :as s] [llvm.ffi :as ffi] [lir.parse :as parse] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
+  (:require [fib.string :as s] [llvm.ffi :as ffi] [native.macros :as macros] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
             [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
@@ -20,7 +20,7 @@
   lair link FILE.liro.. -o OUT [-O n] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
-  lair cases DIR..
+  lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
   lair fuzz-one [-O n] FILE.lir")
 
@@ -43,7 +43,7 @@
   (if (not (= (count rest) 1))
       (Err usage)
       (try-let [src (read-src (nth rest 0))
-                _ (rendered (pipe/check-source src) (nth rest 0))]
+                _ (rendered (pipe/check-file src (nth rest 0)) (nth rest 0))]
         (Ok 0))))
 
 (defun emit-llvm-cmd :private (rest: (Vec str)) -> (Result i64 str)
@@ -53,12 +53,12 @@
                 text (rendered (pipe/emit-llvm src (nth rest 0)) (nth rest 0))]
         (do (print text) (Ok 0)))))
 
-;; The canonical text of the parsed module (docs/design/lair-ast-dump.md); it parses but does not check.
+;; The canonical text of the parsed module (docs/design/lair-ast-dump.md), its macros expanded; it parses but does not check.
 (defun dump-ast-cmd :private (rest: (Vec str)) -> (Result i64 str)
   (if (not (= (count rest) 1))
       (Err usage)
       (try-let [src (read-src (nth rest 0))]
-        (match (parse/parse-source src)
+        (match (macros/parse-source src (nth rest 0))
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok m) (do (dump/dump-with m (fn (chunk: str) (print-raw chunk))) (Ok 0)))))))
 
@@ -91,7 +91,7 @@
 ;; JIT-compiles the module and runs `main`; exits with its status (`exit` flushes the C library's buffers, as returning from a C main would).
 (defun execute :private (file: str opt: i64 prog-args: (Vec str) tracing: bool) -> (Result i64 str)
   (try-let [src (read-src file)
-            m (rendered (pipe/for-executable src) file)
+            m (rendered (pipe/for-executable-file src file) file)
             session (rendered (jit/session-new opt) file)
             _ (rendered (jit/session-add-module session file m) file)
             ty (rendered (jit/session-signature session "main") file)
@@ -147,13 +147,13 @@
 (defun build-output :private (b: BuildArgs file: str src: str out: str) -> (Result unit str)
   (let ((opts (aot/AotOptions (. b opt) (. b libs) (. b dirs))))
     (if (. b liro)
-      (try-let [m (rendered (pipe/check-source src) file)
+      (try-let [m (rendered (pipe/check-file src file) file)
                 libs (libraries/lib-words (libraries/declared-libs src))]
         (rendered (liro-file/export-file m out (. b opt) libs) file))
     (match (. b emit)
-      (nil (try-let [m (rendered (pipe/for-executable src) file)]
+      (nil (try-let [m (rendered (pipe/for-executable-file src file) file)]
              (rendered (liro/build-executable m file out opts) file)))
-      ((some kind) (try-let [m (rendered (pipe/check-source src) file)
+      ((some kind) (try-let [m (rendered (pipe/check-file src file) file)
                              bytes (rendered (aot/aot-emit m file kind opts) file)]
                      (match (link/write-bytes out bytes)
                        ((Err e) (Err (str out ": " e)))
@@ -224,13 +224,24 @@
         (println (str-join ["total: " (show (count reports)) " cases, " (show (- (count reports) failed)) " pass, " (show failed) " fail"]))
         (if (= failed 0) 0 1))))
 
+;; `-j N` anywhere in the words: taken out, the number of cases run at a time (else FIB_LAIR_WORKERS or 4).
+(defun take-jobs :private (words: (Vec str)) -> (Result (Pair (Vec str) i64) str)
+  (loop ((i 0) (out []) (jobs (cases/cases-workers)))
+    (cond (>= i (count words)) (Ok (Pair out jobs))
+          (not (= (nth words i) "-j")) (recur (+ i 1) (conj out (nth words i)) jobs)
+          (>= (+ i 1) (count words)) (Err "-j needs a number")
+          :else (match (hdr/parse-i32 (nth words (+ i 1)))
+                  ((some n) (if (> n 0) (recur (+ i 2) out n) (Err (str "bad -j " (nth words (+ i 1))))))
+                  (nil (Err (str "bad -j " (nth words (+ i 1)))))))))
+
 (defun cases-cmd :private (rest: (Vec str)) -> (Result i64 str)
-  (let ((found (cases/cases-collect rest)))
-    (if (empty? found)
-        (Err "no cases found")
-        (try-let [scratch (scratch-dir)]
-          (let ((reports (cases/cases-run-all (fuzz/self-path) found scratch)))
-            (do (remove-scratch scratch) (Ok (summarise reports))))))))
+  (try-let [split (take-jobs rest)]
+    (let ((found (cases/cases-collect (. split fst))))
+      (if (empty? found)
+          (Err "no cases found")
+          (try-let [scratch (scratch-dir)]
+            (let ((reports (cases/cases-run-with (fuzz/self-path) found scratch (. split snd))))
+              (do (remove-scratch scratch) (Ok (summarise reports)))))))))
 
 ;; -------------------------------------------------------------------------------------------------- dispatch
 

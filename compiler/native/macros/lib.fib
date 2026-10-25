@@ -1,0 +1,165 @@
+;; compiler/native/macros/lib.fib: the form library of lIR's macros (spec/lir.md 4.6), as lIR text: compiled once into the macro session
+;; of a module that defines a macro (native.macros `session-new`), and declared in every macro's module (`declares-source`). The object
+;; layout is the spec's: a tag word, the line, the column and the file, then the kind's fields (native.macros.objects reads and writes the
+;; same layout from fibber). Objects are malloc'd and never freed: they live as long as the expansion of the module. The text is in parts
+;; of under 50 lines each (ADR 0006); the whole is `lib-source`.
+(ns native.macros.lib)
+
+;; The library's module.
+(defun lib-source () -> str
+  (str-join [(part-0) "\n" (part-1) "\n" (part-2) "\n" (part-3)]))
+
+;; What a macro's module declares of it (`lir.sexp.failure-take` and `failure-at` are the runner's, not a macro's).
+(defun declares-source () -> str
+  "(declare lir.sexp.tag i64 (ptr))
+(declare lir.sexp.line i64 (ptr))
+(declare lir.sexp.column i64 (ptr))
+(declare lir.sexp.file ptr (ptr))
+(declare lir.sexp.symbol ptr (ptr))
+(declare lir.sexp.string ptr (ptr))
+(declare lir.sexp.integer ptr (i64))
+(declare lir.sexp.float ptr (double))
+(declare lir.sexp.list ptr (i64))
+(declare lir.sexp.push ptr (ptr ptr))
+(declare lir.sexp.count i64 (ptr))
+(declare lir.sexp.nth ptr (ptr i64))
+(declare lir.sexp.bracket i64 (ptr))
+(declare lir.sexp.text ptr (ptr))
+(declare lir.sexp.len i64 (ptr))
+(declare lir.sexp.int i64 (ptr))
+(declare lir.sexp.flt double (ptr))
+(declare lir.sexp.is i1 (ptr ptr))
+(declare lir.sexp.gensym ptr (ptr))
+(declare lir.sexp.fail ptr (ptr ptr))
+")
+
+(defun part-0 :private () -> str
+  ";; lir.sexp: the forms of lIR as objects (spec/lir.md 4.6): what a macro reads and returns, and what a reader macro will return. Every
+;; object starts with (i64 tag) (i64 line) (i64 column) (ptr file).
+(declare malloc ptr (i64))
+(declare realloc ptr (ptr i64))
+(declare memcpy ptr (ptr ptr i64))
+(declare memcmp i32 (ptr ptr i64))
+(declare strlen i64 (ptr))
+(declare snprintf i32 (ptr i64 ptr ...))
+(defstruct lir.sexp (i64 i64 i64 ptr))
+(defstruct lir.sexp.symbol (i64 i64 i64 ptr ptr i64))
+(defstruct lir.sexp.integer (i64 i64 i64 ptr i64))
+(defstruct lir.sexp.float (i64 i64 i64 ptr double))
+(defstruct lir.sexp.string (i64 i64 i64 ptr ptr i64))
+(defstruct lir.sexp.list (i64 i64 i64 ptr ptr i64 i64 i64))
+(global internal lir.sexp.failure.message ptr (ptr null))
+(global internal lir.sexp.failure.at i64 (i64 0))
+(global internal lir.sexp.gensyms i64 (i64 0))
+
+(define (lir.sexp.tag i64) ((ptr s)) (block entry (ret (load i64 s))))
+(define (lir.sexp.line i64) ((ptr s)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp s (i64 0) (i32 1))))))
+(define (lir.sexp.column i64) ((ptr s)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp s (i64 0) (i32 2))))))
+(define (lir.sexp.file ptr) ((ptr s)) (block entry (ret (load ptr (getelementptr %struct.lir.sexp s (i64 0) (i32 3))))))
+
+(define internal (lir.sexp.new ptr) ((i64 tag) (i64 bytes))
+  (block entry
+    (let ((s (call @malloc bytes)))
+      (store tag s)
+      (store (i64 0) (getelementptr %struct.lir.sexp s (i64 0) (i32 1)))
+      (store (i64 0) (getelementptr %struct.lir.sexp s (i64 0) (i32 2)))
+      (store (ptr null) (getelementptr %struct.lir.sexp s (i64 0) (i32 3)))
+      (ret s))))
+")
+
+(defun part-1 :private () -> str
+  "(define internal (lir.sexp.text-new ptr) ((i64 tag) (ptr p) (i64 n))
+  (block entry
+    (let ((s (call @lir.sexp.new tag (i64 48)))
+          (copy (call @malloc (add n (i64 1)))))
+      (call @memcpy copy p n)
+      (store (i8 0) (getelementptr i8 copy n))
+      (store copy (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 4)))
+      (store n (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 5)))
+      (ret s))))
+
+(define (lir.sexp.symbol ptr) ((ptr cstr)) (block entry (ret (call @lir.sexp.text-new (i64 1) cstr (call @strlen cstr)))))
+(define (lir.sexp.string ptr) ((ptr cstr)) (block entry (ret (call @lir.sexp.text-new (i64 4) cstr (call @strlen cstr)))))
+(define (lir.sexp.integer ptr) ((i64 v))
+  (block entry
+    (let ((s (call @lir.sexp.new (i64 2) (i64 40))))
+      (store v (getelementptr %struct.lir.sexp.integer s (i64 0) (i32 4)))
+      (ret s))))
+(define (lir.sexp.float ptr) ((double v))
+  (block entry
+    (let ((s (call @lir.sexp.new (i64 3) (i64 40))))
+      (store v (getelementptr %struct.lir.sexp.float s (i64 0) (i32 4)))
+      (ret s))))
+(define (lir.sexp.list ptr) ((i64 bracket))
+  (block entry
+    (let ((s (call @lir.sexp.new (i64 5) (i64 64))))
+      (store (call @malloc (i64 32)) (getelementptr %struct.lir.sexp.list s (i64 0) (i32 4)))
+      (store (i64 0) (getelementptr %struct.lir.sexp.list s (i64 0) (i32 5)))
+      (store (i64 4) (getelementptr %struct.lir.sexp.list s (i64 0) (i32 6)))
+      (store bracket (getelementptr %struct.lir.sexp.list s (i64 0) (i32 7)))
+      (ret s))))")
+
+(defun part-2 :private () -> str
+  "(define (lir.sexp.push ptr) ((ptr l) (ptr x))
+  (block entry
+    (let ((n (load i64 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 5))))
+          (cap (load i64 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 6)))))
+      (br (icmp eq n cap) grow put)))
+  (block grow
+    (let ((cap2 (mul cap (i64 2)))
+          (items (call @realloc (load ptr (getelementptr %struct.lir.sexp.list l (i64 0) (i32 4))) (mul cap2 (i64 8)))))
+      (store items (getelementptr %struct.lir.sexp.list l (i64 0) (i32 4)))
+      (store cap2 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 6)))
+      (br put)))
+  (block put
+    (let ((items2 (load ptr (getelementptr %struct.lir.sexp.list l (i64 0) (i32 4)))))
+      (store x (getelementptr ptr items2 n))
+      (store (add n (i64 1)) (getelementptr %struct.lir.sexp.list l (i64 0) (i32 5)))
+      (ret l))))
+(define (lir.sexp.count i64) ((ptr l)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 5))))))
+(define (lir.sexp.nth ptr) ((ptr l) (i64 i))
+  (block entry
+    (let ((n (load i64 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 5)))))
+      (br (icmp ult i n) in out)))
+  (block in (ret (load ptr (getelementptr ptr (load ptr (getelementptr %struct.lir.sexp.list l (i64 0) (i32 4))) i))))
+  (block out (ret (ptr null))))
+(define (lir.sexp.bracket i64) ((ptr l)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp.list l (i64 0) (i32 7))))))
+(define (lir.sexp.text ptr) ((ptr s)) (block entry (ret (load ptr (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 4))))))
+(define (lir.sexp.len i64) ((ptr s)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 5))))))
+(define (lir.sexp.int i64) ((ptr s)) (block entry (ret (load i64 (getelementptr %struct.lir.sexp.integer s (i64 0) (i32 4))))))
+(define (lir.sexp.flt double) ((ptr s)) (block entry (ret (load double (getelementptr %struct.lir.sexp.float s (i64 0) (i32 4))))))
+(define (lir.sexp.is i1) ((ptr s) (ptr cstr))
+  (block entry (br (icmp eq (load i64 s) (i64 1)) sym no))
+  (block sym
+    (let ((n (call @strlen cstr)))
+      (br (icmp eq n (load i64 (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 5)))) cmp no)))
+  (block cmp (ret (icmp eq (call @memcmp (load ptr (getelementptr %struct.lir.sexp.symbol s (i64 0) (i32 4))) cstr n) (i32 0))))
+  (block no (ret (i1 0))))")
+
+(defun part-3 :private () -> str
+  "(define (lir.sexp.gensym ptr) ((ptr prefix))
+  (block entry
+    (let ((k (add (load i64 @lir.sexp.gensyms) (i64 1)))
+          (buf (call @malloc (i64 96))))
+      (store k @lir.sexp.gensyms)
+      (call @snprintf buf (i64 96) (string \"%.64s.%lld\") prefix k)
+      (ret (call @lir.sexp.symbol buf)))))
+(define (lir.sexp.fail ptr) ((ptr at) (ptr message))
+  (block entry
+    (store message @lir.sexp.failure.message)
+    (br (icmp eq at (ptr null)) none some))
+  (block some
+    (store (or (shl (load i64 (getelementptr %struct.lir.sexp at (i64 0) (i32 1))) (i64 32)) (load i64 (getelementptr %struct.lir.sexp at (i64 0) (i32 2)))) @lir.sexp.failure.at)
+    (br none))
+  (block none (ret (ptr null))))
+(define (lir.sexp.failure-take ptr) ()
+  (block entry
+    (let ((m (load ptr @lir.sexp.failure.message)))
+      (store (ptr null) @lir.sexp.failure.message)
+      (ret m))))
+(define (lir.sexp.failure-at i64) ()
+  (block entry
+    (let ((p (load i64 @lir.sexp.failure.at)))
+      (store (i64 0) @lir.sexp.failure.at)
+      (ret p))))
+")
