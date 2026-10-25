@@ -1,0 +1,134 @@
+;; compiler/native/macros/objects.fib: the forms a macro is given and the form it returns, as the form objects of spec/lir.md 4.6
+;; (the layout native.macros.lib compiles: a tag word, the line, the column, the file, then the kind's fields). Written and read here from fibber directly,
+;; so that no call crosses into the session per node: the layout is the contract, as the spec states it.
+;;
+;; An atom becomes an integer when it is an integer token that fits a word, a float when it is a float token, else a symbol; a vector type
+;; `<N x T>` is a symbol of that text, and a symbol of that shape reads back as a vector type. Objects are malloc'd (`alloc` is calloc)
+;; and never freed: the session that made them ends with the module's expansion.
+(ns native.macros.objects
+  (:use lir.sexp lir.lit lir.diag)
+  (:require [lir.parse.literal :as lit] [lir.types :as lt] [llvm.ffi :as ffi] [fib.string :as s]))
+
+(def tag-symbol: i64 1)
+(def tag-integer: i64 2)
+(def tag-float: i64 3)
+(def tag-string: i64 4)
+(def tag-list: i64 5)
+
+;; ---------------------------------------------------------------- forms to objects
+
+;; An object of `bytes` zero bytes with its tag, its line and column (lir.diag's one word) and its file (a C string, or null).
+(defun object-new :private (tag: i64 pos: i64 bytes: i64 file: ptr) -> ptr
+  (unsafe (let ((p (alloc bytes)))
+            (do (store-i64 p tag) (store-i64 (ptr+ p 8) (pos-line pos)) (store-i64 (ptr+ p 16) (pos-col pos)) (store-ptr (ptr+ p 24) file) p))))
+
+;; A symbol or a string: a copy of the bytes, a NUL after them, and their count.
+(defun bytes-object :private (tag: i64 bs: (Array i8) pos: i64 file: ptr) -> ptr
+  (let ((n (array-len bs)) (p (object-new tag pos 48 file)))
+    (unsafe
+      (let ((copy (alloc (+ n 1))))
+        (do (dotimes (i n) (store-i8 (ptr+ copy i) (array-get bs i)))
+            (store-ptr (ptr+ p 32) copy)
+            (store-i64 (ptr+ p 40) n)
+            p)))))
+
+(defun text-object :private (tag: i64 text: str pos: i64 file: ptr) -> ptr
+  (bytes-object tag (str-bytes text) pos file))
+
+(defun integer-object :private (v: i64 pos: i64 file: ptr) -> ptr
+  (let ((p (object-new tag-integer pos 40 file))) (do (unsafe (store-i64 (ptr+ p 32) v)) p)))
+
+(defun float-object :private (v: f64 pos: i64 file: ptr) -> ptr
+  (let ((p (object-new tag-float pos 40 file))) (do (unsafe (store-i64 (ptr+ p 32) (f64->bits v))) p)))
+
+;; An atom: an integer token that fits a word, a float token, else a symbol (`@f`, `%struct.s` and names included).
+(defun atom-object :private (text: str pos: i64 file: ptr) -> ptr
+  (match (lit/int-token text)
+    ((some v) (match (lit->i64 v) ((some n) (integer-object n pos file)) (nil (text-object tag-symbol text pos file))))
+    (nil (match (lit/float-value lt/ty-double text pos)
+           ((Ok f) (float-object f pos file))
+           ((Err _) (text-object tag-symbol text pos file))))))
+
+;; A list with its items, a capacity of at least 4 so that `lir.sexp.push` may grow it (realloc).
+(defun list-object :private (bracket: i64 items: (Vec Sexp) pos: i64 file: ptr) -> ptr
+  (let ((n (count items)) (cap (if (< n 4) 4 n)) (p (object-new tag-list pos 64 file)))
+    (unsafe
+      (let ((arr (alloc (* cap 8))))
+        (do (dotimes (i n) (store-ptr (ptr+ arr (* i 8)) (to-object-ptr (nth items i) file)))
+            (store-ptr (ptr+ p 32) arr)
+            (store-i64 (ptr+ p 40) n)
+            (store-i64 (ptr+ p 48) cap)
+            (store-i64 (ptr+ p 56) bracket)
+            p)))))
+
+(defun to-object-ptr :private (f: Sexp file: ptr) -> ptr
+  (match f
+    ((SxAtom text pos) (atom-object text pos file))
+    ((SxStr bs pos) (bytes-object tag-string bs pos file))
+    ((SxList items pos) (list-object 0 items pos file))
+    ((SxBrace items pos) (list-object 1 items pos file))
+    ((SxBracket items pos) (list-object 2 items pos file))
+    ((SxVecType n e pos) (text-object tag-symbol (str "<" n " x " e ">") pos file))))
+
+;; The object of a form read from `file` (a C string, null for none), as the address a macro's entry takes.
+(defun to-object (f: Sexp file: ptr) -> i64
+  (ffi/ptr->addr (to-object-ptr f file)))
+
+;; ---------------------------------------------------------------- objects to forms
+
+(defun word :private (p: ptr off: i64) -> i64
+  (unsafe (load-i64 (ptr+ p off))))
+
+(defun bytes-at :private (p: ptr n: i64) -> (Array i8)
+  (let ((c (cell (array n 0i8))))
+    (do (unsafe (dotimes (i n) (array-set! &c i (load-i8 (ptr+ p i)))))
+        @c)))
+
+;; The bytes of a symbol or a string.
+(defun text-of :private (p: ptr) -> (Array i8)
+  (bytes-at (unsafe (load-ptr (ptr+ p 32))) (word p 40)))
+
+;; A float as a token the reader takes: `inf`, `-inf`, `nan`, else the shortest decimal that reads back to it.
+(defun float-text :private (v: f64) -> str
+  (cond (not (= v v)) "nan"
+        (= v (bits->f64 9218868437227405312)) "inf"
+        (= v (bits->f64 -4503599627370496)) "-inf"
+        :else (show v)))
+
+;; A symbol's text as a form: `<N x T>` is a vector type.
+(defun symbol-form :private (text: str pos: i64) -> Sexp
+  (if (and (> (str-len text) 2) (starts-with? text "<") (s/ends-with? text ">"))
+      (let ((parts (s/split (str-slice text 1 (- (str-len text) 1)) " ")))
+        (if (and (= (count parts) 3) (= (nth parts 1) "x"))
+            (SxVecType (nth parts 0) (nth parts 2) pos)
+            (SxAtom text pos)))
+      (SxAtom text pos)))
+
+;; The form of the object at address `a`; an object with no position (one a macro made) is at `at`, the macro use. The file of an object is
+;; not carried back: a diagnostic's position is in the module's file (lir.diag), which is where every form of a module is until reader macros
+;; bring forms in from elsewhere.
+(defun from-object (a: i64 at: i64) -> (Result Sexp str)
+  (from-ptr (ffi/addr->ptr a) at 0))
+
+(defun from-ptr :private (p: ptr at: i64 depth: i64) -> (Result Sexp str)
+  (if (= (ffi/ptr->addr p) 0)
+      (Err "a null object")
+      (let ((tag (word p 0)) (pos0 (pos-new (word p 8) (word p 16))))
+        (let ((pos (if (= pos0 0) at pos0)))
+          (cond (= tag tag-symbol) (Ok (symbol-form (str-from-bytes (text-of p)) pos))
+                (= tag tag-integer) (Ok (SxAtom (show (word p 32)) pos))
+                (= tag tag-float) (Ok (SxAtom (float-text (bits->f64 (word p 32))) pos))
+                (= tag tag-string) (Ok (SxStr (text-of p) pos))
+                (= tag tag-list) (list-from p pos at depth)
+                :else (Err (str "an object with tag " tag ", which is no s-expression kind")))))))
+
+(defun list-from :private (p: ptr pos: i64 at: i64 depth: i64) -> (Result Sexp str)
+  (if (>= depth max-depth)
+      (Err (str "nesting deeper than " max-depth))
+      (let ((n (word p 40)) (arr (unsafe (load-ptr (ptr+ p 32)))) (bracket (word p 56)))
+        (loop ((i 0) (out []))
+          (if (>= i n)
+              (Ok (cond (= bracket 1) (SxBrace out pos) (= bracket 2) (SxBracket out pos) :else (SxList out pos)))
+              (match (from-ptr (unsafe (load-ptr (ptr+ arr (* i 8)))) at (+ depth 1))
+                ((Err e) (Err e))
+                ((Ok f) (recur (+ i 1) (conj out f)))))))))
