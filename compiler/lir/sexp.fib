@@ -5,8 +5,10 @@
 (ns lir.sexp
   (:use lir.diag lir.types lir.sexp.lexer))
 
-;; Lists nested deeper than this are an error (sexp/mod.rs `MAX_DEPTH`).
-(def max-depth: i64 512)
+;; Forms nested deeper than this are an error, lists and reader macro runs together (sexp/mod.rs `MAX_DEPTH` was 512): the default, which a
+;; module's readtable may change (spec/lir.md 4.8, `define-reader-depth`), and the limit on an object a macro returns.
+(def max-depth: i64 1024)
+(def max-depth-setting: i64 4096)
 
 ;; One form of the source text (sexp/mod.rs `Sexp`).
 (defenum Sexp
@@ -43,11 +45,20 @@
 ;; `token reader`). The host (native.macros.readers) runs an entry: the reader is the stream, and the runner answers the form, nil for no
 ;; form (a discard), or the error.
 (defstruct ReaderEntry (addr: i64 name: str))
-(defstruct Readtable (chars: (Cell (Map i64 ReaderEntry)) dispatch: (Cell (Map i64 ReaderEntry)) token: (Cell (Option ReaderEntry)) active: (Cell bool)))
+(defstruct Readtable (chars: (Cell (Map i64 ReaderEntry)) dispatch: (Cell (Map i64 ReaderEntry)) token: (Cell (Option ReaderEntry)) active: (Cell bool)
+                      classes: Classes depth: (Cell i64)))
 (defstruct Runner (run: (fn (Reader ReaderEntry i64 (Option Sexp)) (Result (Option Sexp) Diagnostic))))
 
 (defun readtable-new () -> Readtable
-  (Readtable (cell (map-empty)) (cell (map-empty)) (cell nil) (cell false)))
+  (Readtable (cell (map-empty)) (cell (map-empty)) (cell nil) (cell false) (classes-new) (cell max-depth)))
+
+;; Sets the class of a character (a Unicode scalar; `class-whitespace`, `class-constituent` or `class-terminating`), and the depth the
+;; reader allows.
+(defun readtable-class! (t: Readtable scalar: i64 class: i64) -> unit
+  (do (classes-set! (. t classes) scalar class) (set! (. t active) true)))
+
+(defun readtable-depth! (t: Readtable n: i64) -> unit
+  (do (set! (. t depth) n) (set! (. t active) true)))
 
 ;; Binds byte `b` to a reader macro, a later binding replacing an earlier; `readtable-bind-dispatch!` the byte after `#`;
 ;; `readtable-token!` the token reader.
@@ -68,13 +79,13 @@
 ;; the stack of forms read and not yet in a list: `stack[0..top)`, and the readtable. A list's items are the forms above its base; closing
 ;; the list moves them, by `array-take!`, into an array of exactly their count (no object counts a form again, and no 32-slot tail is made
 ;; for a list of three).
-(defstruct Reader (lx: Lexer failed: (Cell bool) stack: (Cell (Array Sexp)) top: (Cell i64) table: Readtable))
+(defstruct Reader (lx: Lexer failed: (Cell bool) stack: (Cell (Array Sexp)) top: (Cell i64) table: Readtable depth: (Cell i64)))
 
 ;; The filler of an unused slot of the stack.
 (def filler: Sexp (SxList [] 0))
 
 (defun reader-new :private (src: str table: Readtable) -> Reader
-  (Reader (lexer-new src) (cell false) (cell (array 64 filler)) (cell 0) table))
+  (Reader (lexer-with src (. table classes)) (cell false) (cell (array 64 filler)) (cell 0) table (cell 0)))
 
 ;; Reads every form of `src`; the first lexical or structural error (sexp/reader.rs `read`). A lexical error found anywhere in the text
 ;; wins over a parse error, because lir::parse reads all forms before it parses any, and over a structural error, because the Rust
