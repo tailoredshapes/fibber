@@ -61,9 +61,14 @@
             (store-i64 (ptr+ p 56) bracket)
             p)))))
 
+;; The symbol object of a text, whatever the text: the token reader's argument (spec/lir.md 4.8), and a symbol passed on.
+(defun symbol-object (text: str pos: i64 file: ptr) -> i64
+  (ffi/ptr->addr (text-object tag-symbol text pos file)))
+
 (defun to-object-ptr :private (f: Sexp file: ptr) -> ptr
   (match f
     ((SxAtom text pos) (atom-object text pos file))
+    ((SxSymbol text pos) (text-object tag-symbol text pos file))
     ((SxStr bs pos) (bytes-object tag-string bs pos file))
     ((SxList items pos) (list-object 0 items pos file))
     ((SxBrace items pos) (list-object 1 items pos file))
@@ -95,14 +100,15 @@
         (= v (bits->f64 -4503599627370496)) "-inf"
         :else (show v)))
 
-;; A symbol's text as a form: `<N x T>` is a vector type.
+;; A symbol's text as a form: `<N x T>` is a vector type; anything else is a symbol, which stays one at the next macro boundary whatever
+;; its text (`.5`, `inf` and `1e3` are symbols when a macro made them so, spec/lir.md 4.8).
 (defun symbol-form :private (text: str pos: i64) -> Sexp
   (if (and (> (str-len text) 2) (starts-with? text "<") (s/ends-with? text ">"))
       (let ((parts (s/split (str-slice text 1 (- (str-len text) 1)) " ")))
         (if (and (= (count parts) 3) (= (nth parts 1) "x"))
             (SxVecType (nth parts 0) (nth parts 2) pos)
-            (SxAtom text pos)))
-      (SxAtom text pos)))
+            (SxSymbol text pos)))
+      (SxSymbol text pos)))
 
 ;; The form of the object at address `a`; an object with no position (one a macro made) is at `at`, the macro use. The file of an object is
 ;; not carried back: a diagnostic's position is in the module's file (lir.diag), which is where every form of a module is until reader macros

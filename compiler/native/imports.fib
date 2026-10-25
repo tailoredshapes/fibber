@@ -7,7 +7,7 @@
 ;; the tables are never built for it.
 (ns native.imports
   (:use lir.diag lir.types lir.ast native.imports.program)
-  (:require [native.macros :as macros] [lir.check :as check]))
+  (:require [native.macros :as macros] [native.macros.types :as mt] [native.macros.helpers :as mh] [lir.check :as check] [llvm.ffi :as ffi]))
 
 ;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported,
 ;; and the file whose `ownership` form (spec/lir.md 6.14.6) it took, if any: one per program, as the `target` form.
@@ -36,12 +36,13 @@
   (let ((st (state-new)) (im (imports-new)))
     (let ((r (load-main st im src file)))
       (do (doseq [e @(. st envs)] (macros/env-close e))
+          (ffi/free-addr (. st gensym))
           r))))
 
 ;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle); when it has any,
 ;; checked with their interface, admitted last, and the union made.
 (defun load-main :private (st: State im: Imports src: str file: str) -> (Result Program Diagnostic)
-  (try-let ((p (do (set! (. st loading) (conj @(. st loading) (macros/canonical file))) (parse-with st im src file))))
+  (try-let ((p (do (set! (. st loading) (conj @(. st loading) (mh/canonical file))) (parse-with st im src file))))
     (let ((own (. (. p module) items)))
       (if (empty? @(. st loaded))
           (Ok (Program (. p module) {}))
@@ -51,8 +52,8 @@
             (Ok (Program (LModule (union-items st items)) @(. im hidden))))))))
 
 ;; Reads and expands a module, every `import` of it loaded as it is met; the environment is kept open in the state.
-(defun parse-with :private (st: State im: Imports src: str file: str) -> (Result macros/Parsed Diagnostic)
-  (let ((importer (macros/Importer (fn (env: macros/Env path: str pos: i64) (import-into st im env path pos)))))
+(defun parse-with :private (st: State im: Imports src: str file: str) -> (Result mt/Parsed Diagnostic)
+  (let ((importer (mt/Importer (fn (env: mt/Env path: str pos: i64) (import-into st im env path pos)) (. st gensym))))
     (match (macros/parse-module src file importer)
       ((Err d) (Err d))
       ((Ok p) (do (set! (. st envs) (conj @(. st envs) (. p env))) (Ok p))))))
@@ -60,9 +61,9 @@
 ;; `(import PATH)` at `pos` in the module of `env`: nothing when the module imported the file already; a cycle when the file is being loaded;
 ;; else the module's export, loaded now if it was not, taken into the importer. The file is identified by its canonical path (`key`,
 ;; spec/lir.md 4.7) and named in messages as written (`file`).
-(defun import-into :private (st: State im: Imports env: macros/Env path: str pos: i64) -> (Option Diagnostic)
-  (let ((file (macros/resolve env path)))
-    (let ((key (macros/canonical file)))
+(defun import-into :private (st: State im: Imports env: mt/Env path: str pos: i64) -> (Option Diagnostic)
+  (let ((file (mh/resolve env path)))
+    (let ((key (mh/canonical file)))
       (cond (set-contains? @(. im files) key) nil
             (set-contains? @(. st loading) key) (some (Diagnostic pos (str "import: " file " imports itself")))
             :else (match (match (get @(. st exports) key) ((some e) (Ok e)) (nil (load-module st file key pos)))
@@ -92,7 +93,7 @@
 
 ;; The export of `file` taken into the importing module at the import at `pos`: its interface items there, its internal names remembered,
 ;; its macros defined.
-(defun take-export :private (im: Imports env: macros/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
+(defun take-export :private (im: Imports env: mt/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
   (match (take-ownership im e file pos)
     ((some d) (some d))
     (nil (take-items im env e file key pos))))
@@ -106,7 +107,7 @@
       nil))
 
 ;; The export's items into the importer: the module once (`key`, its canonical path), its names in messages as written (`file`).
-(defun take-items :private (im: Imports env: macros/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
+(defun take-items :private (im: Imports env: mt/Env e: Export file: str key: str pos: i64) -> (Option Diagnostic)
   (do (set! (. im files) (conj @(. im files) key))
       (set! (. im iface) (into @(. im iface) (mapv (fn (it: LItem) (item-at it pos)) (. e iface))))
       (doseq [n (. e hidden)] (set! (. im hidden) (assoc @(. im hidden) n file)))

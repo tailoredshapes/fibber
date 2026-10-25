@@ -27,8 +27,9 @@
 
 (defstruct Mailbox (handle: i64))
 
-;; What `call-wait` found: the call returned, or the worker is parked at a hook call of this arity (1 or 2).
-(defenum Wait (Done) (Hook arity: i64))
+;; What `call-wait` found: the call returned, the worker is parked at a hook call of this arity (1 or 2), or a nested call (`call-nest`)
+;; returned.
+(defenum Wait (Done) (Hook arity: i64) (Nested))
 
 (extern bsearch :private (ptr ptr i64 i64 ptr) -> ptr)
 (extern pthread_create :private (ptr ptr ptr ptr) -> i32)
@@ -40,7 +41,8 @@
 ;; --------------------------------------------------------------------------------------------- the host
 
 ;; The addresses of the shim and of the mailbox's functions.
-(defstruct Host (cmp: i64 thread: i64 mb-new: i64 start: i64 wait: i64 arg: i64 reply: i64 result: i64 fault: i64 free: i64 hook1: i64 hook2: i64))
+(defstruct Host (cmp: i64 thread: i64 mb-new: i64 start: i64 wait: i64 arg: i64 reply: i64 result: i64 fault: i64 free: i64 hook1: i64 hook2: i64
+                 nest: i64 nest-result: i64))
 
 (def the-host: (Atom (Option Host)) (atom nil))
 
@@ -48,6 +50,8 @@
   (try-let ((cmp (lookup "lair_shim_cmp"))
             (thread (lookup "lair_shim_thread"))
             (mb-new (lookup "lair_mb_new"))
+            (nest (lookup "lair_mb_nest"))
+            (nest-result (lookup "lair_mb_nest_result"))
             (start (lookup "lair_mb_start"))
             (wait (lookup "lair_mb_wait"))
             (arg (lookup "lair_mb_hook_arg"))
@@ -57,7 +61,7 @@
             (free (lookup "lair_mb_free"))
             (hook1 (lookup "lair_mb_hook1"))
             (hook2 (lookup "lair_mb_hook2")))
-    (Ok (Host cmp thread mb-new start wait arg reply result fault free hook1 hook2))))
+    (Ok (Host cmp thread mb-new start wait arg reply result fault free hook1 hook2 nest nest-result))))
 
 (defun lair-str :private (r: (Result a err/LairError)) -> (Result a str)
   (match r ((Ok v) (Ok v)) ((Err e) (Err (err/lair-error-str e)))))
@@ -198,6 +202,25 @@
             (p (invoke (. h mb-new) [] [] 0 0)))
     (if (= p 0) (Err "lair_call_new: the mailbox could not be made") (Ok (Mailbox p)))))
 
+;; Beyond `lair.call`. While the worker is parked at a hook, runs the function at addr with the arguments on that worker, inside the hook
+;; (`lair_mb_nest`): the next `call-wait` answers `Nested` when it returns (its hooks come first, as any), and `call-nest-result` is its
+;; value, the worker parked again at the hook it was asked from. A reader macro's `lir.read.form` is served this way when the form runs
+;; another reader macro: one worker, its stack holding every level.
+(defun call-nest (c: Mailbox addr: i64 args: (Vec i64)) -> (Result unit str)
+  (match (refusal "call-nest" addr (count args))
+    ((some why) (Err why))
+    (nil
+     (let ((buf (unsafe (ffi/words-new args))))
+       (do (mb-call (fn (h: Host) -> i64 (. h nest)) [(. c handle) addr (ffi/ptr->addr buf) (count args)])
+           (unsafe (free buf))
+           (match (call-fault c)
+             ((some why) (Err why))
+             (nil (Ok ()))))))))
+
+;; The value of the nested call that `call-wait` reported `Nested`; 0 before (a misuse).
+(defun call-nest-result (c: Mailbox) -> i64
+  (mb-call (fn (h: Host) -> i64 (. h nest-result)) [(. c handle)]))
+
 ;; (capi/mailbox.rs `lair_call_free`)
 (defun call-free (c: Mailbox) -> unit
   (do (mb-call (fn (h: Host) -> i64 (. h free)) [(. c handle)]) ()))
@@ -228,6 +251,7 @@
   (let ((k (unsafe (sext i64 (trunc i32 (mb-call (fn (h: Host) -> i64 (. h wait)) [(. c handle)]))))))
     (cond (= k 0) (Ok Done)
           (or (= k 1) (= k 2)) (Ok (Hook k))
+          (= k 3) (Ok Nested)
           true (Err (unwrap-or (call-fault c) "the mailbox is not usable")))))
 
 ;; Argument i (0 or 1) of the hook call the worker is parked at; 0 when there is none or i is not below its arity (a misuse). (capi/mailbox.rs `lair_call_hook_arg`)
