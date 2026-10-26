@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.1.20
+
+- lIR has compile-time macros (spec/lir.md 4.6): `(define-macro NAME (P..) block+)` is a function from form objects to a form, written
+  in lIR, compiled into the module's own JIT session when it is read and run between reading and parsing; `(require-macros "FILE")`
+  loads a file of them. The form objects are `lir.sexp.*` (symbol, integer, float, string, list, each with its file, line, column and
+  byte span; `lir.sexp.at` copies a position onto a made form, `lir.sexp.set` is the dual of nth, `lir.sexp.expand` expands a form from
+  inside a macro, `lir.sexp.gensym` counts per program read). A top-level `begin` is a splice of items, so one use can define several.
+  `(module-macro ..)` runs at the end of the module over the forms it collected, `(macro-import "FILE")` puts a runtime module into the
+  macro session as its state, and `(include "FILE")` reads a file's text in place. A module with no macros reads as before.
+- `(import "FILE")` (spec/lir.md 4.7): a program is the union of its modules, joined as llvm-link joins them. The importer sees the
+  imported module's exported functions, globals, structs and the macros of its own file; each module is loaded once per program, in
+  dependency order, identified by its canonical path, and reads under its own readtable.
+- Reader macros (spec/lir.md 4.8): `define-reader-macro` binds a character of the module's readtable to an lIR function run at read time
+  over a stream (`lir.read.peek`, `next`, `position`, `skip`, `form`, `fail`), `define-dispatch-macro` binds the character after `#`, and
+  `define-token-reader` is called after every atom with the atom's text as a symbol; `define-reader-class` sets a character's class and
+  the nesting depth is the readtable's (1024 unless set). Forms carry byte spans; a byte order mark is skipped. The bindings a required
+  library makes are the requiring module's. A module with no bindings reads as before.
+- Ownership in lIR (spec/lir.md 6.14): the managed pointer type, owned parameters, `unsafe`, `mutable` and the ownership form are read,
+  typed and printed, and lair verifies them (one dataflow per function, the ten rules of 6.14.5) on every path it compiles:
+  `FIB_LIR_OWN=verify|report|off`, `report` the default (one summary line on stderr, the program accepted), `verify` makes a violation an
+  error. The forms are erased after the optimisation slot, before LLVM and the C, JS and WGSL printers. A program has one ownership form,
+  carried in the interface of the module that holds it.
+- `noinline` and `cold`, LLVM's function attributes, on a `define`; `defun` takes `:noinline` and `:cold` after its parameters
+  (spec/syntax.md 3.1). lair no longer makes a function noinline for a name ending `-slow`: an attribute is written, not inferred from a
+  name.
+- `(dependent-library "NAME")`, LLVM's `!llvm.dependent-libraries`, is a module item and replaces the `;; link-lib:` comment and the libs
+  argument on every path (AOT, liro, the JIT and the live JIT, the C route, shared libraries). fibber's emitter writes it for each
+  `:lib`; `:lib` in fibber source is unchanged.
+- `(export-name "NAME")` is a modifier of a define, LLVM's `wasm-export-name`: the WebAssembly backend exports the symbol with no
+  `--export` flag. Library versus executable is `lair build --library`; a shared library exports what the lIR made external, with no
+  symbol list. lair reads `FIB_EXPORTS` nowhere: the variable is now only `fibc`'s own channel from `--export` to its front end.
+- `(align N)` means N on a kernel target too (spec/lir.md 6.9a); fibber's emitter writes a kernel's scalar alignment itself.
+- Each `(string ..)` occurrence is its own constant, as spec/lir.md 3 says: lair no longer marks them `unnamed_addr`, so LLVM cannot merge
+  two equal ones into one address. The emitter interns a trap's message as one private constant per text (`cstr.N`): the compiler's own
+  lIR has 10 of them where it had 11,804 `(string ..)` occurrences, and the binary grows by 752 bytes, not 118 KB.
+- The respelling (spec/lir.md 2): every word lIR owns is upper case (`ADD`, `FUNCTION`, `DEFINE`), a reference or a type is a form
+  (`(GLOBAL f)`, `(STRUCT S)`, `(PTR (ADDRSPACE 1))`, `(FUNCTION ..)`, `(VECTOR N T)`, `(ARRAY N T)`, `(LITERAL-STRUCT ..)`), the lower
+  case is free for the language above, and a name that is a word is refused. The parser reads both spellings; the printer writes the new
+  one. The old spelling (`add`, `@f`, `%struct.s`, `(ptr 1)`, `(fn ..)`, `<N x T>`, `[N x T]`) is admitted for this release only: `lairf`
+  refuses it by default and admits it with `--old-spelling` or `FIB_LIR_SPELLING=old` (`--new-spelling`, `FIB_LIR_SPELLING=new` refuse
+  it); `fibc` admits it. `lairf respell FILE [--in-place|--check]` rewrites a text into the new spelling with its comments and layout
+  kept, `lairf words` prints the table of words, and `lairf expand FILE` prints a module with its macros expanded, for a backend with
+  no compile-time runtime.
+- lIR and lair live in their own repository, https://github.com/tailoredshapes/lir, with lIR's cases (`cases/lir`), tests, tools (lir2c,
+  lir2js, the JS backend) and designs (lir-language.md, lir-facts.md, lair-in-fibber.md and the rest). fibc compiles lair from source,
+  so fibber keeps a pinned, read-only copy of `compiler/lir`, `compiler/native`, `compiler/llvm`, `compiler/c`, `compiler/lir.fib`,
+  `compiler/lairf.fib` and `spec/lir.md`: the file `LIR` names the repository, the commit and the sha256 of the copied files' manifest,
+  `scripts/sync-lir.sh [--repo DIR] [COMMIT]` updates the copy, and the quick gate fails when the copy differs from the pin
+  (`scripts/lir-drift.sh`). A change to lIR or lair starts in that repository.
+- lIR facts in LLVM's own forms (spec/lir.md 6.13): `(add nsw a b)` and `nuw` on add, sub, mul and shl, `(assume c)` and
+  `(load (range LO HI) T p)`. `FIB_LIR_FACTS=use|trap|ignore`: `use` (the default) gives them to LLVM, `trap` turns each into a test that
+  traps with `lIR fact violated: ..`, `ignore` drops them. The emitter proves the first ones (the Vec tail read, bounded steps), and
+  `make cases-trap` runs ownership and the stdlib under `trap` in the full gate.
+- `FIB_LIRO_THIN=1`: the partitioned build's units are ThinLTO bitcode with summaries, thin-linked inside `fibc` through a C++ shim over
+  LLVM's LTO (Linux and macOS; no LLVMgold.so or linker plugin). The backend cache keys on the unit after importing, so an edit reruns
+  only the backends that import what changed. Opt-in; the default build is unchanged. `FIB_LIRO_THIN_JOBS`, `FIB_LIRO_THIN_IMPORT` and
+  `FIB_LIRO_THIN_REPORT=FILE` tune and report it (docs/design/compile-performance.md).
+- Performance (docs/design/vec-performance.md 8 and 9): a Vec built whole, or by `conj` from empty while unique, is flat (every element
+  in its tail), so `nth` is a load and a unique update is in place; a shared update makes the trie once. `vec-nth`, `vec-assoc` and
+  `vec-conj` are small fast paths with the trie work out of line, and the Vec read path is emitted inline. `reduce` and `into` over a Vec
+  or an Array keep the accumulator in a loop variable, so a unique one is updated in place. A literal or named function passed to a defun
+  that calls it, or bound by `let` and only called, is a direct call; stack and immortal closures called directly skip their counts; a
+  let-bound literal captured only by stack closures stays on the stack. Fused chains over a range with a literal step, or over a vector
+  literal of fn stages, have no fallback branch; a match the checker proved exhaustive falls through to `unreachable`.
+- Fixes: the operand of `private-copy` escapes, so a closure it copies is a heap closure (it read a dead frame); the live server answers
+  a buffered request line without waiting for more bytes (a client that pipelined two requests hung); `lairf cases DIR.. -j N` reads
+  its option instead of walking `-j` as a path.
+- Tests and CI: the live test op's status check measures the run, not the entry's compile; the host-threads, live leak and shared
+  stackcheck tests run on macOS (a mutex and condvar barrier, `ps` for the resident size, `nm -gU` for Mach-O exports, `LLVM_LIBDIR` for
+  the live-mode build); the Linux CI runs the tools with `TOOLS_TIMEOUT=1800`, as the Mac does; case 8641 counts the tasks the workers
+  ran instead of assuming every task runs on one; the stdlib cases that wrote fixed paths under /tmp name their files by the process id,
+  so two gates at once no longer collide.
+
 ## 0.1.19
 
 - Fusion covers more chains: a `map` over a `range` call is a counted loop over the range with the stage in line, and
