@@ -23,7 +23,7 @@
 (defun item :private (form: Sexp) -> (Result LItem Diagnostic)
   (match form
     ((SxList items pos)
-     (let ((head (if (> (count items) 0) (atom-or-empty (nth items 0)) ""))
+     (let ((head (if (> (count items) 0) (word-of (nth items 0)) ""))
            (rest (if (> (count items) 0) (vec-from items 1) items)))
        (cond (= head "defstruct") (defstruct-form rest pos)
              (= head "global") (global rest pos false)
@@ -37,7 +37,7 @@
              :else (err pos (str top-text ", found " (sexp-describe form))))))
     (_ (err (sexp-pos form) (str top-text ", found " (sexp-describe form))))))
 
-;; `(dependent-library "NAME")` (spec/lir.md 4.9): one non-empty string, the library's name as the linker's `-l` takes it.
+;; `(DEPENDENT-LIBRARY "NAME")` (spec/lir.md 4.9): one non-empty string, the library's name as the linker's `-l` takes it.
 (defun dependent-library-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
   (if (not (= (count rest) 1))
       (err pos "dependent-library expects one string")
@@ -47,8 +47,8 @@
                           (Ok (ItDependentLibrary (LDependentLibrary (str-from-bytes bs) pos)))))
         (other (err (sexp-pos other) (str "dependent-library expects one string, found " (sexp-describe other)))))))
 
-;; `(ownership (retain @f) .. (header %struct.NAME))` (spec/lir.md 6.14.6): every field once, each a list of the field's word and one atom;
-;; the names are kept without their `@` and `%struct.`.
+;; `(OWNERSHIP (RETAIN (GLOBAL f)) .. (HEADER (STRUCT NAME)))` (spec/lir.md 6.14.6): every field once, each a list of the field's word and
+;; one reference (`@f` and `%struct.NAME` in the old spelling); the names are kept bare.
 (defun ownership-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
   (loop ((i 0) (seen: (Map str str) {}))
     (if (>= i (count rest))
@@ -65,14 +65,16 @@
 (defun ownership-field :private (seen: (Map str str) f: Sexp) -> (Result (Map str str) Diagnostic)
   (match f
     ((SxList items p)
-     (let ((key (if (> (count items) 0) (atom-or-empty (nth items 0)) ""))
-           (val (if (= (count items) 2) (atom-or-empty (nth items 1)) "")))
+     (let ((key (if (> (count items) 0) (word-of (nth items 0)) ""))
+           (val (if (= (count items) 2) (some (nth items 1)) nil)))
        (cond (not (includes? key ownership-fields)) (err p (str "ownership: unknown field " (if (= key "") (sexp-describe f) key)))
              (contains? seen key) (err p (str "ownership: duplicate " key))
-             (and (= key "header") (starts-with? val "%struct.") (> (str-len val) 8)) (Ok (assoc seen key (str-slice val 8 (str-len val))))
-             (= key "header") (err p "ownership: header expects %struct.NAME")
-             (and (starts-with? val "@") (> (str-len val) 1)) (Ok (assoc seen key (str-slice val 1 (str-len val))))
-             :else (err p (str "ownership: " key " expects @f")))))
+             (= key "header") (match (match val ((some v) (struct-ref v)) (nil nil))
+                                ((some n) (Ok (assoc seen key n)))
+                                (nil (err p "ownership: header expects %struct.NAME")))
+             :else (match (match val ((some v) (global-ref v)) (nil nil))
+                     ((some n) (Ok (assoc seen key n)))
+                     (nil (err p (str "ownership: " key " expects @f")))))))
     (other (err (sexp-pos other) (str "ownership: expected (FIELD @f), found " (sexp-describe other))))))
 
 ;; `(target (cpu "NAME") (features "+a,-b"))` (spec/lir.md 4.5; no Rust counterpart).
@@ -114,7 +116,7 @@
 (defun target-field :private (acc: TargetAcc f: Sexp) -> (Result TargetAcc Diagnostic)
   (match f
     ((SxList items p)
-     (let ((key (if (> (count items) 0) (atom-or-empty (nth items 0)) "")))
+     (let ((key (if (> (count items) 0) (word-or-atom (nth items 0)) "")))
        (cond (and (= (count items) 2) (= key "cpu")) (target-cpu acc (nth items 1) p)
              (and (= (count items) 2) (= key "features")) (target-features acc (nth items 1) p)
              (or (= key "cpu") (= key "features")) (err p (str "target: " key " expects one string"))
@@ -154,8 +156,8 @@
 
 ;; `(defstruct mutable? NAME (T..))`; `mutable` is spec/lir.md 6.14.5 rule 8's.
 (defun defstruct-form :private (rest0: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
-  (let ((mutable (and (> (count rest0) 0) (atom-is? (nth rest0 0) "mutable")))
-        (rest (if (and (> (count rest0) 0) (atom-is? (nth rest0 0) "mutable")) (vec-from rest0 1) rest0)))
+  (let ((mutable (and (> (count rest0) 0) (atom-word? (nth rest0 0) "mutable")))
+        (rest (if (and (> (count rest0) 0) (atom-word? (nth rest0 0) "mutable")) (vec-from rest0 1) rest0)))
     (try-let ((_ (arity "defstruct" rest 2 pos))
               (name (global-name (nth rest 0))))
       (match (nth rest 1)
@@ -174,11 +176,11 @@
 ;; The modifiers at the front of a form and how many words they took; `export-name` from `(export-name "NAME")` (spec/lir.md 4.3).
 (defstruct Mods (linkage: LLinkage hidden: bool used: i64 shared: bool inline: bool noinline: bool cold: bool unsafe: bool export-name: (Option str)))
 
-;; `(export-name "NAME")` among the modifiers: the name, or why the form is not one.
+;; `(EXPORT-NAME "NAME")` among the modifiers: the name, or why the form is not one.
 (defun export-name-form :private (s: Sexp) -> (Result (Option str) Diagnostic)
   (match s
     ((SxList items p)
-     (if (and (> (count items) 0) (atom-is? (nth items 0) "export-name"))
+     (if (and (> (count items) 0) (atom-word? (nth items 0) "export-name"))
          (if (= (count items) 2)
              (match (nth items 1)
                ((SxStr bs _) (if (= (array-len bs) 0) (err p "export-name: the name must not be empty") (Ok (some (str-from-bytes bs)))))
@@ -212,8 +214,8 @@
 ;; `inline` and `noinline` exclude each other (LLVM's verifier refuses `alwaysinline` with `noinline`).
 (defun modifiers :private (items: (Vec Sexp)) -> (Result Mods Diagnostic)
   (loop ((i 0) (seen false) (m (Mods lk-external false 0 false false false false false nil)))
-    (let ((word (if (< i (count items)) (atom-or-empty (nth items i)) ""))
-          (code (modifier-code (if (< i (count items)) (atom-or-empty (nth items i)) ""))))
+    (let ((word (if (< i (count items)) (word-of (nth items i)) ""))
+          (code (modifier-code (if (< i (count items)) (word-of (nth items i)) ""))))
       (if (< code 0)
           (match (if (< i (count items)) (export-name-form (nth items i)) (Ok nil))
             ((Err d) (Err d))
@@ -240,7 +242,7 @@
 (defun has-external? :private (items: (Vec Sexp) n: i64) -> bool
   (loop ((i 0))
     (cond (>= i n) false
-          (atom-is? (nth items i) "external") true
+          (atom-word? (nth items i) "external") true
           :else (recur (+ i 1)))))
 
 ;; A `declare` or `declare-global` takes `hidden` only. (items.rs `declared_hidden`)
@@ -316,7 +318,7 @@
            (Ok (Params tys names))
            (match (nth items i)
              ((SxList tn pp)
-              (if (or (= (count tn) 2) (and (= (count tn) 3) (atom-is? (nth tn 1) "owned")))
+              (if (or (= (count tn) 2) (and (= (count tn) 3) (atom-word? (nth tn 1) "owned")))
                   (match (param-type (nth tn 0) (= (count tn) 3) pp)
                     ((Err d) (Err d))
                     ((Ok ty) (match (try-let ((a (atom-text (nth tn (- (count tn) 1)) "a parameter name"))) (valid-name a pp))
@@ -326,7 +328,7 @@
              (other (err (sexp-pos other) "a parameter must be (T name)"))))))
     (_ (err (sexp-pos s) "expected a parameter list ((T name)..)"))))
 
-;; The type of a parameter `(T name)` or `((ptr 1) owned name)` (spec/lir.md 6.14.2): `owned` wraps `(ptr 1)` only.
+;; The type of a parameter `(T name)` or `((PTR (ADDRSPACE 1)) OWNED name)` (spec/lir.md 6.14.2): `owned` wraps the managed type only.
 (defun param-type :private (s: Sexp owned: bool pp: i64) -> (Result LType Diagnostic)
   (try-let ((t (parse-type s)))
     (cond (not owned) (Ok t)
@@ -344,7 +346,7 @@
 (defun block :private (s: Sexp) -> (Result LBlock Diagnostic)
   (match s
     ((SxList items pos)
-     (if (and (> (count items) 0) (atom-is? (nth items 0) "block"))
+     (if (and (> (count items) 0) (atom-word? (nth items 0) "block"))
          (if (< (count items) 2)
              (err pos "block needs a label")
              (try-let ((l (label (nth items 1)))

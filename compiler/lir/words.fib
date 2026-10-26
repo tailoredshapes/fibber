@@ -1,0 +1,122 @@
+;; compiler/lir/words.fib: the one table of the words lIR owns (spec/lir.md section 2, "Spelling"): every item head, instruction head,
+;; modifier, type word, literal head and flag, as the AST names it (its canonical name: lower case, what lir.ast, lir.intrin, the checker
+;; and the backends compare) and as the text spells it (upper case: `ADD`, `ATOMIC-LOAD`, `ACQ_REL`; a few respelled: `fn` is
+;; `FUNCTION`). The parser (lir.parse.names `word-of`), the printer (lir.print), the name and label rules and the macro form-name check
+;; all read it, so a word is added here and nowhere else; compiler/tests/lir/words.sh holds the table equal to the upper-case atoms of
+;; the spec's grammar.
+;;
+;; The spelling mode (spec/lir.md 2, transitional for one release). Until the repository is converted (the respelling's steps 4 to 7), the
+;; parser can admit the old spelling beside the new: lower-case words, `@f`, `%struct.s`, `(ptr 1)`, `(fn ..)`, `<N x T>`, `[N x T]`,
+;; `{ T.. }`. `FIB_LIR_SPELLING=old` admits it, `new` refuses it; unset, a process admits it unless it says otherwise: lairf refuses it by
+;; default (`lairf --old-spelling` admits it), fibc admits it, since its own lIR texts (the runtime, the templates) and the inline `lir`
+;; bodies of lib/ are old until the seed reads the new. The parser's functions carry no context of their own and a library keeps no global
+;; state (ADR 0013), so the mode is the environment variable itself, set once by lairf before any work (`default-spelling!`, the flags)
+;; and read where the old spelling could change the reading (an atom that is a lower-case word or starts with a sigil, a bracket type),
+;; never for an upper-case word or an ordinary name. lair's own lIR texts that it reads at run time are in the new spelling.
+(ns lir.words
+  (:require [fib.string :as s] [fib.os :as os]))
+
+;; The canonical names, grouped as spec/lir.md presents them. The text of each is its upper case unless `respelled` says otherwise.
+(def names: (Vec str)
+  [;; items and directions (section 4: 4.6, 4.8 the reader settings and classes, 4.9), the ownership form's fields (6.14.6), the target
+   ;; form's (4.5), and the export-name modifier (4.3)
+   "define" "declare" "declare-global" "defstruct" "global" "constant" "target" "ownership" "block" "let"
+   "define-macro" "require-macros" "import" "begin" "define-reader-macro" "define-dispatch-macro" "define-token-reader"
+   "define-reader-class" "define-reader-depth" "whitespace" "constituent" "terminating"
+   "macro-import" "module-macro" "include" "dependent-library" "export-name"
+   "retain" "release" "unique" "alloc" "stack-init" "stack-end" "header" "cpu" "features"
+   ;; modifiers (4.3, 6.9a, 6.14.4, 6.14.5) and calling conventions (4.2, 6.6b, 6.9a)
+   "private" "internal" "external" "hidden" "inline" "noinline" "cold" "shared" "unsafe" "mutable"
+   "ccc" "tailcc" "kernelcc" "preservemost"
+   ;; types (section 2): the scalars, the heads of the spelled types, the parameter kind, the function type
+   "i1" "i8" "i16" "i32" "i64" "float" "double" "ptr" "void" "addrspace" "struct" "literal-struct" "array" "vector" "owned" "fn"
+   ;; literals (section 3)
+   "null" "inf" "nan" "string" "zeroinitializer"
+   ;; arithmetic, bitwise, comparison, select, conversion, vector and aggregate instructions (6.1 to 6.4)
+   "add" "sub" "mul" "sdiv" "udiv" "srem" "urem" "fadd" "fsub" "fmul" "fdiv" "frem" "fneg" "and" "or" "xor" "shl" "lshr" "ashr" "ctpop"
+   "sadd-overflow" "ssub-overflow" "smul-overflow" "icmp" "fcmp" "select"
+   "trunc" "zext" "sext" "fptrunc" "fpext" "fptosi" "fptoui" "sitofp" "uitofp" "ptrtoint" "inttoptr" "bitcast" "fptosi-sat" "fptoui-sat"
+   "extractelement" "insertelement" "shufflevector" "extractvalue" "insertvalue"
+   ;; predicates (6.2)
+   "eq" "ne" "slt" "sle" "sgt" "sge" "ult" "ule" "ugt" "uge" "oeq" "one" "olt" "ole" "ogt" "oge" "ord" "ueq" "une" "uno"
+   ;; the intrinsic forms (6.1, 6.4, 6.5, 6.6a, 6.6b, 6.9a; lir.intrin has their classes)
+   "fma" "fmuladd" "fsqrt" "fabs" "ffloor" "fceil" "ftrunc" "fround" "froundeven" "fcopysign" "fmin" "fmax" "fminnum" "fmaxnum"
+   "smin" "smax" "umin" "umax" "abs" "cttz" "ctlz"
+   "reduce-add" "reduce-mul" "reduce-and" "reduce-or" "reduce-xor" "reduce-smin" "reduce-smax" "reduce-umin" "reduce-umax"
+   "reduce-fadd" "reduce-fmul" "reduce-fmin" "reduce-fmax" "reduce-fminnum" "reduce-fmaxnum"
+   "masked-load" "masked-store" "gather" "scatter" "shfl-down" "shfl-up" "shfl-xor" "shfl-idx" "ballot"
+   "spin-hint" "cache-line" "stack-addr" "assume"
+   ;; flags: fast-math (6.1) and the facts (6.13)
+   "reassoc" "contract" "arcp" "afn" "nsz" "nsw" "nuw"
+   ;; memory (6.5) and its options, the ownership access words (6.14.3)
+   "alloca" "load" "store" "getelementptr" "volatile" "align" "inbounds" "range" "copy" "borrow" "take" "init" "assign"
+   ;; atomics (6.6): the forms, the scope and weak flags, the orderings and the atomicrmw operations
+   "atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence" "singlethread" "weak"
+   "unordered" "monotonic" "acquire" "acq_rel" "seq_cst" "xchg" "nand" "max" "min"
+   ;; control (6.7, 6.8, 6.9, 6.9a)
+   "ret" "br" "switch" "unreachable" "trap" "barrier" "sreg" "phi" "call" "tailcall" "indirect-call" "indirect-tailcall"
+   ;; the ownership forms (6.14.3)
+   "copy-value" "destroy-value" "is-unique" "alloc-object" "alloc-stack" "dealloc-stack" "addrspacecast"])
+
+;; The words whose text is not their upper case: LLVM's own spelling where lIR had abbreviated it (spec/lir.md 2, 4.3, 6.6b).
+(def respelled: (Map str str) {"fn" "FUNCTION" "inline" "ALWAYSINLINE" "preservemost" "PRESERVE_MOSTCC"})
+
+(defstruct Word (name: str text: str))
+
+(defun text-of-name :private (n: str) -> str
+  (match (get respelled n) ((some t) t) (nil (s/upper-case n))))
+
+;; The table: every word with its canonical name and its text, in the order of `names`.
+(def table: (Vec Word) (mapv (fn (n: str) (Word n (text-of-name n))) names))
+
+(def by-text: (Map str str) (reduce (fn (m: (Map str str) w: Word) (assoc m (. w text) (. w name))) {} table))
+(def by-name: (Map str str) (reduce (fn (m: (Map str str) w: Word) (assoc m (. w name) (. w text))) {} table))
+
+(defun words-table () -> (Vec Word) table)
+
+;; ---------------------------------------------------------------- the spelling mode
+
+(def spelling-var: str "FIB_LIR_SPELLING")
+
+;; Whether the parser admits the old spelling beside the new: `FIB_LIR_SPELLING=new` refuses it, anything else (unset: fibc's default,
+;; `old`) admits it.
+(defun old-admitted? () -> bool
+  (match (sys-getenv spelling-var) ((some v) (not (= v "new"))) (nil true)))
+
+;; Sets the mode for the process and the processes it starts: `on` admits the old spelling, `off` refuses it (`lairf --old-spelling`,
+;; `--new-spelling`).
+(defun admit-old-spelling! (on: bool) -> unit
+  (do (os/setenv spelling-var (if on "old" "new")) ()))
+
+;; A process's default when `FIB_LIR_SPELLING` does not say: lairf calls it with `false` (the new spelling only) before its flags are read.
+(defun default-spelling! (admit-old: bool) -> unit
+  (match (sys-getenv spelling-var)
+    ((some v) (if (or (= v "old") (= v "new")) () (admit-old-spelling! admit-old)))
+    (nil (admit-old-spelling! admit-old))))
+
+;; ---------------------------------------------------------------- lookups
+
+;; Whether the first byte of `text` is an upper-case ASCII letter: no word's text starts otherwise, so a lower-case atom skips the map.
+(defun upper-first? :private (text: str) -> bool
+  (and (> (str-len text) 0)
+       (let ((b (zext i64 (str-byte-at text 0)))) (and (>= b 65) (<= b 90)))))
+
+;; The canonical name of the word `text` spells in the current mode: its text (`ADD`), or, while the old spelling is admitted, its canonical
+;; name itself (`add`); nil for an atom that is not a word, which is then a name.
+(defun keyword-of (text: str) -> (Option str)
+  (if (upper-first? text)
+      (get by-text text)
+      (if (and (contains? by-name text) (old-admitted?)) (some text) nil)))
+
+;; The canonical name of the word `text` spells in either spelling, whatever the mode: `ADD` and `add` both give `add` (lir.respell reads
+;; the old spelling to convert it).
+(defun keyword-of-any (text: str) -> (Option str)
+  (if (upper-first? text) (get by-text text) (if (contains? by-name text) (some text) nil)))
+
+;; The text of the canonical name `name`, which the printer writes; a name that is no word comes back as it is.
+(defun word-text (name: str) -> str
+  (match (get by-name name) ((some t) t) (nil name)))
+
+;; Whether `text` is the text of a word: refused as a name or a label in every mode (`reserved word ADD used as a name`).
+(defun word-text? (text: str) -> bool
+  (and (upper-first? text) (contains? by-text text)))

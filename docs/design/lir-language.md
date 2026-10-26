@@ -131,7 +131,7 @@ The sizes are estimates from reading the code, not measurements. An agent-week i
    - `lir.fact.check` becomes a reserved name.
 9. A spec/code disagreement, reported and not changed. String constants get `unnamed_addr` (lower/consts.fib:95), so LLVM
    may merge two equal ones, but spec/lir.md 3 says each occurrence is its own constant (decision D12). *Resolved 2026-10-25*
-   as D12 recommends: `unnamed_addr` dropped, the spec kept (spec/lir.md 3, item 21).
+   as D12 recommends: `unnamed_addr` dropped, the spec kept (spec/lir.md 3, item 22).
 
 **Stage 1: an lIR pass pipeline.** Medium; about one agent-week. This is a pass driver with timing per pass and
 `--dump-after`, plus an lIR canonicaliser that renames SSA names and labels. These move onto it:

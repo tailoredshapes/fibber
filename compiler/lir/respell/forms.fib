@@ -1,0 +1,260 @@
+;; compiler/lir/respell/forms.fib: the items, blocks and expressions of the respelling walk (lir.respell.walk has the types and the words):
+;; each form by the shape lir.parse gives it (spec/lir.md 4 to 6), so that only word positions are respelled and every name stays. A form
+;; the grammar does not know, a macro use, is walked generically (`generic!`): a form inside it whose head the grammar knows (an item, a
+;; block, an instruction) is walked by its shape, and in anything else every word is respelled.
+(ns lir.respell.forms
+  (:use lir.respell.tree lir.respell.walk lir.intrin)
+  (:require [lir.words :as words]))
+
+(defun items-of :private (f: RForm) -> (Vec RForm)
+  (match f ((RList kind _ items _) (if (= kind 0) items [])) (_ [])))
+
+(defun nth-or :private (items: (Vec RForm) i: i64) -> (Option RForm)
+  (if (< i (count items)) (some (nth items i)) nil))
+
+;; ---------------------------------------------------------------- the generic walk
+
+(defun item-head? :private (h: str) -> bool
+  (or (= h "define") (= h "declare") (= h "declare-global") (= h "defstruct") (= h "global") (= h "constant") (= h "target") (= h "ownership")
+      (= h "define-macro") (= h "require-macros") (= h "import") (= h "begin") (= h "dependent-library")
+      (= h "macro-import") (= h "module-macro") (= h "include")
+      (= h "define-reader-macro") (= h "define-dispatch-macro") (= h "define-token-reader")))
+
+;; A word that heads no instruction or literal: a modifier, a convention, a type's head, a flag, an ordering, a predicate, an option, an
+;; access word, a field; a list headed by one is not an expression.
+(defun non-head-word? :private (h: str) -> bool
+  (or (modifier-word? h) (cc-word? h) (ordering-word? h) (= h "mutable") (= h "owned") (= h "fn") (= h "addrspace") (= h "struct")
+      (= h "array") (= h "vector") (= h "null") (= h "inf") (= h "nan") (= h "volatile") (= h "align") (= h "inbounds") (= h "range")
+      (= h "copy") (= h "borrow") (= h "take") (= h "init") (= h "assign") (= h "void") (= h "block")
+      (= h "retain") (= h "release") (= h "unique") (= h "alloc") (= h "stack-init") (= h "stack-end") (= h "header") (= h "cpu") (= h "features")
+      (= h "reassoc") (= h "contract") (= h "arcp") (= h "afn") (= h "nsz") (= h "nsw") (= h "nuw")
+      (= h "eq") (= h "ne") (= h "slt") (= h "sle") (= h "sgt") (= h "sge") (= h "ult") (= h "ule") (= h "ugt") (= h "uge")
+      (= h "oeq") (= h "one") (= h "olt") (= h "ole") (= h "ogt") (= h "oge") (= h "ord") (= h "ueq") (= h "une") (= h "uno")
+      (= h "xchg") (= h "nand") (= h "max") (= h "min")))
+
+;; A form the grammar does not know (a macro use, or an argument of one): a list headed by a word the grammar knows is walked by its
+;; shape; in anything else every word is respelled, every sigil and bracket type rewritten. A list headed by a scalar type is a literal
+;; or a parameter `(i64 x)` or a type list `(i64 ptr)`, which the walk cannot tell apart here: every word in it is respelled.
+(defun generic! (wk: Walk f: RForm) -> unit
+  (match f
+    ((RAtom i) (let ((t (nth (. wk toks) i)))
+                 (cond (= (. t kind) tk-vec) (type-atom! wk f t)
+                       (or (starts-with? (. t text) "@") (starts-with? (. t text) "%struct.")) (ref! wk f)
+                       :else (kw! wk f))))
+    ((RList kind open items close)
+     (cond (= kind 1) (brace! wk open items close generic!)
+           (= kind 2) (if (and (= (count items) 3) (= (atom-text wk (nth items 1)) "x"))
+                          (array-brackets! wk open items close)
+                          (each-from wk items 0 generic!))
+           :else (generic-list! wk f items)))))
+
+(defun generic-list! :private (wk: Walk f: RForm items: (Vec RForm)) -> unit
+  (let ((h (if (= (count items) 0) "" (word-of wk (nth items 0)))))
+    (cond (and (= h "ptr") (= (count items) 2) (= (atom-text wk (nth items 1)) "1")) (type-list! wk items)
+          (= h "fn") (fn-type! wk items)
+          (some? (scalar-word? h)) (each-from wk items 0 generic!)
+          (item-head? h) (item! wk f)
+          (= h "block") (block! wk f)
+          (and (not (= h "")) (not (non-head-word? h))) (expr! wk f)
+          :else (each-from wk items 0 generic!))))
+
+;; ---------------------------------------------------------------- items
+
+(defun modifier-word? :private (w: str) -> bool
+  (or (= w "private") (= w "internal") (= w "external") (= w "hidden") (= w "inline") (= w "noinline") (= w "cold") (= w "shared") (= w "unsafe")))
+
+(defun cc-word? :private (w: str) -> bool
+  (or (= w "ccc") (= w "tailcc") (= w "kernelcc") (= w "preservemost")))
+
+;; Whether the form is `(export-name ..)`, the one modifier that is a list (spec/lir.md 4.3).
+(defun export-name? :private (wk: Walk f: RForm) -> bool
+  (= (word-of wk (nth-or-empty (items-of f) 0)) "export-name"))
+
+;; The leading modifier words and `(export-name "NAME")` (and a convention word after them) respelled; the index of the first item after them.
+(defun modifiers! :private (wk: Walk items: (Vec RForm) from: i64) -> i64
+  (loop ((i from))
+    (let ((w (if (< i (count items)) (word-of wk (nth items i)) "")))
+      (cond (modifier-word? w) (do (kw! wk (nth items i)) (recur (+ i 1)))
+            (export-name? wk (nth-or-empty items i)) (do (kw! wk (nth (items-of (nth items i)) 0)) (recur (+ i 1)))
+            (cc-word? w) (do (kw! wk (nth items i)) (+ i 1))
+            :else i))))
+
+;; A top-level form: an item of spec/lir.md 4, a macro's definition, a splice, or (any other head) a macro use walked generically. A bare
+;; atom or a string at the top level is left as it is (the goldens hold `#### FILE` and `status N` lines beside the lIR).
+(defun item! (wk: Walk f: RForm) -> unit
+  (match f
+    ((RList kind _ items _)
+     (let ((h (if (or (not (= kind 0)) (= (count items) 0)) "" (word-of wk (nth items 0)))))
+       (if (item-head? h)
+           (do (kw! wk (nth items 0)) (item-rest! wk h items))
+           (generic! wk f))))
+    (_ ())))
+
+(defun item-rest! :private (wk: Walk h: str items: (Vec RForm)) -> unit
+  (cond (= h "defstruct") (defstruct! wk items)
+        (or (= h "global") (= h "constant")) (let ((i (modifiers! wk items 1)))
+                                               (do (if-some [t (nth-or items (+ i 1))] (type! wk t) ())
+                                                   (if-some [e (nth-or items (+ i 2))] (expr! wk e) ())))
+        (= h "declare-global") (let ((i (modifiers! wk items 1))) (if-some [t (nth-or items (+ i 1))] (type! wk t) ()))
+        (= h "declare") (let ((i (modifiers! wk items 1)))
+                          (do (if-some [t (nth-or items (+ i 1))] (type! wk t) ())
+                              (if-some [ps (nth-or items (+ i 2))] (each-from wk (items-of ps) 0 ptype!) ())))
+        (= h "define") (define! wk items)
+        (= h "target") (each-from wk items 1 (fn (w: Walk x: RForm) (if-some [k (nth-or (items-of x) 0)] (kw! w k) ())))
+        (= h "ownership") (each-from wk items 1 (fn (w: Walk x: RForm)
+                                                   (do (if-some [k (nth-or (items-of x) 0)] (kw! w k) ())
+                                                       (if-some [v (nth-or (items-of x) 1)] (ref! w v) ()))))
+        (= h "define-macro") (each-from wk items 3 block!)
+        (or (= h "define-reader-macro") (= h "define-dispatch-macro")) (each-from wk items 3 block!)
+        (= h "define-token-reader") (each-from wk items 2 block!)
+        (= h "begin") (each-from wk items 1 item!)
+        (or (= h "require-macros") (= h "import") (= h "dependent-library") (= h "macro-import") (= h "module-macro") (= h "include")) ()
+        :else (each-from wk items 1 generic!)))
+
+(defun ptype! :private (wk: Walk f: RForm) -> unit
+  (if (= (atom-text wk f) "...") () (type! wk f)))
+
+;; `(defstruct mutable? NAME (T..))`.
+(defun defstruct! :private (wk: Walk items: (Vec RForm)) -> unit
+  (let ((i (if (= (word-of wk (nth-or-empty items 1)) "mutable") (do (kw! wk (nth items 1)) 2) 1)))
+    (if-some [fs (nth-or items (+ i 1))] (each-from wk (items-of fs) 0 type!) ())))
+
+(defun nth-or-empty :private (items: (Vec RForm) i: i64) -> RForm
+  (if (< i (count items)) (nth items i) (RList 0 0 [] 0)))
+
+;; `(define mod* cc? (NAME R) (param*) block+)`; a parameter is `(T name)` or `((ptr 1) owned name)`.
+(defun define! :private (wk: Walk items: (Vec RForm)) -> unit
+  (let ((i (modifiers! wk items 1)))
+    (do (if-some [sig (nth-or items i)] (if-some [r (nth-or (items-of sig) 1)] (type! wk r) ()) ())
+        (if-some [ps (nth-or items (+ i 1))] (each-from wk (items-of ps) 0 param!) ())
+        (each-from wk items (+ i 2) block!))))
+
+(defun param! :private (wk: Walk f: RForm) -> unit
+  (let ((xs (items-of f)))
+    (do (if-some [t (nth-or xs 0)] (type! wk t) ())
+        (if (= (count xs) 3) (kw! wk (nth xs 1)) ()))))
+
+;; `(block LABEL instr..)`.
+(defun block! (wk: Walk f: RForm) -> unit
+  (let ((xs (items-of f)))
+    (if (= (word-of wk (nth-or-empty xs 0)) "block")
+        (do (kw! wk (nth xs 0)) (each-from wk xs 2 expr!))
+        (generic! wk f))))
+
+;; ---------------------------------------------------------------- expressions
+
+;; An expression: a name (left), `@f`, a literal, an instruction by its head's shape.
+(defun expr! (wk: Walk f: RForm) -> unit
+  (match f
+    ((RAtom _) (ref! wk f))
+    ((RList kind open items close)
+     (cond (= kind 1) (brace! wk open items close expr!)
+           (= kind 2) ()
+           (= (count items) 0) ()
+           :else (match (nth items 0)
+                   ((RAtom _) (headed! wk items))
+                   (_ (do (type! wk (nth items 0)) (each-from wk items 1 element!))))))))
+
+;; A vector, array or struct literal's element: a bare literal word, or an expression.
+(defun element! :private (wk: Walk f: RForm) -> unit
+  (do (literal-word! wk f) (expr! wk f)))
+
+(def flag-arity: (Map str i64) {"add" 2 "sub" 2 "mul" 2 "shl" 2 "fadd" 2 "fsub" 2 "fmul" 2 "fdiv" 2 "frem" 2 "fma" 3 "reduce-fadd" 2 "reduce-fmul" 2})
+
+(defun ordering-word? :private (w: str) -> bool
+  (or (= w "unordered") (= w "monotonic") (= w "acquire") (= w "release") (= w "acq_rel") (= w "seq_cst") (= w "singlethread") (= w "weak")))
+
+(defun option-list! :private (wk: Walk f: RForm) -> bool
+  (let ((xs (items-of f)) (h (word-of wk (nth-or-empty (items-of f) 0))))
+    (if (or (= h "align") (= h "range")) (do (kw! wk (nth xs 0)) true) false)))
+
+;; A form headed by an atom: the head respelled when it is a word, its operands by the head's shape; an unknown head is a macro use.
+(defun headed! :private (wk: Walk items: (Vec RForm)) -> unit
+  (let ((h (word-of wk (nth items 0))) (head (nth items 0)) (args (vec (drop 1 items))))
+    (cond (= h "") (if (starts-with? (atom-text wk head) "%struct.")
+                       (do (ref! wk head) (each-from wk args 0 expr!))
+                       (each-from wk items 0 generic!))
+          :else (do (kw! wk head) (operands! wk h args)))))
+
+(defun operands! :private (wk: Walk h: str args: (Vec RForm)) -> unit
+  (cond (some? (scalar-word? h)) (each-from wk args 0 literal-word!)
+        (= h "global") ()
+        (= h "zeroinitializer") (each-from wk args 0 type!)
+        (= h "string") ()
+        (some? (get flag-arity h)) (flagged! wk (unwrap-or (get flag-arity h) 0) args)
+        (or (= h "icmp") (= h "fcmp")) (do (if-some [p (nth-or args 0)] (kw! wk p) ()) (each-from wk args 1 expr!))
+        (cast-word? h) (do (if-some [t (nth-or args 0)] (type! wk t) ()) (each-from wk args 1 expr!))
+        (= h "alloca") (do (let ((i (if (and (> (count args) 0) (option-list! wk (nth args 0))) 1 0)))
+                             (do (if-some [t (nth-or args i)] (type! wk t) ()) (each-from wk args (+ i 1) expr!))))
+        (= h "load") (load! wk args)
+        (= h "store") (store! wk args)
+        (= h "getelementptr") (let ((i (if (= (word-of wk (nth-or-empty args 0)) "inbounds") (do (kw! wk (nth args 0)) 1) 0)))
+                                (do (if-some [t (nth-or args i)] (type! wk t) ()) (each-from wk args (+ i 1) expr!)))
+        (or (= h "atomic-load") (= h "atomic-store") (= h "fence") (= h "cmpxchg")) (atomic! wk args (= h "atomic-load") 0)
+        (= h "atomicrmw") (do (if-some [op (nth-or args 0)] (kw! wk op) ()) (atomic! wk args false 1))
+        (= h "br") (if (= (count args) 3) (expr! wk (nth args 0)) ())
+        (= h "switch") (do (if-some [v (nth-or args 0)] (expr! wk v) ())
+                           (each-from wk args 2 (fn (w: Walk c: RForm) (if-some [k (nth-or (items-of c) 0)] (expr! w k) ()))))
+        (= h "phi") (do (if-some [t (nth-or args 0)] (type! wk t) ())
+                        (each-from wk args 1 (fn (w: Walk e: RForm) (if-some [v (nth-or (items-of e) 1)] (expr! w v) ()))))
+        (= h "let") (do (if-some [bs (nth-or args 0)]
+                          (each-from wk (items-of bs) 0 (fn (w: Walk b: RForm) (if-some [v (nth-or (items-of b) 1)] (expr! w v) ()))) ())
+                        (each-from wk args 1 expr!))
+        (or (= h "call") (= h "tailcall")) (do (if-some [c (nth-or args 0)] (ref! wk c) ()) (each-from wk args 1 expr!))
+        (or (= h "indirect-call") (= h "indirect-tailcall")) (do (if-some [c (nth-or args 0)] (expr! wk c) ())
+                                                                 (if-some [t (nth-or args 1)] (type! wk t) ())
+                                                                 (each-from wk args 2 expr!))
+        (= h "sreg") ()
+        (intrin-typed? h) (do (if-some [t (nth-or args 0)] (type! wk t) ()) (each-from wk args 1 aligned-expr!))
+        (intrin-aligned? h) (each-from wk args 0 aligned-expr!)
+        :else (each-from wk args 0 expr!)))
+
+(defun scalar-word? :private (h: str) -> (Option str)
+  (if (or (= h "i1") (= h "i8") (= h "i16") (= h "i32") (= h "i64") (= h "float") (= h "double") (= h "ptr")) (some h) nil))
+
+(defun cast-word? :private (h: str) -> bool
+  (or (= h "trunc") (= h "zext") (= h "sext") (= h "fptrunc") (= h "fpext") (= h "fptosi") (= h "fptoui") (= h "sitofp") (= h "uitofp")
+      (= h "ptrtoint") (= h "inttoptr") (= h "bitcast") (= h "fptosi-sat") (= h "fptoui-sat") (= h "addrspacecast")
+      (= h "alloc-object") (= h "alloc-stack")))
+
+;; The first `count - arity` operands are flag words (spec/lir.md 6.1, 6.13), the rest expressions.
+(defun flagged! :private (wk: Walk arity: i64 args: (Vec RForm)) -> unit
+  (let ((nflags (- (count args) arity)))
+    (dotimes (i (count args)) (if (< i nflags) (kw! wk (nth args i)) (expr! wk (nth args i))))))
+
+;; A trailing `(align N)` of a masked access, else an expression.
+(defun aligned-expr! :private (wk: Walk f: RForm) -> unit
+  (if (option-list! wk f) () (expr! wk f)))
+
+;; `(load volatile? (range ..)? (align N)? T p)` or `(load copy|borrow|take T a)` (three operands, the word first).
+(defun load! :private (wk: Walk args: (Vec RForm)) -> unit
+  (let ((w (word-of wk (nth-or-empty args 0))))
+    (if (and (= (count args) 3) (or (= w "copy") (= w "borrow") (= w "take")))
+        (do (kw! wk (nth args 0)) (type! wk (nth args 1)) (expr! wk (nth args 2)))
+        (let ((i (options! wk args)))
+          (do (if-some [t (nth-or args i)] (type! wk t) ()) (each-from wk args (+ i 1) expr!))))))
+
+;; `(store volatile? (align N)? v p)` or `(store init|assign|borrow v a)`.
+(defun store! :private (wk: Walk args: (Vec RForm)) -> unit
+  (let ((w (word-of wk (nth-or-empty args 0))))
+    (if (and (= (count args) 3) (or (= w "init") (= w "assign") (= w "borrow")))
+        (do (kw! wk (nth args 0)) (each-from wk args 1 expr!))
+        (each-from wk args (options! wk args) expr!))))
+
+;; The leading `volatile`, `(range ..)` and `(align N)` respelled; the index after them.
+(defun options! :private (wk: Walk args: (Vec RForm)) -> i64
+  (loop ((i 0))
+    (if (>= i (count args))
+        i
+        (cond (= (word-of wk (nth args i)) "volatile") (do (kw! wk (nth args i)) (recur (+ i 1)))
+              (option-list! wk (nth args i)) (recur (+ i 1))
+              :else i))))
+
+;; The atomic forms: leading scope, weak and ordering words, then (atomic-load) a type, then expressions.
+(defun atomic! :private (wk: Walk args: (Vec RForm) typed: bool from: i64) -> unit
+  (loop ((i from) (want-type typed))
+    (if (>= i (count args))
+        ()
+        (cond (ordering-word? (word-of wk (nth args i))) (do (kw! wk (nth args i)) (recur (+ i 1) want-type))
+              want-type (do (type! wk (nth args i)) (recur (+ i 1) false))
+              :else (do (expr! wk (nth args i)) (recur (+ i 1) false))))))

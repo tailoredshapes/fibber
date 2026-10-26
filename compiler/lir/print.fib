@@ -4,9 +4,14 @@
 ;; the emitter built equals the text it prints today.
 ;;
 ;; The text is one form per line, each line the whole form (no indentation): it reads back to the same tree, with other positions. A floating
-;; literal is written as the shortest decimal that reads back to the same f64; a NaN is written `nan` (its payload is not kept).
+;; literal is written as the shortest decimal that reads back to the same f64; a NaN is written `NAN` (its payload is not kept).
+;;
+;; The spelling is the new one of spec/lir.md section 2 (lir.words): every word upper case through `w`, `(GLOBAL f)`, `(STRUCT s)`,
+;; `(PTR (ADDRSPACE 1))`, `(FUNCTION ..)`, `(VECTOR N T)`, `(ARRAY N T)`, `(LITERAL-STRUCT ..)`. `type-text` and `fn-type-text` are the types
+;; in that spelling; lir.types `type-str` stays the old spelling for messages until they are moved with the case headers (the audit's step 4).
 (ns lir.print
-  (:use lir.diag lir.types lir.lit lir.ast lir.intrin))
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin)
+  (:require [lir.words :as words]))
 
 ;; The module as lIR text, items in order, one top-level form per line.
 (defun print-module (m: LModule) -> str
@@ -17,6 +22,9 @@
   (print-kind (. e kind)))
 
 ;; ---------------------------------------------------------------- helpers
+
+;; The text of the word `name` (lir.words): `add` is `ADD`.
+(defun w :private (name: str) -> str (words/word-text name))
 
 (defun joined :private (parts: (Vec str)) -> str (str-join-all " " parts))
 
@@ -49,8 +57,8 @@
   (str-from-bytes (array 1 (trunc i8 b))))
 
 (defun float-text :private (v: f64) -> str
-  (cond (not (= v v)) "nan"
-        (not (= (- v v) 0.0)) (if (> v 0.0) "inf" "-inf")
+  (cond (not (= v v)) (w "nan")
+        (not (= (- v v) 0.0)) (if (> v 0.0) (w "inf") (str "-" (w "inf")))
         :else (str v)))
 
 ;; The number token of a literal written bare in a vector.
@@ -58,55 +66,91 @@
   (match (. e kind)
     ((KInt _ v) (lit-str v))
     ((KFloat _ v) (float-text v))
-    ((KNull) "null")
+    ((KNull) (w "null"))
     (_ (print-expr e))))
+
+;; ---------------------------------------------------------------- types
+
+;; The text of a type in the new spelling: `I32`, `(VECTOR 4 I32)`, `(STRUCT s)`, `(ARRAY 3 PTR)`, `(LITERAL-STRUCT PTR PTR)`,
+;; `(PTR (ADDRSPACE 1))`, `(OWNED (PTR (ADDRSPACE 1)))`.
+(defun type-text (t: LType) -> str
+  (match t
+    ((TInt n) (w (str "i" n)))
+    ((TFloat) (w "float"))
+    ((TDouble) (w "double"))
+    ((TPtr) (w "ptr"))
+    ((TVector n e) (form [(w "vector") (str n) (type-text e)]))
+    ((TNamed s) (form [(w "struct") s]))
+    ((TArray n e) (form [(w "array") (str n) (type-text e)]))
+    ((TManaged) managed-text)
+    ((TOwned) (form [(w "owned") managed-text]))
+    ((TAnon fs) (form (concat-parts [[(w "literal-struct")] (vec (map type-text fs))])))))
+
+(def managed-text: str "(PTR (ADDRSPACE 1))")
+
+;; `VOID` or the type.
+(defun ret-text (t: (Option LType)) -> str
+  (match t ((some x) (type-text x)) (nil (w "void"))))
+
+;; The convention word, none for `ccc`.
+(defun cc-words :private (c: LCc) -> (Vec str)
+  (match c ((CcC) []) ((CcTail) [(w "tailcc")]) ((CcKernel) [(w "kernelcc")]) ((CcPreserve) [(w "preservemost")])))
+
+;; The parameter list as `(I64 PTR ...)`.
+(defun fn-params-text (f: LFnType) -> str
+  (let ((parts (vec (map type-text (. f params)))))
+    (form (if (. f varargs) (conj parts "...") parts))))
+
+;; `(FUNCTION TAILCC VOID (PTR ...))`: the text of a function type (`ccc` is not written).
+(defun fn-type-text (f: LFnType) -> str
+  (form (concat-parts [[(w "fn")] (cc-words (. f cc)) [(ret-text (. f ret)) (fn-params-text f)]])))
 
 ;; ---------------------------------------------------------------- operator words
 
 (defun binop-word :private (o: LBinOp) -> str
-  (match o
-    ((BAdd) "add") ((BSub) "sub") ((BMul) "mul") ((BSDiv) "sdiv") ((BUDiv) "udiv") ((BSRem) "srem") ((BURem) "urem")
-    ((BFAdd) "fadd") ((BFSub) "fsub") ((BFMul) "fmul") ((BFDiv) "fdiv") ((BFRem) "frem") ((BAnd) "and") ((BOr) "or")
-    ((BXor) "xor") ((BShl) "shl") ((BLShr) "lshr") ((BAShr) "ashr")))
+  (w (match o
+       ((BAdd) "add") ((BSub) "sub") ((BMul) "mul") ((BSDiv) "sdiv") ((BUDiv) "udiv") ((BSRem) "srem") ((BURem) "urem")
+       ((BFAdd) "fadd") ((BFSub) "fsub") ((BFMul) "fmul") ((BFDiv) "fdiv") ((BFRem) "frem") ((BAnd) "and") ((BOr) "or")
+       ((BXor) "xor") ((BShl) "shl") ((BLShr) "lshr") ((BAShr) "ashr"))))
 
-(defun unop-word :private (o: LUnOp) -> str (match o ((UFNeg) "fneg") ((UCtpop) "ctpop")))
+(defun unop-word :private (o: LUnOp) -> str (w (match o ((UFNeg) "fneg") ((UCtpop) "ctpop"))))
 
 (defun ovf-word :private (o: LOvfOp) -> str
-  (match o ((OvSAdd) "sadd-overflow") ((OvSSub) "ssub-overflow") ((OvSMul) "smul-overflow")))
+  (w (match o ((OvSAdd) "sadd-overflow") ((OvSSub) "ssub-overflow") ((OvSMul) "smul-overflow"))))
 
 (defun cast-word :private (o: LCastOp) -> str
-  (match o
-    ((CTrunc) "trunc") ((CZExt) "zext") ((CSExt) "sext") ((CFpTrunc) "fptrunc") ((CFpExt) "fpext") ((CFpToSi) "fptosi")
-    ((CFpToUi) "fptoui") ((CSiToFp) "sitofp") ((CUiToFp) "uitofp") ((CPtrToInt) "ptrtoint") ((CIntToPtr) "inttoptr")
-    ((CBitcast) "bitcast") ((CFpToSiSat) "fptosi-sat") ((CFpToUiSat) "fptoui-sat")))
+  (w (match o
+       ((CTrunc) "trunc") ((CZExt) "zext") ((CSExt) "sext") ((CFpTrunc) "fptrunc") ((CFpExt) "fpext") ((CFpToSi) "fptosi")
+       ((CFpToUi) "fptoui") ((CSiToFp) "sitofp") ((CUiToFp) "uitofp") ((CPtrToInt) "ptrtoint") ((CIntToPtr) "inttoptr")
+       ((CBitcast) "bitcast") ((CFpToSiSat) "fptosi-sat") ((CFpToUiSat) "fptoui-sat"))))
 
 (defun ipred-word :private (p: LIPred) -> str
-  (match p
-    ((IEq) "eq") ((INe) "ne") ((ISlt) "slt") ((ISle) "sle") ((ISgt) "sgt") ((ISge) "sge") ((IUlt) "ult") ((IUle) "ule")
-    ((IUgt) "ugt") ((IUge) "uge")))
+  (w (match p
+       ((IEq) "eq") ((INe) "ne") ((ISlt) "slt") ((ISle) "sle") ((ISgt) "sgt") ((ISge) "sge") ((IUlt) "ult") ((IUle) "ule")
+       ((IUgt) "ugt") ((IUge) "uge"))))
 
 (defun fpred-word :private (p: LFPred) -> str
-  (match p
-    ((FOeq) "oeq") ((FOne) "one") ((FOlt) "olt") ((FOle) "ole") ((FOgt) "ogt") ((FOge) "oge") ((FOrd) "ord") ((FUeq) "ueq")
-    ((FUne) "une") ((FUlt) "ult") ((FUle) "ule") ((FUgt) "ugt") ((FUge) "uge") ((FUno) "uno")))
+  (w (match p
+       ((FOeq) "oeq") ((FOne) "one") ((FOlt) "olt") ((FOle) "ole") ((FOgt) "ogt") ((FOge) "oge") ((FOrd) "ord") ((FUeq) "ueq")
+       ((FUne) "une") ((FUlt) "ult") ((FUle) "ule") ((FUgt) "ugt") ((FUge) "uge") ((FUno) "uno"))))
 
 (defun ord-word :private (o: LOrdering) -> str
-  (match o
-    ((OUnordered) "unordered") ((OMonotonic) "monotonic") ((OAcquire) "acquire") ((ORelease) "release") ((OAcqRel) "acq_rel")
-    ((OSeqCst) "seq_cst")))
+  (w (match o
+       ((OUnordered) "unordered") ((OMonotonic) "monotonic") ((OAcquire) "acquire") ((ORelease) "release") ((OAcqRel) "acq_rel")
+       ((OSeqCst) "seq_cst"))))
 
 (defun rmw-word :private (o: LRmwOp) -> str
-  (match o
-    ((RXchg) "xchg") ((RAdd) "add") ((RSub) "sub") ((RAnd) "and") ((RNand) "nand") ((ROr) "or") ((RXor) "xor") ((RMax) "max")
-    ((RMin) "min") ((RUMax) "umax") ((RUMin) "umin") ((RFAdd) "fadd") ((RFSub) "fsub") ((RFMax) "fmax") ((RFMin) "fmin")))
+  (w (match o
+       ((RXchg) "xchg") ((RAdd) "add") ((RSub) "sub") ((RAnd) "and") ((RNand) "nand") ((ROr) "or") ((RXor) "xor") ((RMax) "max")
+       ((RMin) "min") ((RUMax) "umax") ((RUMin) "umin") ((RFAdd) "fadd") ((RFSub) "fsub") ((RFMax) "fmax") ((RFMin) "fmin"))))
 
 (defun scope-words :private (s: LScope) -> (Vec str)
-  (match s ((ScSystem) []) ((ScSingleThread) ["singlethread"])))
+  (match s ((ScSystem) []) ((ScSingleThread) [(w "singlethread")])))
 
 (defun align-words :private (a: (Option i64)) -> (Vec str)
-  (match a ((some n) [(str "(align " n ")")]) (nil [])))
+  (match a ((some n) [(form [(w "align") (str n)])]) (nil [])))
 
-(defun flag-words :private (on: bool word: str) -> (Vec str) (if on [word] []))
+(defun flag-words :private (on: bool word: str) -> (Vec str) (if on [(w word)] []))
 
 (defun concat-parts :private (vs: (Vec (Vec str))) -> (Vec str)
   (loop ((i 0) (out []))
@@ -119,18 +163,18 @@
 (defun print-kind :private (k: LKind) -> str
   (match k
     ((KLocal n) n)
-    ((KGlobal n) (str "@" n))
-    ((KInt t v) (form [(type-str t) (lit-str v)]))
-    ((KFloat t v) (form [(type-str t) (float-text v)]))
-    ((KNull) "(ptr null)")
-    ((KVector t es) (form (concat-parts [[(type-str t)] (vec (map vector-element-text es))])))
-    ((KStr b) (form ["string" (string-text b)]))
+    ((KGlobal n) (form [(w "global") n]))
+    ((KInt t v) (form [(type-text t) (lit-str v)]))
+    ((KFloat t v) (form [(type-text t) (float-text v)]))
+    ((KNull) (form [(w "ptr") (w "null")]))
+    ((KVector t es) (form (concat-parts [[(type-text t)] (vec (map vector-element-text es))])))
+    ((KStr b) (form [(w "string") (string-text b)]))
     ((KStruct n es)
      (match n
-       ((some s) (form (concat-parts [[(str "%struct." s)] (exprs-text es)])))
-       (nil (str "{ " (joined (exprs-text es)) " }"))))
-    ((KArray t es) (form (concat-parts [[(type-str t)] (exprs-text es)])))
-    ((KZero t) (form ["zeroinitializer" (type-str t)]))
+       ((some s) (form (concat-parts [[(type-text (TNamed s))] (exprs-text es)])))
+       (nil (form (concat-parts [[(w "literal-struct")] (exprs-text es)])))))
+    ((KArray t es) (form (concat-parts [[(type-text t)] (exprs-text es)])))
+    ((KZero t) (form [(w "zeroinitializer") (type-text t)]))
     (_ (print-op k))))
 
 (defun print-op :private (k: LKind) -> str
@@ -138,110 +182,111 @@
     ((KBin op a b) (form [(binop-word op) (print-expr a) (print-expr b)]))
     ((KUn op a) (form [(unop-word op) (print-expr a)]))
     ((KOverflow op a b) (form [(ovf-word op) (print-expr a) (print-expr b)]))
-    ((KICmp p a b) (form ["icmp" (ipred-word p) (print-expr a) (print-expr b)]))
-    ((KFCmp p a b) (form ["fcmp" (fpred-word p) (print-expr a) (print-expr b)]))
-    ((KCast op t v) (form [(cast-word op) (type-str t) (print-expr v)]))
-    ((KSelect c a b) (form ["select" (print-expr c) (print-expr a) (print-expr b)]))
-    ((KExtractElement v i) (form ["extractelement" (print-expr v) (print-expr i)]))
-    ((KInsertElement v x i) (form ["insertelement" (print-expr v) (print-expr x) (print-expr i)]))
-    ((KShuffle a b m) (form ["shufflevector" (print-expr a) (print-expr b) (print-expr m)]))
-    ((KExtractValue a ix) (form (concat-parts [["extractvalue" (print-expr a)] (vec (map lit-str ix))])))
-    ((KInsertValue a v ix) (form (concat-parts [["insertvalue" (print-expr a) (print-expr v)] (vec (map lit-str ix))])))
+    ((KICmp p a b) (form [(w "icmp") (ipred-word p) (print-expr a) (print-expr b)]))
+    ((KFCmp p a b) (form [(w "fcmp") (fpred-word p) (print-expr a) (print-expr b)]))
+    ((KCast op t v) (form [(cast-word op) (type-text t) (print-expr v)]))
+    ((KSelect c a b) (form [(w "select") (print-expr c) (print-expr a) (print-expr b)]))
+    ((KExtractElement v i) (form [(w "extractelement") (print-expr v) (print-expr i)]))
+    ((KInsertElement v x i) (form [(w "insertelement") (print-expr v) (print-expr x) (print-expr i)]))
+    ((KShuffle a b m) (form [(w "shufflevector") (print-expr a) (print-expr b) (print-expr m)]))
+    ((KExtractValue a ix) (form (concat-parts [[(w "extractvalue") (print-expr a)] (vec (map lit-str ix))])))
+    ((KInsertValue a v ix) (form (concat-parts [[(w "insertvalue") (print-expr a) (print-expr v)] (vec (map lit-str ix))])))
     (_ (print-memory k))))
 
 (defun print-memory :private (k: LKind) -> str
   (match k
     ((KAlloca t count align)
-     (form (concat-parts [["alloca"] (align-words align) [(type-str t)] (match count ((some c) [(print-expr c)]) (nil []))])))
+     (form (concat-parts [[(w "alloca")] (align-words align) [(type-text t)] (match count ((some c) [(print-expr c)]) (nil []))])))
     ((KLoad t p vol align)
-     (form (concat-parts [["load"] (flag-words vol "volatile") (align-words align) [(type-str t) (print-expr p)]])))
+     (form (concat-parts [[(w "load")] (flag-words vol "volatile") (align-words align) [(type-text t) (print-expr p)]])))
     ((KStore v p vol align)
-     (form (concat-parts [["store"] (flag-words vol "volatile") (align-words align) [(print-expr v) (print-expr p)]])))
+     (form (concat-parts [[(w "store")] (flag-words vol "volatile") (align-words align) [(print-expr v) (print-expr p)]])))
     ((KGep inb t p ix)
-     (form (concat-parts [["getelementptr"] (flag-words inb "inbounds") [(type-str t) (print-expr p)] (exprs-text ix)])))
+     (form (concat-parts [[(w "getelementptr")] (flag-words inb "inbounds") [(type-text t) (print-expr p)] (exprs-text ix)])))
     ((KAtomicLoad sc ord t p)
-     (form (concat-parts [["atomic-load"] (scope-words sc) [(ord-word ord) (type-str t) (print-expr p)]])))
+     (form (concat-parts [[(w "atomic-load")] (scope-words sc) [(ord-word ord) (type-text t) (print-expr p)]])))
     ((KAtomicStore sc ord v p)
-     (form (concat-parts [["atomic-store"] (scope-words sc) [(ord-word ord) (print-expr v) (print-expr p)]])))
+     (form (concat-parts [[(w "atomic-store")] (scope-words sc) [(ord-word ord) (print-expr v) (print-expr p)]])))
     ((KAtomicRmw op sc ord p v)
-     (form (concat-parts [["atomicrmw" (rmw-word op)] (scope-words sc) [(ord-word ord) (print-expr p) (print-expr v)]])))
+     (form (concat-parts [[(w "atomicrmw") (rmw-word op)] (scope-words sc) [(ord-word ord) (print-expr p) (print-expr v)]])))
     ((KCmpXchg weak sc succ fail p e n)
-     (form (concat-parts [["cmpxchg"] (flag-words weak "weak") (scope-words sc)
+     (form (concat-parts [[(w "cmpxchg")] (flag-words weak "weak") (scope-words sc)
                           [(ord-word succ) (ord-word fail) (print-expr p) (print-expr e) (print-expr n)]])))
-    ((KFence sc ord) (form (concat-parts [["fence"] (scope-words sc) [(ord-word ord)]])))
+    ((KFence sc ord) (form (concat-parts [[(w "fence")] (scope-words sc) [(ord-word ord)]])))
     (_ (print-control k))))
 
 (defun print-control :private (k: LKind) -> str
   (match k
-    ((KTrap) "(trap)")
-    ((KBarrier) "(barrier)")
-    ((KSreg r) (str "(sreg " r ")"))
+    ((KTrap) (form [(w "trap")]))
+    ((KBarrier) (form [(w "barrier")]))
+    ((KSreg r) (form [(w "sreg") r]))
     ((KIntrin name flags ty args align)
      (cond (= name "load") (range-load-text ty args align)
-           (= name "managed-null") "((ptr 1) null)"
+           (= name "managed-null") (form [managed-text (w "null")])
            (not (= (own-access-word name) ""))
-           (form (concat-parts [[(if (starts-with? name "load-") "load" "store") (own-access-word name)]
-                                (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args)]))
-           :else (form (concat-parts [[name] (op-flag-words flags) (match ty ((some t) [(type-str t)]) (nil [])) (exprs-text args) (align-words align)]))))
+           (form (concat-parts [[(w (if (starts-with? name "load-") "load" "store")) (w (own-access-word name))]
+                                (match ty ((some t) [(type-text t)]) (nil [])) (exprs-text args)]))
+           :else (form (concat-parts [[(w name)] (vec (map w (op-flag-words flags))) (match ty ((some t) [(type-text t)]) (nil []))
+                                      (exprs-text args) (align-words align)]))))
     ((KCall callee args tail) (print-call callee args tail))
-    ((KRet v) (match v ((some x) (form ["ret" (print-expr x)])) (nil "(ret)")))
-    ((KBr l) (form ["br" l]))
-    ((KCondBr c t f) (form ["br" (print-expr c) t f]))
+    ((KRet v) (match v ((some x) (form [(w "ret") (print-expr x)])) (nil (form [(w "ret")]))))
+    ((KBr l) (form [(w "br") l]))
+    ((KCondBr c t f) (form [(w "br") (print-expr c) t f]))
     ((KSwitch v d cases)
-     (form (concat-parts [["switch" (print-expr v) d]
+     (form (concat-parts [[(w "switch") (print-expr v) d]
                           (vec (map (fn (c: LCase) (form [(print-expr (. c value)) (. c label)])) cases))])))
-    ((KUnreachable) "(unreachable)")
-    ((KPhi t bs) (form (concat-parts [["phi" (type-str t)] (vec (map binding-text bs))])))
+    ((KUnreachable) (form [(w "unreachable")]))
+    ((KPhi t bs) (form (concat-parts [[(w "phi") (type-text t)] (vec (map binding-text bs))])))
     ((KLet bs body)
-     (form (concat-parts [["let" (form (vec (map binding-text bs)))] (exprs-text body)])))
+     (form (concat-parts [[(w "let") (form (vec (map binding-text bs)))] (exprs-text body)])))
     (_ "")))
 
-;; `(load (range LO HI) (align N)? T p)` (spec/lir.md 6.13): the bounds are the literals args 1 and 2 (lir.ast).
+;; `(LOAD (RANGE LO HI) (ALIGN N)? T p)` (spec/lir.md 6.13): the bounds are the literals args 1 and 2 (lir.ast).
 (defun range-load-text :private (ty: (Option LType) args: (Vec LExpr) align: (Option i64)) -> str
   (let ((bound (fn (e: LExpr) (match (expr-int-literal e) ((some v) (lit-str v)) (nil (print-expr e))))))
-    (form (concat-parts [["load" (form ["range" (bound (nth args 1)) (bound (nth args 2))])] (align-words align)
-                         [(type-str (unwrap-or ty ty-i32)) (print-expr (nth args 0))]]))))
+    (form (concat-parts [[(w "load") (form [(w "range") (bound (nth args 1)) (bound (nth args 2))])] (align-words align)
+                         [(type-text (unwrap-or ty ty-i32)) (print-expr (nth args 0))]]))))
 
 (defun binding-text :private (b: LBinding) -> str (form [(. b name) (print-expr (. b value))]))
 
 (defun print-call :private (callee: LCallee args: (Vec LExpr) tail: bool) -> str
   (match callee
-    ((CalDirect n) (form (concat-parts [[(if tail "tailcall" "call") (str "@" n)] (exprs-text args)])))
+    ((CalDirect n) (form (concat-parts [[(w (if tail "tailcall" "call")) (form [(w "global") n])] (exprs-text args)])))
     ((CalIndirect c ty)
-     (form (concat-parts [[(if tail "indirect-tailcall" "indirect-call") (print-expr c) (fn-type-str ty)] (exprs-text args)])))))
+     (form (concat-parts [[(w (if tail "indirect-tailcall" "indirect-call")) (print-expr c) (fn-type-text ty)] (exprs-text args)])))))
 
 ;; ---------------------------------------------------------------- items
 
 (defun linkage-words :private (m: LModifiers) -> (Vec str)
-  (concat-parts [(match (. m linkage) ((LkExternal) []) ((LkInternal) ["internal"]) ((LkPrivate) ["private"]))
+  (concat-parts [(match (. m linkage) ((LkExternal) []) ((LkInternal) [(w "internal")]) ((LkPrivate) [(w "private")]))
                  (flag-words (. m hidden) "hidden") (flag-words (. m inline) "inline")
                  (flag-words (. m noinline) "noinline") (flag-words (. m cold) "cold") (flag-words (. m unsafe) "unsafe")
-                 (match (. m export-name) (nil []) ((some n) [(form ["export-name" (string-text (str-bytes n))])]))]))
+                 (match (. m export-name) (nil []) ((some n) [(form [(w "export-name") (string-text (str-bytes n))])]))]))
 
-(defun cc-words :private (f: LFnType) -> (Vec str)
-  (match (. f cc) ((CcC) []) ((CcTail) ["tailcc"]) ((CcKernel) ["kernelcc"]) ((CcPreserve) ["preservemost"])))
+(defun global-text :private (n: str) -> str (form [(w "global") n]))
 
 (defun print-item :private (it: LItem) -> str
   (match it
-    ((ItStruct s) (form (concat-parts [["defstruct"] (flag-words (. s mutable) "mutable") [(. s name) (form (vec (map type-str (. s fields))))]])))
+    ((ItStruct s) (form (concat-parts [[(w "defstruct")] (flag-words (. s mutable) "mutable") [(. s name) (form (vec (map type-text (. s fields))))]])))
     ((ItOwnership o)
-     (form ["ownership" (form ["retain" (str "@" (. o retain))]) (form ["release" (str "@" (. o release))]) (form ["unique" (str "@" (. o unique))])
-            (form ["alloc" (str "@" (. o alloc))]) (form ["stack-init" (str "@" (. o stack-init))]) (form ["stack-end" (str "@" (. o stack-end))])
-            (form ["header" (str "%struct." (. o header))])]))
+     (form [(w "ownership") (form [(w "retain") (global-text (. o retain))]) (form [(w "release") (global-text (. o release))])
+            (form [(w "unique") (global-text (. o unique))]) (form [(w "alloc") (global-text (. o alloc))])
+            (form [(w "stack-init") (global-text (. o stack-init))]) (form [(w "stack-end") (global-text (. o stack-end))])
+            (form [(w "header") (type-text (TNamed (. o header)))])]))
     ((ItGlobal g)
-     (form (concat-parts [[(if (. g constant) "constant" "global")] (linkage-words (. g mods)) (flag-words (. g shared) "shared")
-                          [(. g name) (type-str (. g ty)) (print-expr (. g init))]])))
-    ((ItDeclareGlobal g) (form (concat-parts [["declare-global"] (flag-words (. g hidden) "hidden") [(. g name) (type-str (. g ty))]])))
+     (form (concat-parts [[(w (if (. g constant) "constant" "global"))] (linkage-words (. g mods)) (flag-words (. g shared) "shared")
+                          [(. g name) (type-text (. g ty)) (print-expr (. g init))]])))
+    ((ItDeclareGlobal g) (form (concat-parts [[(w "declare-global")] (flag-words (. g hidden) "hidden") [(. g name) (type-text (. g ty))]])))
     ((ItDeclare f)
-     (form (concat-parts [["declare"] (flag-words (. f hidden) "hidden") (cc-words (. f ty))
-                          [(. f name) (ret-str (. (. f ty) ret)) (fn-params-str (. f ty))]])))
+     (form (concat-parts [[(w "declare")] (flag-words (. f hidden) "hidden") (cc-words (. (. f ty) cc))
+                          [(. f name) (ret-text (. (. f ty) ret)) (fn-params-text (. f ty))]])))
     ((ItTarget t)
-     (form (into ["target" (form ["cpu" (string-text (str-bytes (. t cpu)))])]
-                 (if (= (. t features) "") [] [(form ["features" (string-text (str-bytes (. t features)))])]))))
-    ((ItDependentLibrary d) (form ["dependent-library" (string-text (str-bytes (. d name)))]))
+     (form (into [(w "target") (form [(w "cpu") (string-text (str-bytes (. t cpu)))])]
+                 (if (= (. t features) "") [] [(form [(w "features") (string-text (str-bytes (. t features)))])]))))
+    ((ItDependentLibrary d) (form [(w "dependent-library") (string-text (str-bytes (. d name)))]))
     ((ItDefine f)
-     (form (concat-parts [["define"] (linkage-words (. f mods)) (cc-words (. f ty))
-                          [(form [(. f name) (ret-str (. (. f ty) ret))]) (params-text f)]
+     (form (concat-parts [[(w "define")] (linkage-words (. f mods)) (cc-words (. (. f ty) cc))
+                          [(form [(. f name) (ret-text (. (. f ty) ret))]) (params-text f)]
                           (vec (map block-text (. f blocks)))])))))
 
 (defun params-text :private (f: LFunction) -> str
@@ -250,9 +295,9 @@
               out
               (recur (+ i 1) (conj out (param-text (nth (. (. f ty) params) i) (. (nth (. f params) i) name))))))))
 
-;; `(T name)`, or `((ptr 1) owned name)` for a parameter of the owned kind (spec/lir.md 6.14.2).
+;; `(T name)`, or `((PTR (ADDRSPACE 1)) OWNED name)` for a parameter of the owned kind (spec/lir.md 6.14.2).
 (defun param-text :private (t: LType name: str) -> str
-  (if (type-owned? t) (form ["(ptr 1)" "owned" name]) (form [(type-str t) name])))
+  (if (type-owned? t) (form [managed-text (w "owned") name]) (form [(type-text t) name])))
 
 (defun block-text :private (b: LBlock) -> str
-  (form (concat-parts [["block" (. b label)] (exprs-text (. b body))])))
+  (form (concat-parts [[(w "block") (. b label)] (exprs-text (. b body))])))

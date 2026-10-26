@@ -7,7 +7,8 @@
 ;; Positions count characters, as the Rust `chars()` does: the lexer walks bytes and a UTF-8 continuation byte does not advance the
 ;; column. `is_whitespace` is Unicode's (`ws-len`).
 (ns lir.sexp.lexer
-  (:use lir.diag))
+  (:use lir.diag)
+  (:require [lir.words :as words]))
 
 ;; sexp/lexer.rs `Tok`.
 (defenum Tok
@@ -43,14 +44,22 @@
           (set! (. c unicode) (assoc @(. c unicode) scalar class)))
       (set! (. c active) true)))
 
-;; The text, the cursor (byte offset, line and column, three cells) and the classes.
-(defstruct Lexer (src: str n: i64 i: (Cell i64) line: (Cell i64) col: (Cell i64) classes: Classes))
+;; The text, the cursor (byte offset, line and column, three cells), the classes, and whether `<` starts a vector type `<N x T>` (the old
+;; spelling, spec/lir.md 2, while lir.words admits it) or is a character of an atom like any other.
+(defstruct Lexer (src: str n: i64 i: (Cell i64) line: (Cell i64) col: (Cell i64) classes: Classes old: bool))
 
 (defun lexer-new (src: str) -> Lexer
   (lexer-with src (classes-new)))
 
+;; A lexer that reads the old spelling's `<N x T>` token whatever the mode (lir.respell, which converts the old spelling).
+(defun lexer-old (src: str) -> Lexer
+  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1) (classes-new) true))
+
 (defun lexer-with (src: str classes: Classes) -> Lexer
-  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1) classes))
+  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1) classes (words/old-admitted?)))
+
+;; Whether the lexer reads the old spelling's `<N x T>` token.
+(defun lex-old? (lx: Lexer) -> bool (. lx old))
 
 ;; The UTF-8 character at byte j: `scalar | width << 32` (a byte that is no lead byte: itself, width 1).
 (defun scalar-at :private (lx: Lexer j: i64) -> i64
@@ -189,7 +198,7 @@
               (= b 91) (single lx tok-bracket-open start)
               (= b 93) (single lx tok-bracket-close start)
               (= b 34) (lex-string lx start)
-              (= b 60) (lex-vector lx start)
+              (and (= b 60) (. lx old)) (lex-vector lx start)
               :else (lex-atom lx start)))))
 
 (defun single :private (lx: Lexer t: Tok start: i64) -> (Result (Option Token) Diagnostic)

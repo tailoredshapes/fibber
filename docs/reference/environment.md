@@ -47,6 +47,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIRO_UNITS` | [compiler/native/liro/partition.fib:41](../../compiler/native/liro/partition.fib#L41) |
 | `FIB_LIR_FACTS` | [compiler/lir/facts.fib:15](../../compiler/lir/facts.fib#L15) |
 | `FIB_LIR_OWN` | [compiler/lir/own.fib:18](../../compiler/lir/own.fib#L18) |
+| `FIB_LIR_SPELLING` | [compiler/lir/words.fib:79](../../compiler/lir/words.fib#L79) |
 | `FIB_LIVE` | [compiler/driver/testlive.fib:89](../../compiler/driver/testlive.fib#L89) |
 | `FIB_LIVE_BASE` | [compiler/serve/livesess.fib:216](../../compiler/serve/livesess.fib#L216) |
 | `FIB_LIVE_DEBUG` | [compiler/serve/livesess.fib:377](../../compiler/serve/livesess.fib#L377) |

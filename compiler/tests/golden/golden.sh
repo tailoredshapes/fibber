@@ -13,6 +13,8 @@
 # Environment: GOLDEN_JOBS suites (and tool builds) at a time, default 4 (the gate's GATE_SLOTS limit the heavy ones); GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
 # Prints `ok SUITE (N inputs)` or `FAIL SUITE: first differing input` for each suite; exit 0 only if none failed; 2 for a usage error.
 set -u
+# The tree's lIR is in the old spelling until it is converted (spec/lir.md 2, transitional): lairf admits it (mk/config.mk sets the same).
+export FIB_LIR_SPELLING=${FIB_LIR_SPELLING:-old}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 . "$here/suites.sh"

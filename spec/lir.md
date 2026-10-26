@@ -45,19 +45,19 @@ more, a constant out-of-range vector index, a store to a `constant`).
 ## 1. Lexical syntax
 
 - A module is UTF-8 text. `;` starts a comment to the end of the line.
-  Commas are whitespace (so `{ ptr, ptr }` and `{ ptr ptr }` are the
-  same).
-- Tokens: `(`, `)`, `{`, `}`, `[`, `]`, strings, vector types and atoms.
+  Commas are whitespace.
+- Tokens: `(`, `)`, `{`, `}`, `[`, `]`, strings and atoms. No form of lIR is
+  written with braces or brackets (§2: the types and values they wrote
+  in the old spelling are spelled out); the reader reads them as lists
+  with their bracket, for reader macros (§4.8).
 - A **string** is `"…"` with the escapes `\n \t \r \0 \\ \"` and
   `\xHH` (one byte, two hex digits). Any other escape is an error
   `invalid escape`; a string without its closing quote is `unterminated
   string`.
-- A **vector type** is `<N x T>` written as one token (spaces inside
-  allowed): `<4 x i32>`.
 - An **atom** is any other run of characters that are not whitespace,
-  parentheses, braces, brackets, `"` or `;`. `@name` names a global or function,
-  `%struct.name` a struct type; any other atom is a keyword, a number or
-  a local name.
+  parentheses, braces, brackets, `"` or `;`: a word of lIR (upper case,
+  §2), a number, or a name. `@`, `%` and `<` are characters of an atom
+  like any other.
 - Nesting deeper than **1024** forms is an error `nesting deeper than
   1024` (liar's parser overflowed its stack at a nesting of about 200000,
   `lir-audit/deepadd.txt`); a module's readtable may set the depth,
@@ -65,21 +65,88 @@ more, a constant out-of-range vector index, a store to a `constant`).
 
 Integer tokens are decimal, `0x` hex or `0b` binary, with an optional
 leading `-`. Float tokens are decimal with an optional fraction and
-exponent, or `inf`, `-inf`, `nan`.
+exponent, or `INF`, `-INF`, `NAN`.
 
 ## 2. Types
 
+**Spelling.** (owner, 2026-10-25; §14 item 21.) lIR spells names out: it has
+no sigil or shorthand of its own. Every word lIR owns is written in upper
+case: the heads of items and instructions, modifiers, calling conventions,
+types, literal heads, flags, predicates, orderings and fields (`DEFINE`,
+`ADD`, `INTERNAL`, `TAILCC`, `I64`, `NULL`, `ACQ_REL`, `RETAIN`). They are
+LLVM's words, upper-cased; where lIR had abbreviated one it is LLVM's again
+(`ALWAYSINLINE`, `PRESERVE_MOSTCC`), a function type is `FUNCTION`, and
+`KERNELCC` stays lIR's (LLVM's word for it is NVPTX's, and WGSL has none).
+Two rules follow.
+
+1. **A reference or a type is a form, never a sigil.** `(GLOBAL NAME)` is
+   the address of the global or function `NAME` (LLVM's `@NAME`); the item
+   `(GLOBAL mod* NAME T init)` defines one, and the two are told apart by
+   position (an item or an operand) and by their operand count. `(STRUCT
+   NAME)` is the struct type a `DEFSTRUCT` defines (LLVM's `%NAME`, which
+   lair names `%struct.NAME`) and `((STRUCT NAME) v..)` its value. `(PTR
+   (ADDRSPACE 1))` is LLVM's `ptr addrspace(1)`. `(VECTOR N T)` and `(ARRAY
+   N T)` are LLVM's `<N x T>` and `[N x T]`, and a literal is headed by its
+   type as every literal is: `((VECTOR 4 I32) 1 2 3 4)`, `((ARRAY 2 I8) (I8
+   1) (I8 2))`. The anonymous struct, LLVM's literal struct `{ T, .. }`, is
+   `(LITERAL-STRUCT T..)` as a type and `(LITERAL-STRUCT v..)` as a value:
+   LLVM calls it a literal structure, and it cannot be taken for `(STRUCT
+   NAME)`, which has exactly one operand, a name, and refers to a
+   definition, where `LITERAL-STRUCT` has any number of types (in a type
+   position) or values (in a value position) and names nothing. `...`
+   (variadic) is the one piece of punctuation left.
+2. **The lower case is free.** lIR owns no lower-case word, so a name may
+   be any atom that is not a number and is not one of lIR's words (§5.3):
+   `add`, `let`, `null` and `block` are names, `ADD` is not (`reserved
+   word ADD used as a name`, `invalid label RET`). Case is not folded:
+   `Add` is a name. Labels, locals, parameters and the names of globals,
+   functions and structs are kept exactly as written. A language built on
+   lIR, as a library of macros, has the lower case to itself: a macro named
+   in lower case cannot capture a form of lIR, so no macro name is
+   reserved (§4.6).
+
+The words are one table, `compiler/lir/words.fib`: each word's text and
+its canonical name, which is its lower case except for the three respelled
+(`FUNCTION` is `fn`, `ALWAYSINLINE` is `inline`, `PRESERVE_MOSTCC` is
+`preservemost`). The parser, the printer, the name rule and the macro
+reader all read it, and `lair words` prints it. `compiler/tests/lir/words.sh`
+holds it equal to the upper-case atoms of this chapter's grammar, the code
+blocks that hold `::=`, comments left out, less the placeholders, which are
+upper case and are not words. The placeholders: `NAME PNAME LABEL STR
+INT FLT N T LO HI`. In prose, and in lIR's messages, a word is named by
+its canonical name (`load`, `inline`).
+
+**The old spelling (transitional, for one release).** Until the tree's
+lIR is converted and a seed reads the new spelling, the parser can also
+read the old one and gives it the same tree: lower-case words, `@f`,
+`%struct.S`, `(ptr 1)`, `(fn ..)`, `inline`, `preservemost`, `inf` and
+`nan`, the vector type `<N x T>` as one token, `[N x T]` and `{ T.. }`;
+with it the old rules come back (the reserved words of the old §5.3, `@`
+and `%` refused at the start of a name, and the macro names of the old
+§4.6). `lair` reads the new spelling only unless it is given
+`--old-spelling` or `FIB_LIR_SPELLING=old` (`--new-spelling` and `new` the
+other way), and `lair cases` and `lair fuzz` pass the choice on to the
+processes they start (`lair fuzz` and `fuzz-one` admit the old spelling
+unless told otherwise: their generator writes it). `fibc` admits the old
+spelling, since its own lIR texts (the runtime, the templates) and the
+inline `lir` bodies of `lib/` stay old until the seed reads the new; the
+build exports
+`FIB_LIR_SPELLING=old` for its `lair` runs (`mk/config.mk`). The printer
+writes the new spelling only, and messages keep the old (`@f`,
+`%struct.s`) until they move with the case headers. The old spelling is
+dropped in the release after the seed that reads the new.
+
 ```
-type   ::= i1 | i8 | i16 | i32 | i64 | float | double | ptr
-         | (ptr 1)                          ; a managed reference: LLVM's ptr addrspace(1), non-integral (§6.14)
-         | <N x elem>                       ; elem: an integer type, float, double or ptr; 1 ≤ N ≤ 1024
-         | %struct.NAME                     ; a named struct, defined by defstruct
-         | { type* }                        ; an anonymous (literal) struct
-         | [N x type]                       ; an array of N elements, N ≥ 0 (§2.1)
-rtype  ::= type | void                      ; function results only
-ptype  ::= type | (owned (ptr 1))           ; a parameter's type, with its ownership kind (§6.14.2)
-fntype ::= (fn cc? rtype (ptype* ...?))     ; a function type, for indirect calls
-cc     ::= ccc | tailcc | kernelcc          ; kernelcc: a GPU kernel's entry (§6.9a, accepted 2026-10-07)
+type   ::= I1 | I8 | I16 | I32 | I64 | FLOAT | DOUBLE | PTR
+         | (PTR (ADDRSPACE 1))             ; a managed reference: LLVM's ptr addrspace(1), non-integral (§6.14)
+         | (VECTOR N elem)                 ; elem: an integer type, float, double or ptr; 1 ≤ N ≤ 1024
+         | (STRUCT NAME)                   ; a named struct, defined by defstruct
+         | (LITERAL-STRUCT type*)          ; an anonymous (literal) struct
+         | (ARRAY N type)                  ; an array of N elements, N ≥ 0 (§2.1)
+rtype  ::= type | VOID                     ; function results only
+ptype  ::= type | (OWNED (PTR (ADDRSPACE 1)))     ; a parameter's type, with its ownership kind (§6.14.2)
+fntype ::= (FUNCTION cc? rtype (ptype* ...?))     ; a function type, for indirect calls
+cc     ::= CCC | TAILCC | KERNELCC | PRESERVE_MOSTCC   ; kernelcc: a GPU kernel's entry (§6.9a); preservemost: §6.6b
 ```
 
 - There is no `bool` (use `i1`), no `f32`/`f64` (use `float`/`double`),
@@ -87,7 +154,7 @@ cc     ::= ccc | tailcc | kernelcc          ; kernelcc: a GPU kernel's entry (§
   anywhere in the language.
 - Two types are equal only if they are written the same: a named struct
   equals only itself (not an anonymous struct with the same fields, as
-  in LLVM), and `<4 x i32>` differs from `<2 x i64>`.
+  in LLVM), and `(VECTOR 4 I32)` differs from `(VECTOR 2 I64)`.
 - **First-class** types (those a value, parameter, result, `load`,
   `store`, `phi` or `select` may have) are all of `type`. **Sized**:
   all of them (a struct may not contain itself by value, §4.1).
@@ -98,97 +165,104 @@ cc     ::= ccc | tailcc | kernelcc          ; kernelcc: a GPU kernel's entry (§
 
 ### 2.1 Arrays
 
-**Decided** (owner, 2026-09-28; §14 item 8). `[N x T]` is LLVM's array type: `N`
+**Decided** (owner, 2026-09-28; §14 item 8). `(ARRAY N T)` is LLVM's array type: `N`
 elements of the sized type `T`, laid out contiguously, `N` a
-non-negative decimal integer (`[0 x i8]` is the flexible trailing
+non-negative decimal integer (`(ARRAY 0 I8)` is the flexible trailing
 member of a struct, as in C; `array length must be a non-negative
 integer`, `array length 5000000000 is too large` above `2^32 - 1`).
 `T` may be any type, arrays and structs included; a vector's element
 may not be an array (§2). An array is an aggregate: it is a value
 (`load`, `store`, `phi`, `select`, a parameter or a result), it is
-built by `([N x T] v..)` (§3) or `insertvalue`, read by `extractvalue`
+built by `((ARRAY N T) v..)` (§3) or `insertvalue`, read by `extractvalue`
 (§6.4), and addressed by `getelementptr` (§6.5). It has no `bits`
 (`bitcast cannot convert [4 x i32]`), is not atomic, and is not a
 `switch` or `icmp` operand. types.md §8.3 lays a string's bytes and an
-array object's elements out as `[0 x T]` at the end of the header
-struct, and §8.2 holds the type table as `[N x %struct.fib.typerec]`.
+array object's elements out as `(ARRAY 0 T)` at the end of the header
+struct, and §8.2 holds the type table as `(ARRAY N (STRUCT fib.typerec))`.
 
 ## 3. Values and literals
 
 ```
 value ::= NAME                  ; a parameter or let-bound name (§5.3)
-        | @NAME                 ; the address of a global or function: ptr
-        | (iK INT)              ; K ∈ {1, 8, 16, 32, 64}
-        | (float FLT) | (double FLT)
-        | (ptr null)
-        | (<N x T> v₁ .. v_N)   ; N literal elements: numbers, or null for ptr elements
-        | (string STR)          ; ptr to a private constant NUL-terminated byte array
-        | { value* }            ; anonymous struct value
-        | (%struct.S value*)    ; named struct value, one value per field
-        | ([N x T] value*)      ; array value, exactly N elements of type T (§2.1)
-        | (zeroinitializer T)   ; every bit zero: 0, 0.0, null, and so on through aggregates
+        | (GLOBAL NAME)         ; the address of a global or function: ptr
+        | (I1 INT) | (I8 INT) | (I16 INT) | (I32 INT) | (I64 INT)
+        | (FLOAT FLT) | (DOUBLE FLT)
+        | (PTR NULL)
+        | ((VECTOR N T) v₁ .. v_N)   ; N literal elements: numbers, or NULL for ptr elements
+        | (STRING STR)          ; ptr to a private constant NUL-terminated byte array
+        | (LITERAL-STRUCT value*)    ; anonymous struct value
+        | ((STRUCT NAME) value*)     ; named struct value, one value per field
+        | ((ARRAY N T) value*)       ; array value, exactly N elements of type T (§2.1)
+        | (ZEROINITIALIZER T)   ; every bit zero: 0, 0.0, null, and so on through aggregates
         | instruction           ; §6
+FLT   ::= a float token | INF | -INF | NAN   ; §1
 ```
 
-- `(iK n)` accepts `-2^(K-1) ≤ n ≤ 2^K - 1`, stored as its low `K`
-  bits: `(i8 255)` and `(i8 -1)` are the same value. Outside that range
+- `(IK n)`, `K` one of 1, 8, 16, 32 and 64, accepts `-2^(K-1) ≤ n ≤ 2^K - 1`, stored as its low `K`
+  bits: `(I8 255)` and `(I8 -1)` are the same value. Outside that range
   the literal is an error `integer literal n out of range for iK`
-  (liar accepted `(i8 300)` as 44, `lir-audit/tc/i8_overflow_lit.lir`).
-- `(float x)` and `(double x)` round to nearest; a finite literal that
+  (liar accepted `(I8 300)` as 44, `lir-audit/tc/i8_overflow_lit.lir`).
+- `(FLOAT x)` and `(DOUBLE x)` round to nearest; a finite literal that
   rounds to an infinity is an error `float literal out of range for
   double` (liar read `1e999` as infinity).
 - A struct or array value is built by `insertvalue`s when a field is
   not a constant; its fields are evaluated left to right. An array
   literal has exactly `N` elements, each of type `T` (`[3 x i32]
   literal: 3 elements expected, found 2`; `[3 x i32] literal: element
-  2 has type i64, expected i32`). `(zeroinitializer T)` is a constant
+  2 has type i64, expected i32`). `(ZEROINITIALIZER T)` is a constant
   of any sized `T`; it emits no instruction.
-- `(string "…")` may appear in any function and as a global
+- `(STRING "…")` may appear in any function and as a global
   initialiser (§9); each occurrence is its own constant: two equal
   strings have two addresses, on both paths and at every optimisation
   level. lair writes the constant `private` and never `unnamed_addr`
   (LLVM merges only `unnamed_addr` constants; until 2026-10-25 lair
   marked every string so and the spec and the code disagreed: decision
   D12 of docs/design/lir-language.md, **Decided** owner 2026-10-25, the
-  code follows the spec; §14 item 21; `cases/lir/instr/string-own-constant.lir`).
+  code follows the spec; §14 item 22; `cases/lir/instr/string-own-constant.lir`).
 
 ## 4. Modules
 
 ```
 module ::= item*
-item   ::= (defstruct mutable? NAME (type*))       ; mutable: its fields may be written without uniqueness evidence (§6.14.5 rule 8)
-         | (global mod* NAME type init)            ; mutable
-         | (constant mod* NAME type init)          ; read-only
-         | (declare-global hidden? NAME type)      ; a variable defined elsewhere (§4.4)
-         | (declare hidden? cc? NAME rtype (ptype* ...?))  ; a function defined elsewhere
-         | (define mod* cc? (NAME rtype) (param*) block+)
-         | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
-         | (dependent-library STRING)                      ; a native library the code needs linked: LLVM's !llvm.dependent-libraries (§4.9)
-         | (ownership (retain @f) (release @f) (unique @f) (alloc @f) (stack-init @f) (stack-end @f) (header %struct.NAME))
+item   ::= (DEFSTRUCT MUTABLE? NAME (type*))       ; mutable: its fields may be written without uniqueness evidence (§6.14.5 rule 8)
+         | (GLOBAL mod* NAME type init)            ; mutable
+         | (CONSTANT mod* NAME type init)          ; read-only
+         | (DECLARE-GLOBAL HIDDEN? NAME type)      ; a variable defined elsewhere (§4.4)
+         | (DECLARE HIDDEN? cc? NAME rtype (ptype* ...?))  ; a function defined elsewhere
+         | (DEFINE mod* cc? (NAME rtype) (param*) block+)
+         | (TARGET (CPU STR) (FEATURES STR)?)        ; the CPU and features to generate code for (§4.5)
+         | (DEPENDENT-LIBRARY STR)                   ; a native library the code needs linked: LLVM's !llvm.dependent-libraries (§4.9)
+         | (OWNERSHIP (RETAIN (GLOBAL NAME)) (RELEASE (GLOBAL NAME)) (UNIQUE (GLOBAL NAME)) (ALLOC (GLOBAL NAME))
+                      (STACK-INIT (GLOBAL NAME)) (STACK-END (GLOBAL NAME)) (HEADER (STRUCT NAME)))
                                                    ; what the ownership forms lower to (§6.14.6)
-         | (define-macro NAME (PNAME* ...?) block+)        ; a compile-time macro (§4.6)
-         | (require-macros STRING)                         ; the macros of a library file (§4.6)
-         | (import STRING)                                 ; another module of the program (§4.7)
-         | (define-reader-macro STRING (PNAME) block+)     ; a reader macro on a character (§4.8)
-         | (define-dispatch-macro STRING (PNAME) block+)   ; a reader macro on the character after # (§4.8)
-         | (define-reader-class STRING CLASS)              ; a character's class: whitespace | constituent | terminating (§4.8)
-         | (define-reader-depth N)                         ; the nesting the reader allows (§4.8)
-         | (define-token-reader (PNAME PNAME) block+)      ; the module's token reader (§4.8)
-param  ::= (type PNAME) | ((ptr 1) owned PNAME)    ; a parameter; `owned` is its ownership kind (§6.14.2)
-mod    ::= private | internal | external           ; linkage (§4.3), at most one
-         | hidden                                  ; visibility (§4.3)
-         | inline                                  ; a function the optimiser always inlines (§4.3)
-         | noinline | cold                         ; LLVM's function attributes of those names (§4.3), `define` only
-         | shared                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
-         | unsafe                                  ; the fence of §6.14.4 is open inside the function, `define` only
-         | (export-name STRING)                    ; LLVM's "wasm-export-name" attribute (§4.3), `define` only
-block  ::= (block LABEL instr+)
+         | (DEFINE-MACRO NAME (PNAME* ...?) block+)        ; a compile-time macro (§4.6)
+         | (REQUIRE-MACROS STR)                         ; the macros of a library file (§4.6)
+         | (IMPORT STR)                                 ; another module of the program (§4.7)
+         | (MACRO-IMPORT STR)                           ; a module compiled into the macro session only (§4.6)
+         | (MODULE-MACRO NAME)                          ; the macro applied to the rest of the module's forms (§4.6)
+         | (INCLUDE STR)                                ; a file's text read in place (§4.6)
+         | (DEFINE-READER-MACRO STR (PNAME) block+)     ; a reader macro on a character (§4.8)
+         | (DEFINE-DISPATCH-MACRO STR (PNAME) block+)   ; a reader macro on the character after # (§4.8)
+         | (DEFINE-READER-CLASS STR class)              ; a character's class (§4.8)
+         | (DEFINE-READER-DEPTH N)                         ; the nesting the reader allows (§4.8)
+         | (DEFINE-TOKEN-READER (PNAME PNAME) block+)      ; the module's token reader (§4.8)
+         | (BEGIN item*)                                   ; a splice: each form a top-level form in its place (§4.6)
+class  ::= WHITESPACE | CONSTITUENT | TERMINATING
+param  ::= (type PNAME) | ((PTR (ADDRSPACE 1)) OWNED PNAME)    ; a parameter; `owned` is its ownership kind (§6.14.2)
+mod    ::= PRIVATE | INTERNAL | EXTERNAL           ; linkage (§4.3), at most one
+         | HIDDEN                                  ; visibility (§4.3)
+         | ALWAYSINLINE                            ; a function the optimiser always inlines (§4.3)
+         | NOINLINE | COLD                         ; LLVM's function attributes of those names (§4.3), `define` only
+         | SHARED                                  ; a global in block-shared memory of a kernel target (§6.9a), `global` only
+         | UNSAFE                                  ; the fence of §6.14.4 is open inside the function, `define` only
+         | (EXPORT-NAME STR)                       ; LLVM's "wasm-export-name" attribute (§4.3), `define` only
+block  ::= (BLOCK LABEL instr+)
 ```
 
 Anything else at the top level is an error `expected a top-level form
 (define, declare, declare-global, defstruct, global, constant), found …`
 (liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`). The
-message names the forms of the first M3 pass; `(target ..)` (§4.5) is a top-level form too, and
+message names the forms of the first M3 pass; `(TARGET ..)` (§4.5) is a top-level form too, and
 is left out of the text so that the Rust `lair`, the oracle of the compare scripts, says the same;
 so are `define-macro` and `require-macros` (§4.6), `import` (§4.7) and the five reader forms of §4.8, which are not items but directions to the
 reader, and a macro use whose macro is not yet defined gets this message too.
@@ -202,10 +276,10 @@ before it is used (§4.6).
   struct %struct.s` (liar kept the first of two `define`s of one name,
   `tc/dup_fn.lir`).
 - Names beginning with `llvm.` are reserved: `name @llvm.x is reserved`.
-- Every `%struct.S` used anywhere must be defined: `undefined struct
+- Every `(STRUCT S)` used anywhere must be defined: `undefined struct
   %struct.S`. A struct that contains itself by value, directly or
   through other structs, is `struct %struct.S contains itself by value`.
-- Every `@f` must be defined or declared in the module: `undefined
+- Every `(GLOBAL f)` must be defined or declared in the module: `undefined
   function @f`, `undefined global @g`. Calling a global variable is
   `@g is not a function`.
 - A global's initialiser must have the global's type (§9).
@@ -238,10 +312,10 @@ any order before the calling convention (`duplicate modifier private`,
 | `internal` | `internal` | a local symbol of the object file (C's `static`): invisible to other modules, present for the debugger |
 | `private` | `private` | no symbol at all: the name exists only inside the module |
 | `hidden` | `hidden` visibility | exported to other modules of the same executable or shared object, but not from it (the ELF/Mach-O sense); a call to it needs no PLT |
-| `inline` | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
+| `ALWAYSINLINE` (canonical name `inline`) | `alwaysinline` | **Decided** (owner, 2026-10-20; docs/design/inline-lir.md): a `define` only (`global cannot be inline: inline is for a function`, `declare cannot be inline`), once (`duplicate modifier inline`), alongside any linkage word; the optimiser inlines every call of it it can see. Inlining is not a language rule: a call through a pointer or from another module is a call, and an `inline` function that is recursive is not inlined into itself |
 | `noinline` | `noinline` | **Decided** (owner, 2026-10-25: lIR spells what LLVM IR spells, and lair reads no front end's convention out of band): a `define` only (`declare cannot be noinline`, `global cannot be noinline: noinline is for a function`), once (`duplicate modifier noinline`), not with `inline` (`inline and noinline exclude each other`: LLVM's verifier refuses `alwaysinline` with `noinline`); the inliner never inlines the function. For the out-of-line half of a fast path, which LLVM would otherwise inline into its one caller (the runtime's `fib.alloc-slow`, `fib.retain-slow`, `fib.release-slow`, `fib.stack-slow`) |
 | `cold` | `cold` | **Decided** (owner, 2026-10-25): a `define` only (`declare cannot be cold`, `global cannot be cold: cold is for a function`), once; the function is rarely called: when LLVM weighs the edges of a function, a block that a call of it post-dominates is cold too, so it is laid out off the hot path. For a trap or error path |
-| `(export-name "NAME")` | `"wasm-export-name"="NAME"` | **Decided** (owner, 2026-10-25: the text is the contract; §14 item 20): a `define` only (`declare cannot be export-name`, `global cannot be export-name: export-name is for a function`), once (`duplicate modifier export-name`), among the other modifiers in any order; `NAME` a non-empty string (`export-name expects one string`, `.. found X`, `export-name: the name must not be empty`). LLVM's string attribute of that name: the WebAssembly backend marks the symbol exported in the object and `wasm-ld` exports the function under `NAME` (clang's `__attribute__((export_name))`); every other backend ignores it, and the C, JS and WGSL printers too. What a native shared library exports is not this but the linkage and visibility of this table: the `external` definitions that are not `hidden`, and nothing else (lair writes no version script or symbol list; until 2026-10-25 it took one beside the module). A front end writes it on each function a wasm host is to call |
+| `(EXPORT-NAME "NAME")` | `"wasm-export-name"="NAME"` | **Decided** (owner, 2026-10-25: the text is the contract; §14 item 20): a `define` only (`declare cannot be export-name`, `global cannot be export-name: export-name is for a function`), once (`duplicate modifier export-name`), among the other modifiers in any order; `NAME` a non-empty string (`export-name expects one string`, `.. found X`, `export-name: the name must not be empty`). LLVM's string attribute of that name: the WebAssembly backend marks the symbol exported in the object and `wasm-ld` exports the function under `NAME` (clang's `__attribute__((export_name))`); every other backend ignores it, and the C, JS and WGSL printers too. What a native shared library exports is not this but the linkage and visibility of this table: the `external` definitions that are not `hidden`, and nothing else (lair writes no version script or symbol list; until 2026-10-25 it took one beside the module). A front end writes it on each function a wasm host is to call |
 
 A function's name carries no attribute: lair puts `alwaysinline`, `noinline` and `cold` on a function
 when its `define` says so and never otherwise (until 2026-10-25 it made every function whose name ended
@@ -258,15 +332,15 @@ in its own module; what it cannot be is seen from outside (§11).
 
 ### 4.4 External globals
 
-**Decided** (owner, 2026-09-28; §14 item 10). `(declare-global NAME T)` names a
+**Decided** (owner, 2026-09-28; §14 item 10). `(DECLARE-GLOBAL NAME T)` names a
 variable of type `T` that another module or the C library defines: a
-`declare` for data. `@NAME` is its address; `(load T @NAME)` reads it
+`declare` for data. `(GLOBAL NAME)` is its address; `(LOAD T (GLOBAL NAME))` reads it
 and `store` writes it, under the typed direct-access rule of §6.5. It
 has no initialiser and is never `constant` in lIR (`store to constant
 @g` never fires on it; a store to a read-only definition elsewhere is
-undefined behaviour, as in C). `(declare-global stderr ptr)` reaches
+undefined behaviour, as in C). `(DECLARE-GLOBAL stderr PTR)` reaches
 glibc's `stderr`; `errno` is a macro over a function there, not a
-symbol, so `(declare __errno_location ptr ())` is the way to it.
+symbol, so `(DECLARE __errno_location PTR ())` is the way to it.
 
 ### 4.5 The target
 
@@ -274,7 +348,7 @@ symbol, so `(declare __errno_location ptr ())` is the way to it.
 and the CPU features its code is generated for:
 
 ```
-(target (cpu "x86-64-v3") (features "+avx2,+fma"))
+(TARGET (CPU "x86-64-v3") (FEATURES "+avx2,+fma"))
 ```
 
 `cpu` is required; `features` is optional and defaults to the empty
@@ -323,20 +397,20 @@ s-expression", because LLVM has no such thing and the languages built on lIR (gl
 LLVM's spelling: a macro's body is ordinary lIR, and what it returns is parsed as the text would be.
 
 ```
-(define-macro NAME (PNAME* ...?) block+)
-(require-macros "FILE")
+(DEFINE-MACRO NAME (PNAME* ...?) block+)
+(REQUIRE-MACROS "FILE")
 ```
 
-**Definition.** `(define-macro NAME (P₁ .. Pₙ) block+)` defines the macro `NAME`. Its body is the function
-`(define (lir.macro.NAME ptr) ((ptr P₁) .. (ptr Pₙ)) block+)`: every parameter is a `ptr` to an s-expression object (below), and it
+**Definition.** `(DEFINE-MACRO NAME (P₁ .. Pₙ) block+)` defines the macro `NAME`. Its body is the function
+`(DEFINE (lir.macro.NAME PTR) ((PTR P₁) .. (PTR Pₙ)) block+)`: every parameter is a `ptr` to an s-expression object (below), and it
 returns one. The body is checked and compiled when the form is read, as any `define` is (§10; the module's own `define`s are not visible to
 it: a macro runs before the module exists), and its errors are reported where they are in the body, prefixed `macro NAME:`. With `...`
-after the last name, `Pₙ` is bound to the list of the arguments past the first `n - 1` (`(define-macro defun (name params arrow ret body ...) ..)`),
+after the last name, `Pₙ` is bound to the list of the arguments past the first `n - 1` (`(DEFINE-MACRO defun (name params arrow ret body ...) ..)`),
 as `...` ends a variadic parameter list in a `declare`; `...` must follow a name (`... must follow a parameter name`) and be last
 (`... must be the last parameter`). A macro has at most 8 parameters, what the host's call bridge passes (`a macro takes at most 8 parameters`);
-the names are valid names (§5.3), each once (`duplicate parameter P`). `NAME` is a valid name that is not one of `define declare declare-global
-defstruct global constant target define-macro require-macros import begin block let` (`macro NAME: the name of a form`), and is defined once
-(`duplicate macro NAME`). A macro may be named as an instruction is; it then shadows it.
+the names are valid names (§5.3), each once (`duplicate parameter P`). `NAME` is a valid name, so never one of lIR's words (§2: a macro
+named in lower case cannot capture a form, and one named in upper case is refused as every such name is), and is defined once (`duplicate
+macro NAME`).
 
 **Use.** Once defined, `(NAME a₁ .. aₘ)` anywhere in a later form of the module, at the top level or inside one, is a use: the macro is called
 with the arguments as objects (unexpanded) and the use is replaced by the form it returns. A use before the definition is not a use (the
@@ -354,20 +428,20 @@ before this section existed, and the reader hands each of its forms to the parse
 **Splices.** A top-level form headed `begin`, written or returned by a macro used at the top level, is a splice: its elements are each
 expanded and parsed as a top-level form, in order, in its place. So a macro may expand to several items (a `defrecord` is a `defstruct`,
 a constructor and the accessors), a spliced `define-macro` defines its macro for the forms after it, a splice in a splice is flattened,
-and `(begin)` is nothing. The word is Scheme's: a top-level `begin` splices its definitions there (Common Lisp's top-level `progn` is the
+and `(BEGIN)` is nothing. The word is Scheme's: a top-level `begin` splices its definitions there (Common Lisp's top-level `progn` is the
 same); LLVM has no spelling for it, so it is lIR's own, as `define-macro` is, and nothing new is invented. A macro use is applied before
 anything in its result is expanded, so the splice is seen whole. Inside a function `begin` is no instruction: a macro used there whose
 result is a splice is `macro NAME: a splice (begin ..) is a top-level form, not an instruction` at the use, and a written one is `unknown
-instruction begin`. `begin` is among the names a macro may not have. A spliced reader form (§4.8: `define-reader-macro`,
+instruction begin`. A spliced reader form (§4.8: `define-reader-macro`,
 `define-dispatch-macro`, `define-token-reader`) binds as a written one does, for the text read after the top-level form that spliced it;
 the elements of the splice were read before it ran, so a binding it makes reaches them no more than a written one reaches its own form
 (`cases/lir/macros/splice-define-reader.lir`). The cases are `cases/lir/macros/splice-*.lir` and `reject-splice-in-body.lir`.
 
 **Scope.** A macro is visible to the forms after its definition in the module, the bodies of later `define-macro`s included (so a macro
-may expand to a use of an earlier one, and its own body may use one), and its function `@lir.macro.NAME` is declared in the bodies of
+may expand to a use of an earlier one, and its own body may use one), and its function `(GLOBAL lir.macro.NAME)` is declared in the bodies of
 later macros, which may call it (`cases/lir/macros/position.lir`); a body may call its own function too, which is the module's own
 `define`, so a macro recurses over the forms it is given directly (`cases/lir/macros/self-recursive.lir`). A body holds blocks only: it
-declares nothing else, and calls nothing of the C library or of the module. `(require-macros "FILE")` defines, in the requiring module, the
+declares nothing else, and calls nothing of the C library or of the module. `(REQUIRE-MACROS "FILE")` defines, in the requiring module, the
 macros of the library `FILE`, a text of `define-macro` and `require-macros` forms and nothing else (`expected define-macro or
 require-macros, found declare`): a library is not a module, there is nothing to link its items into (ADR 0024). `FILE` is read as written
 when absolute, else beside the requiring file (`cases/lir/macros/x.lir` requires `"../../../lib/lir/defun.lir"`), or relative to the
@@ -376,7 +450,7 @@ links resolved by the OS, the authority on which file is which; a lexical normal
 of one file are one library (`cases/lir/macros/require-twice-spelled.lir`), while every message names the path as written; a
 library that requires the module or a library being loaded is `require-macros: FILE requires itself`; an error in a library is
 `require-macros: FILE:L:C: error: ..` at the require. This is the smallest import there is: one form, one file, no names, no renaming,
-no search path; a library of macros is just a file of them, and what a module needs it names by path. `(import "FILE")` (§4.7) is the
+no search path; a library of macros is just a file of them, and what a module needs it names by path. `(IMPORT "FILE")` (§4.7) is the
 same shape for a module: its functions, globals, structs and macros.
 
 **Hygiene.** None in v1: a macro's result is read as if written in place, so a name it binds can capture or collide with one of the
@@ -389,17 +463,17 @@ makes and the parser takes) and the objects a macro's code sees, laid out thus, 
 them):
 
 ```
-(defstruct lir.sexp (i64 i64 i64 ptr))                   ; the start of every object: tag, line, column, file
-(defstruct lir.sexp.symbol (i64 i64 i64 ptr ptr i64))    ; 1, position, bytes (a NUL after them), count
-(defstruct lir.sexp.integer (i64 i64 i64 ptr i64))       ; 2, position, value
-(defstruct lir.sexp.float (i64 i64 i64 ptr double))      ; 3, position, value
-(defstruct lir.sexp.string (i64 i64 i64 ptr ptr i64))    ; 4, position, bytes (a NUL after them), count
-(defstruct lir.sexp.list (i64 i64 i64 ptr ptr i64 i64 i64)) ; 5, position, items (an array of ptr), count, capacity, bracket (0 `()`, 1 `{}`, 2 `[]`)
+(DEFSTRUCT lir.sexp (I64 I64 I64 PTR))                   ; the start of every object: tag, line, column, file
+(DEFSTRUCT lir.sexp.symbol (I64 I64 I64 PTR PTR I64))    ; 1, position, bytes (a NUL after them), count
+(DEFSTRUCT lir.sexp.integer (I64 I64 I64 PTR I64))       ; 2, position, value
+(DEFSTRUCT lir.sexp.float (I64 I64 I64 PTR DOUBLE))      ; 3, position, value
+(DEFSTRUCT lir.sexp.string (I64 I64 I64 PTR PTR I64))    ; 4, position, bytes (a NUL after them), count
+(DEFSTRUCT lir.sexp.list (I64 I64 I64 PTR PTR I64 I64 I64)) ; 5, position, items (an array of ptr), count, capacity, bracket (0 `()`, 1 `{}`, 2 `[]`)
 ```
 
 An atom of the text is an integer when it is an integer token (§1) whose value fits an `i64`, a float when it is a float token
-(`inf`, `-inf`, `nan` included), else a symbol: `@f`, `%struct.s`, names, keywords and `...` are symbols, and so is a vector type `<N x T>`,
-a symbol of exactly that text (one reads back as the type). A string is its bytes; `{ .. }` and `[ .. ]` are lists with their bracket.
+(`inf`, `-inf`, `nan` included), else a symbol: `(GLOBAL f)`, `(STRUCT s)`, names, keywords and `...` are symbols, and so is a vector type `(VECTOR N T)`,
+a symbol of exactly that text (one reads back as the type). A string is its bytes; `(LITERAL-STRUCT ..)` and `[ .. ]` are lists with their bracket.
 The position is the form's: its line and column, 1-based, and its file as a NUL-terminated path (the module's, or the library's for a
 form in one); line and column 0 and a null file for an object a macro made. Going back, an integer prints in decimal, a float as the
 shortest decimal that reads back to it or `inf`, `-inf`, `nan`. The layout is the contract: a macro may read the fields with
@@ -409,7 +483,7 @@ stream's functions of §4.8 are the only names that are):
 | Function | Does |
 |---|---|
 | `(lir.sexp.tag s) : i64`, `(lir.sexp.line s) : i64`, `(lir.sexp.column s) : i64`, `(lir.sexp.file s) : ptr` | the tag and the position of any object |
-| `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(string "define")`), copied |
+| `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(STRING "DEFINE")`), copied |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
 | `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
 | `(lir.sexp.list bracket) : ptr` | an empty list with that bracket |
@@ -431,7 +505,7 @@ own module's worker). When the
 nested expansion fails, the macro gets null and the nested error, where it is, is the use's error whatever the macro then returns
 (`cases/lir/macros/expand-delegate.lir`, `reject-expand-fails.lir`); a reader macro (§4.8) runs while the text is read and has no
 expansion to call: null (`cases/lir/readers/expand-null.lir`). 
-**macro-import.** `(macro-import "FILE")` compiles the lIR module `FILE` into the macro session of the module that writes it (as the
+**macro-import.** `(MACRO-IMPORT "FILE")` compiles the lIR module `FILE` into the macro session of the module that writes it (as the
 library `lir.sexp` is), once per session by its canonical path, and declares its structs, its external `define`s and `global`s in the
 bodies of the macros defined after it, as `lir.sexp.*` are; the module is read and expanded as a module of its own (its `import`s are
 macro-imported into the session the same way, their interfaces its declarations) and checked as one, and an error in it is
@@ -443,7 +517,7 @@ directions that bring a file: `require-macros` brings macros (and reader macros)
 the program and its interface to the importer; `macro-import` brings a module into the macro session only: it is neither linked into the
 program nor exported, and a library may hold it beside `define-macro`.
 
-**module-macro.** `(module-macro NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
+**module-macro.** `(MODULE-MACRO NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
 parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
 of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
 `define-macro` or `module-macro` written there is data the macro sees); at the end of the text `NAME` is applied to them as its `...`
@@ -455,7 +529,7 @@ order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that 
 module's own text is data the macro sees. A `module-macro` the result splices arms again and takes the rest of the splice, applied in turn.
 Each module of a program (§4.7) has its own.
 
-**include.** `(include "FILE")` reads the file's text in place, under the module's readtable, its forms as if written there, each a
+**include.** `(INCLUDE "FILE")` reads the file's text in place, under the module's readtable, its forms as if written there, each a
 top-level form of the module (a direction, a macro use, an item), the objects a macro gets naming `FILE` as their file; once per module
 by canonical path, in the set `require-macros` uses, a file that includes itself being `include: FILE includes itself`; an error in it is
 `include: FILE:L:C: error: ..` at the include (`cases/lir/macros/include.lir`, `reject-include-self.lir`, `reject-include-error.lir`).
@@ -475,7 +549,7 @@ top-level form per line, with no `define-macro`, `require-macros` or `import` le
 differential checks (`compiler/tests/js/diff.sh`, `compiler/tests/c-backend/diff.sh`) feed a file that defines or requires macros, or imports, through
 `lair expand` first, and when the expansion is refused that refusal is the verdict the backend is compared with: a `reject` case a macro
 refuses is never seen by the backend. A file with no macros goes to the backend as it is, so that a diagnostic's position is the file's. The
-first library is `lib/lir/defun.lir`: `(defun NAME ((P T)..) -> R block+)` is `(define (NAME R) ((T P)..) block+)`, in lIR over
+first library is `lib/lir/defun.lir`: `(defun NAME ((P T)..) -> R block+)` is `(DEFINE (NAME R) ((T P)..) block+)`, in lIR over
 these objects. The cases are `cases/lir/macros/`.
 
 ### 4.7 Imports
@@ -484,7 +558,7 @@ these objects. The cases are `cases/lir/macros/`.
 macros, extern hooks and importing dependencies"; the owner may override; §14 item 16). A module names the modules it uses:
 
 ```
-(import "FILE")
+(IMPORT "FILE")
 ```
 
 **What it is.** A program is the union of its modules, joined as `llvm-link` joins LLVM modules: one namespace of exported names, a
@@ -507,10 +581,10 @@ found 42`). A module is identified by its canonical path (realpath(3), as a libr
 loaded once (`cases/lir/imports/spelled-twice.lir`), and a cycle closes through any spelling (`reject-cycle-spelled.lir`); every message
 names the path as written.
 
-**The interface.** The importer sees, at the position of the import, as items of its own: a `(declare hidden? cc NAME R (T..))` for
+**The interface.** The importer sees, at the position of the import, as items of its own: a `(DECLARE HIDDEN? cc NAME R (T..))` for
 every `define` of the imported module whose linkage is `external` (the default), with the define's calling convention, types and
 visibility, as a C header declares a function (`inline`, `noinline` and `cold` are the definition's, §4.3, and the optimiser still sees the
-body); a `(declare-global hidden? NAME T)` for every `external` `global` or `constant`; every `defstruct`, copied (`mutable` kept); and
+body); a `(DECLARE-GLOBAL HIDDEN? NAME T)` for every `external` `global` or `constant`; every `defstruct`, copied (`mutable` kept); and
 the imported module's `ownership` form (§6.14.6), so that the importer's managed values are verified against it. Nothing else: not the
 imported module's own `declare`s and `declare-global`s (a module declares what it uses), not its `target`, and not its `internal` or
 `private` names, which a use in the importer leaves undefined: `undefined function @helper: internal to FILE` (`undefined global` likewise,
@@ -521,7 +595,7 @@ namespace as its declarations are: defining or declaring one of them is `duplica
 **Macros.** The macros the imported module defines in its own file with `define-macro` are defined in the importer at the import, before
 the forms after it (`duplicate macro NAME` if the importer has one); the macros it took through `require-macros` or `import` are not
 (`cases/lir/imports/reject-transitive-macro.lir`). An imported macro runs in its module's session: it is used, `(NAME ..)`, and is not
-`@lir.macro.NAME` in the importer's macro bodies (§4.6 declares those for the importer's own session). `lir.sexp.gensym` counts per
+`(GLOBAL lir.macro.NAME)` in the importer's macro bodies (§4.6 declares those for the importer's own session). `lir.sexp.gensym` counts per
 program (§4.6): a name an imported macro makes and one the importer's own macro makes never coincide.
 
 **The program's rules.** Each module is admitted in load order, the named module last, and its items meet the names the program has:
@@ -530,7 +604,7 @@ program (§4.6): a name an imported macro makes and one the importer's own macro
 - a `defstruct` of a name another module defines is `%struct.S is also defined in FILE` (structs are nominal and share one namespace; a
   module's own structs carry its own prefix);
 - a `declare` or `declare-global` of a name the program defines or declares with another type is `@f is defined as TYPE in FILE` or
-  `@f is declared as TYPE in FILE` (`(fn i32 (i32))`, the text of §2); one of the same type is the same symbol: the program keeps the
+  `@f is declared as TYPE in FILE` (`(FUNCTION I32 (I32))`, the text of §2); one of the same type is the same symbol: the program keeps the
   definition, or the first declaration, and drops the rest (`printf` declared by every module is one `declare`);
 - an `internal` or `private` name the program already has, in any linkage, is the module's own: it is renamed `NAME.N`, the smallest `N`
   from 1 that neither the program nor the module has, throughout the module, as `llvm-link` renames (`lair dump-ast` shows the program
@@ -566,19 +640,19 @@ returns a form. lIR's own syntax (§1) is untouched: a module that binds nothing
 forms on without consulting anything.
 
 ```
-(define-reader-macro "C" (STREAM) block+)      ; at the character C, the macro reads what follows and returns the form
-(define-dispatch-macro "C" (STREAM) block+)    ; at #C, the same, the stream after both characters
-(define-token-reader (STREAM TOKEN) block+)    ; after every atom: the atom's text as a symbol, and the macro returns the form to use
-(define-reader-class "C" CLASS)                ; C is whitespace, constituent or terminating to the lexer from here on
-(define-reader-depth N)                        ; forms nest N deep at most (1024 unless set; at most 4096)
+(DEFINE-READER-MACRO "C" (STREAM) block+)      ; at the character C, the macro reads what follows and returns the form
+(DEFINE-DISPATCH-MACRO "C" (STREAM) block+)    ; at #C, the same, the stream after both characters
+(DEFINE-TOKEN-READER (STREAM TOKEN) block+)    ; after every atom: the atom's text as a symbol, and the macro returns the form to use
+(DEFINE-READER-CLASS "C" CLASS)                ; C is whitespace, constituent or terminating to the lexer from here on
+(DEFINE-READER-DEPTH N)                        ; forms nest N deep at most (1024 unless set; at most 4096)
 ```
 
 **Character classes.** lIR's own whitespace (§1: space, tab, the other ASCII controls 9 to 13, comma, Unicode's White_Space) and its
 own atom delimiters (whitespace, the brackets, `"`, `;`) are a choice of lIR's, and a language's choice may differ: fibber refuses the
-Unicode spaces and ends a symbol at `'`. So the readtable holds **classes**: `(define-reader-class "C" whitespace)` makes the character
+Unicode spaces and ends a symbol at `'`. So the readtable holds **classes**: `(DEFINE-READER-CLASS "C" whitespace)` makes the character
 `C` (a string of one UTF-8 character, any scalar: `"\xC2\xA0"` is U+00A0) whitespace between forms, `constituent` makes it part of an
 atom it stands in and nothing between forms (an NBSP so classed reaches the token reader inside an atom, which may refuse it), and
-`terminating` ends an atom (so `a@b` with `@` terminating is the atom `a` and then `@b`, which the reader macro of `@` reads: a bound
+`terminating` ends an atom (so `a@b` with `@` terminating is the atom `a` and then `(GLOBAL b)`, which the reader macro of `@` reads: a bound
 prefix character glued to an atom reaches its macro when its class is terminating). A class changes what is skipped between forms and
 where an atom ends, and nothing else: a character at the start of a form keeps lIR's own meaning there (`(`, `{`, `[`, `"`, `<`) unless a
 reader macro is bound to it, and a terminating character that starts an atom (an unbound `@` before `name`) is the atom's first
@@ -586,19 +660,19 @@ character, as it always was. `(`, `)` and `;` cannot be reclassified (`define-re
 class is one of the three words (`define-reader-class: the class is whitespace, constituent or terminating`). A later class replaces
 an earlier; a character with no class set is what lIR's own lexer makes of it. A module that sets no class lexes exactly as before.
 
-**Depth.** Forms nest 1024 deep unless the module says otherwise: `(define-reader-depth N)`, `N` from 1 to 4096
+**Depth.** Forms nest 1024 deep unless the module says otherwise: `(DEFINE-READER-DEPTH N)`, `N` from 1 to 4096
 (`define-reader-depth expects a count from 1 to 4096`), and the `N+1`th level is `nesting deeper than N` at its opening character. A
 list is a level, and so is a reader macro's or a dispatch macro's run (it reads what is inside it: `'x` and `[x]` are one level each,
-as fibber counts them); the token reader's run is not. fibber's 1000 (`TooDeep` at the 1001st frame) is `(define-reader-depth 1000)`,
+as fibber counts them); the token reader's run is not. fibber's 1000 (`TooDeep` at the 1001st frame) is `(DEFINE-READER-DEPTH 1000)`,
 which gloss's layer 2 sets; a comparison harness that wraps a module in one more form sets one more.
 
 **Definition.** Each body is compiled as a macro's is (§4.6: blocks only, checked when read, the `lir.sexp.*` functions and the
 stream's below declared in it, errors prefixed `reader macro C:`, `dispatch macro #C:` or `token reader:`), under a name of its own in
-the module's macro session; a reader macro may call an earlier `@lir.macro.NAME`. `"C"` is a string of one printable ASCII character
+the module's macro session; a reader macro may call an earlier `(GLOBAL lir.macro.NAME)`. `"C"` is a string of one printable ASCII character
 (`define-reader-macro: the character must be a string of one printable ASCII character`). A reader macro may not be bound to `(`, `)`
 or `;`, and whitespace is not printable (`define-reader-macro: cannot bind (, which is lIR's own`): those are the reader's own, so that a
 list and a comment are always a list and a comment. Any other character may be bound, `"`, `<`, `{`, `[`, `@`, `%` and `#` included, and
-the module's own forms then read under the new table: a module that binds `[` has no array types `[N x T]` unless its macro makes them,
+the module's own forms then read under the new table: a module that binds `[` has no array types `(ARRAY N T)` unless its macro makes them,
 and one that binds `@` reads its globals through its macro. A dispatch macro may be bound to any printable character, `(`, `)`
 and `;` included (`#(`, `#;`), since the `#` is read first. A later binding of a character replaces the earlier
 (`cases/lir/readers/rebind.lir`), and a later token reader the earlier.
@@ -640,7 +714,7 @@ and an import gives the importer none of the imported module's bindings, as it g
 every macro's body:
 
 ```
-(defstruct lir.read.stream (ptr i64 i64 i64 i64 ptr ptr ptr ptr i64 i64))  ; text, length, offset, line, column, file, mailbox, hook, failure message, failure position, failed
+(DEFSTRUCT lir.read.stream (PTR I64 I64 I64 I64 PTR PTR PTR PTR I64 I64))  ; text, length, offset, line, column, file, mailbox, hook, failure message, failure position, failed
 ```
 
 | Function | Does |
@@ -677,7 +751,7 @@ the reader (`compiler/lir/sexp.fib`) consults the table per form and hands a bou
 variable or an argument beside the module; §14 item 19). A module names a native library its code needs linked:
 
 ```
-(dependent-library "z")
+(DEPENDENT-LIBRARY "z")
 ```
 
 It is LLVM's named metadata `!llvm.dependent-libraries = !{!{!"z"}}`, what clang's `#pragma comment(lib, "z")` makes and what an ELF
@@ -687,7 +761,7 @@ library's symbols satisfy the module's `declare`s, so lair lowers the form to th
 `lair build` adds `-lNAME` after the `-l` of its command line (static or dynamic by the build's options, `FIB_LINK`, `FIB_LINK_MODE`,
 `FIB_STATIC`, docs/design/static-linking.md 3; `c m pthread dl rt util` are the C library's own and never a link word), `lair run`,
 the JIT and a live session load the library into the process before the names rules look for its symbols (§11), a liro object records it
-for `lair link`, and `(import "FILE")` (§4.7) keeps the imported module's forms in the union, as `llvm-link` concatenates the metadata.
+for `lair link`, and `(IMPORT "FILE")` (§4.7) keeps the imported module's forms in the union, as `llvm-link` concatenates the metadata.
 A library that cannot be found or loaded is an error naming it, on the path that needed it. A `declare` the library would satisfy but
 no form names is as before: undefined at link, or found in the process by the JIT.
 
@@ -703,7 +777,9 @@ the tree on the in-memory path; a comment is lexically nothing (§1) and now car
 
 A function has at least one block (`function @f has no blocks`; liar
 emitted an empty body, `tc/empty_fn.lir`). The first block is the
-entry block. Labels are unique within a function (`duplicate block
+entry block. A label is an atom that is not empty and not one of lIR's
+words (§2: `invalid label RET`; `entry` and `ret` are labels). Labels are
+unique within a function (`duplicate block
 label L`, `tc/dup_block.lir`) and every label used exists (`undefined
 block L`).
 
@@ -729,17 +805,18 @@ of the last form of the body. A literal or a name emits no instruction.
 ### 5.3 Names: SSA with dominance
 
 ```
-(let ((NAME value)*) instr+)
+(LET ((NAME value)*) instr+)
 ```
 
 Parameters and `let`-bound names are the function's **SSA names**:
 
 - Each name is bound once per function, parameters included (`duplicate
   name x in @f`). There is no shadowing (**Decided**, §14 item 6).
-- A name may not be a type keyword, `null`, `void`, an ordering, or one
-  of `singlethread`, `weak`, `inbounds`, `volatile`, `align`,
-  `zeroinitializer`, `private`, `internal`, `external`, `hidden`
-  (`reserved word x used as a name`).
+- A name may not be one of lIR's words (§2), an atom that is the text
+  of a word, `-` before it or not (`reserved word ADD used as a name`).
+  A lower-case atom is never a word: `add`, `null`, `void` and `let` are
+  names, which position tells from the forms (`(ADD a b)` against a
+  name `add`).
 - A name's scope is not the `let` body. A **use** of `x` is valid if
   the binding of `x` is evaluated before the use in the same block
   (else `x is used before its binding in block L`), or if `x` is bound
@@ -747,9 +824,9 @@ Parameters and `let`-bound names are the function's **SSA names**:
   use in block L`, `tc/use_nondominating.lir`, `tc/nondom2.lir`; liar
   compiled both to code that read an uninitialised register).
   Parameters dominate every block.
-- A name is an atom that is not a number and does not begin with `@`
-  or `%` (`invalid name @x`); a binding is `(NAME value)` (`let binding
-  must be (NAME value)`).
+- A name is an atom that is not a number and not `...` (`invalid name
+  5`); `@` and `%` are characters of a name like any other. A binding is
+  `(NAME value)` (`let binding must be (NAME value)`).
 - In a block unreachable from the entry, a use is valid only if its
   name is bound earlier in the same block, in a reachable block, or is
   a parameter. Unreachable blocks are accepted with this rule, which is
@@ -762,7 +839,7 @@ Parameters and `let`-bound names are the function's **SSA names**:
 ### 5.4 phi
 
 ```
-(phi T (LABEL value)+)
+(PHI T (LABEL value)+)
 ```
 
 - A `phi` must be evaluated before any other instruction of its block
@@ -778,11 +855,11 @@ Parameters and `let`-bound names are the function's **SSA names**:
   of one terminator (a `br` with both labels equal) has one
   predecessor.
 - Every incoming value has type `T` (`tc/phi_wrong.lir`) and is a
-  name, `@name` or a literal: `phi incoming value must be a name, a
+  name, `(GLOBAL name)` or a literal: `phi incoming value must be a name, a
   global or a constant` (an instruction there would have to run in the
   predecessor, after its terminator's operands). This is stricter than
   LLVM, which takes any constant expression (**Decided**, §14 item 7).
-- When one terminator names the block twice (`(br c j j)`, or a `switch`
+- When one terminator names the block twice (`(BR c j j)`, or a `switch`
   with two cases to one label), LLVM wants one phi entry per edge; lIR
   takes one per predecessor and `lair` repeats it per edge.
 - An incoming value from `M` is used at the end of `M`: a name in it
@@ -791,6 +868,48 @@ Parameters and `let`-bound names are the function's **SSA names**:
   block when that block is its own predecessor (a loop).
 
 ## 6. Instructions
+
+The instructions by their words; the sections below give each form's operands and result.
+
+```
+instr   ::= (binop flag* a b) | (FNEG a) | (CTPOP a) | (ovf a b)                           ; §6.1
+          | (fn1 a) | (fn2 a b) | (fn3 flag* a b c)                                     ; §6.1
+          | (ICMP ipred a b) | (FCMP fpred a b) | (SELECT c a b)                         ; §6.2
+          | (conv T v)                                                                  ; §6.3
+          | (EXTRACTELEMENT v i) | (INSERTELEMENT v e i) | (SHUFFLEVECTOR a b m)
+          | (EXTRACTVALUE s k..) | (INSERTVALUE s v k..) | (reduce flag* a? v)            ; §6.4
+          | memory | atomic | control | kernel | own                                    ; §6.5 to §6.9a, §6.14
+binop   ::= ADD | SUB | MUL | SDIV | UDIV | SREM | UREM | FADD | FSUB | FMUL | FDIV | FREM
+          | AND | OR | XOR | SHL | LSHR | ASHR
+ovf     ::= SADD-OVERFLOW | SSUB-OVERFLOW | SMUL-OVERFLOW
+flag    ::= REASSOC | CONTRACT | ARCP | AFN | NSZ        ; fast-math, on the float forms that take it (§6.1)
+          | NSW | NUW                                    ; facts, on add, sub, mul and shl (§6.13)
+fn1     ::= FSQRT | FABS | FFLOOR | FCEIL | FTRUNC | FROUND | FROUNDEVEN | ABS | CTTZ | CTLZ
+fn2     ::= FCOPYSIGN | FMIN | FMAX | FMINNUM | FMAXNUM | SMIN | SMAX | UMIN | UMAX
+fn3     ::= FMA | FMULADD
+ipred   ::= EQ | NE | SLT | SLE | SGT | SGE | ULT | ULE | UGT | UGE
+fpred   ::= OEQ | ONE | OLT | OLE | OGT | OGE | ORD | UEQ | UNE | ULT | ULE | UGT | UGE | UNO
+conv    ::= TRUNC | ZEXT | SEXT | FPTRUNC | FPEXT | FPTOSI | FPTOUI | SITOFP | UITOFP
+          | PTRTOINT | INTTOPTR | BITCAST | FPTOSI-SAT | FPTOUI-SAT
+reduce  ::= REDUCE-ADD | REDUCE-MUL | REDUCE-AND | REDUCE-OR | REDUCE-XOR | REDUCE-SMIN | REDUCE-SMAX
+          | REDUCE-UMIN | REDUCE-UMAX | REDUCE-FADD | REDUCE-FMUL | REDUCE-FMIN | REDUCE-FMAX
+          | REDUCE-FMINNUM | REDUCE-FMAXNUM
+memory  ::= (ALLOCA (ALIGN N)? T n?) | (LOAD VOLATILE? (RANGE LO HI)? (ALIGN N)? T p)
+          | (STORE VOLATILE? (ALIGN N)? v p) | (GETELEMENTPTR INBOUNDS? T p i..)
+          | (MASKED-LOAD T p mask passthru (ALIGN N)?) | (MASKED-STORE v p mask (ALIGN N)?)
+          | (GATHER T ptrs mask passthru (ALIGN N)?) | (SCATTER v ptrs mask (ALIGN N)?)
+control ::= (RET v?) | (BR LABEL) | (BR c LABEL LABEL) | (SWITCH v LABEL ((T c) LABEL)*)
+          | (UNREACHABLE) | (TRAP) | (PHI T (LABEL v)+) | (LET ((NAME v)*) instr+)
+          | (CALL (GLOBAL NAME) a*) | (TAILCALL (GLOBAL NAME) a*)
+          | (INDIRECT-CALL p fntype a*) | (INDIRECT-TAILCALL p fntype a*)
+          | (SPIN-HINT) | (CACHE-LINE) | (STACK-ADDR) | (ASSUME c)
+kernel  ::= (SREG NAME) | (BARRIER) | (SHFL-DOWN v l) | (SHFL-UP v l) | (SHFL-XOR v l)
+          | (SHFL-IDX v l) | (BALLOT c)
+own     ::= (ALLOC-OBJECT (STRUCT NAME) tid n?) | (ALLOC-STACK (STRUCT NAME) tid) | (DEALLOC-STACK s)
+          | (COPY-VALUE v) | (DESTROY-VALUE v) | (IS-UNIQUE v) | (ADDRSPACECAST T v)
+          | (LOAD COPY T a) | (LOAD BORROW T a) | (LOAD TAKE T a)
+          | (STORE INIT v a) | (STORE ASSIGN v a) | (STORE BORROW v a)
+```
 
 Each row gives the form, the operand rule and the result type. `T`
 ranges over the types a row allows; "same T" means every operand has
@@ -812,12 +931,12 @@ instruction and the offending operand. The message forms are:
 
 | Form | Operands | Result |
 |---|---|---|
-| `(add a b)` `sub` `mul` `sdiv` `udiv` `srem` `urem` | same integer `T` | `T` |
-| `(fadd a b)` `fsub` `fmul` `fdiv` `frem` | same float `T` | `T` |
-| `(fneg a)` | float `T` | `T` |
-| `(and a b)` `or` `xor` `shl` `lshr` `ashr` | same integer `T` | `T` |
-| `(ctpop a)` | integer `T` | `T` (`llvm.ctpop`) |
-| `(sadd-overflow a b)` `ssub-overflow` `smul-overflow` | same integer `T` | `{ T, i1 }` (or `{ <N x iK>, <N x i1> }`): the wrapped result and whether it overflowed (`llvm.sadd.with.overflow` and kin; **Decided**, §14 item 5) |
+| `(ADD a b)` `sub` `mul` `sdiv` `udiv` `srem` `urem` | same integer `T` | `T` |
+| `(FADD a b)` `fsub` `fmul` `fdiv` `frem` | same float `T` | `T` |
+| `(FNEG a)` | float `T` | `T` |
+| `(AND a b)` `or` `xor` `shl` `lshr` `ashr` | same integer `T` | `T` |
+| `(CTPOP a)` | integer `T` | `T` (`llvm.ctpop`) |
+| `(SADD-OVERFLOW a b)` `ssub-overflow` `smul-overflow` | same integer `T` | `(LITERAL-STRUCT T I1)` (or `(LITERAL-STRUCT T (VECTOR N I1))` for a vector `T` of `N` lanes): the wrapped result and whether it overflowed (`llvm.sadd.with.overflow` and kin; **Decided**, §14 item 5) |
 
 #### Floating-point functions and integer min/max
 
@@ -828,19 +947,19 @@ that intrinsic's exact semantics.
 
 | Form | Operands | Result | LLVM |
 |---|---|---|---|
-| `(fma a b c)` | same float `F` | `F`: `a*b+c` with one rounding, always | `llvm.fma` |
-| `(fmuladd a b c)` | same float `F` | `F`: `a*b+c`, fused or not as the target prefers (the result may differ by one rounding between targets) | `llvm.fmuladd` |
-| `(fsqrt a)` | float `F` | `F`: the correctly rounded root; negative gives NaN | `llvm.sqrt` |
-| `(fabs a)` | float `F` | `F` | `llvm.fabs` |
-| `(ffloor a)` `(fceil a)` `(ftrunc a)` | float `F` | `F`: rounded to an integral value toward -inf, +inf, zero | `llvm.floor` `ceil` `trunc` |
-| `(fround a)` | float `F` | `F`: to nearest, ties away from zero | `llvm.round` |
-| `(froundeven a)` | float `F` | `F`: to nearest, ties to even | `llvm.roundeven` |
-| `(fcopysign a b)` | same float `F` | `F`: the magnitude of `a` with the sign of `b` | `llvm.copysign` |
-| `(fmin a b)` `(fmax a b)` | same float `F` | `F`: if either operand is NaN the result is NaN; `-0.0` is less than `+0.0` | `llvm.minimum` `llvm.maximum` |
-| `(fminnum a b)` `(fmaxnum a b)` | same float `F` | `F`: if one operand is NaN the result is the other; the order of `-0.0` and `+0.0` is not specified | `llvm.minnum` `llvm.maxnum` |
-| `(smin a b)` `(smax a b)` `(umin a b)` `(umax a b)` | same integer `I` | `I`, compared as signed or unsigned | `llvm.smin` `smax` `umin` `umax` |
-| `(abs a)` | integer `I` | `I`: the absolute value; `abs` of the minimum value is the minimum value (never poison) | `llvm.abs` with `is_int_min_poison` false |
-| `(cttz a)` `(ctlz a)` | integer `I` | `I`: the count of trailing (leading) zero bits; a zero has as many as `I` has bits (never poison) | `llvm.cttz`, `llvm.ctlz` with `is_zero_poison` false (JSON-2; the mask-to-integer move is `bitcast` of `<N x i1>` to `iN`) |
+| `(FMA a b c)` | same float `F` | `F`: `a*b+c` with one rounding, always | `llvm.fma` |
+| `(FMULADD a b c)` | same float `F` | `F`: `a*b+c`, fused or not as the target prefers (the result may differ by one rounding between targets) | `llvm.fmuladd` |
+| `(FSQRT a)` | float `F` | `F`: the correctly rounded root; negative gives NaN | `llvm.sqrt` |
+| `(FABS a)` | float `F` | `F` | `llvm.fabs` |
+| `(FFLOOR a)` `(FCEIL a)` `(FTRUNC a)` | float `F` | `F`: rounded to an integral value toward -inf, +inf, zero | `llvm.floor` `ceil` `trunc` |
+| `(FROUND a)` | float `F` | `F`: to nearest, ties away from zero | `llvm.round` |
+| `(FROUNDEVEN a)` | float `F` | `F`: to nearest, ties to even | `llvm.roundeven` |
+| `(FCOPYSIGN a b)` | same float `F` | `F`: the magnitude of `a` with the sign of `b` | `llvm.copysign` |
+| `(FMIN a b)` `(FMAX a b)` | same float `F` | `F`: if either operand is NaN the result is NaN; `-0.0` is less than `+0.0` | `llvm.minimum` `llvm.maximum` |
+| `(FMINNUM a b)` `(FMAXNUM a b)` | same float `F` | `F`: if one operand is NaN the result is the other; the order of `-0.0` and `+0.0` is not specified | `llvm.minnum` `llvm.maxnum` |
+| `(SMIN a b)` `(SMAX a b)` `(UMIN a b)` `(UMAX a b)` | same integer `I` | `I`, compared as signed or unsigned | `llvm.smin` `smax` `umin` `umax` |
+| `(ABS a)` | integer `I` | `I`: the absolute value; `abs` of the minimum value is the minimum value (never poison) | `llvm.abs` with `is_int_min_poison` false |
+| `(CTTZ a)` `(CTLZ a)` | integer `I` | `I`: the count of trailing (leading) zero bits; a zero has as many as `I` has bits (never poison) | `llvm.cttz`, `llvm.ctlz` with `is_zero_poison` false (JSON-2; the mask-to-integer move is `bitcast` of `(VECTOR N I1)` to `iN`) |
 
 `fmin`/`fmax` are the NaN-propagating pair and `fminnum`/`fmaxnum` the
 NaN-ignoring pair; the names follow LLVM's `minimum`/`minnum`. A scalar
@@ -852,7 +971,7 @@ NaN-ignoring pair; the names follow LLVM's `minimum`/`minnum`. A scalar
 and `reduce-fmul` accept flag words between the name and the operands:
 
 ```
-(fadd reassoc a b)          (reduce-fadd reassoc (double 0.0) v)          (fmul reassoc contract a b)
+(FADD REASSOC a b)          (REDUCE-FADD REASSOC (DOUBLE 0.0) v)          (FMUL REASSOC CONTRACT a b)
 ```
 
 An operand count above the form's own is read as flags: the leading words
@@ -881,7 +1000,7 @@ sum of 4096 doubles in a loop takes 83 ms strict and 14 ms with
 may LLVM keep several partial sums in a vector register.
 
 `add sub mul shl` take LLVM's no-wrap words `nsw` and `nuw` in the same
-position, `(add nsw a b)` as LLVM writes `add nsw i64 %a, %b`: they are
+position, `(ADD NSW a b)` as LLVM writes `add nsw i64 %a, %b`: they are
 facts (§6.13). No `exact` flag exists. `sdiv`, `udiv`, `srem`, `urem`
 with a constant zero divisor are `division by constant zero`; a shift
 whose amount is a constant `≥` the bit width is `shift amount n is not
@@ -891,9 +1010,9 @@ less than the width w`. Both are poison or undefined in LLVM.
 
 | Form | Operands | Result |
 |---|---|---|
-| `(icmp P a b)`, `P ∈ eq ne slt sle sgt sge ult ule ugt uge` | same `T`: integer, `ptr`, or a vector of either | `i1`, or `<N x i1>` |
-| `(fcmp P a b)`, `P ∈ oeq one olt ole ogt oge ord ueq une ult ule ugt uge uno` | same float `T` | `i1`, or `<N x i1>` |
-| `(select c a b)` | `c : i1` (or `<N x i1>` with vector `a`, `b` of `N` elements); `a`, `b` same first-class `T` | `T` |
+| `(ICMP P a b)`, `P ∈ eq ne slt sle sgt sge ult ule ugt uge` | same `T`: integer, `ptr`, or a vector of either | `i1`, or `(VECTOR N I1)` |
+| `(FCMP P a b)`, `P ∈ oeq one olt ole ogt oge ord ueq une ult ule ugt uge uno` | same float `T` | `i1`, or `(VECTOR N I1)` |
+| `(SELECT c a b)` | `c : i1` (or `(VECTOR N I1)` with vector `a`, `b` of `N` elements); `a`, `b` same first-class `T` | `T` |
 
 ### 6.3 Conversions
 
@@ -905,19 +1024,19 @@ length`). The class and width rules below apply to the element types.
 
 | Form | Rule (on the elements) | Result |
 |---|---|---|
-| `(trunc T v)` | integers, `T` narrower than `v` | `T` |
-| `(zext T v)`, `(sext T v)` | integers, `T` wider | `T` |
-| `(fptrunc T v)` | `T` float, `v` double (`float` or `<N x float>`) | `T` |
-| `(fpext T v)` | `T` double, `v` float | `T` |
-| `(fptosi T v)`, `(fptoui T v)` | `T` integer, `v` float | `T` |
-| `(sitofp T v)`, `(uitofp T v)` | `T` float, `v` integer | `T` |
-| `(ptrtoint T v)` | `T` integer, `v : ptr` | `T` |
-| `(inttoptr T v)` | `T` is `ptr`, `v` integer | `T` |
-| `(bitcast T v)` | `T` and `v`'s type non-aggregate, not `ptr` or a vector of `ptr`, same bit size (the sizes of whole vectors; the lane counts may differ) | `T` |
-| `(fptosi-sat T v)`, `(fptoui-sat T v)` | `T` integer, `v` float | `T`: saturating, NaN to 0 (`llvm.fptosi.sat`, `llvm.fptoui.sat`; **Decided**, §14 item 5) |
+| `(TRUNC T v)` | integers, `T` narrower than `v` | `T` |
+| `(ZEXT T v)`, `(SEXT T v)` | integers, `T` wider | `T` |
+| `(FPTRUNC T v)` | `T` float, `v` double (`float` or `(VECTOR N FLOAT)`) | `T` |
+| `(FPEXT T v)` | `T` double, `v` float | `T` |
+| `(FPTOSI T v)`, `(FPTOUI T v)` | `T` integer, `v` float | `T` |
+| `(SITOFP T v)`, `(UITOFP T v)` | `T` float, `v` integer | `T` |
+| `(PTRTOINT T v)` | `T` integer, `v : ptr` | `T` |
+| `(INTTOPTR T v)` | `T` is `ptr`, `v` integer | `T` |
+| `(BITCAST T v)` | `T` and `v`'s type non-aggregate, not `ptr` or a vector of `ptr`, same bit size (the sizes of whole vectors; the lane counts may differ) | `T` |
+| `(FPTOSI-SAT T v)`, `(FPTOUI-SAT T v)` | `T` integer, `v` float | `T`: saturating, NaN to 0 (`llvm.fptosi.sat`, `llvm.fptoui.sat`; **Decided**, §14 item 5) |
 
-`inttoptr` is written `(inttoptr ptr v)` for a scalar and `(inttoptr <N x
-ptr> v)` for a vector of integers; the result type is the pointer type
+`inttoptr` is written `(INTTOPTR PTR v)` for a scalar and `(INTTOPTR (VECTOR N
+PTR) v)` for a vector of integers; the result type is the pointer type
 itself, as in the former scalar form. `fptosi`/`fptoui` of a value out of
 range is poison, lane by lane, as in LLVM; `fptosi-sat`/`fptoui-sat`
 saturate as types.md §8.12 specifies and fibber emits them, on vectors
@@ -927,24 +1046,24 @@ too (the first M3 pass kept them scalar; §14 item 12 lifts that).
 
 | Form | Rule | Result |
 |---|---|---|
-| `(extractelement v i)` | `v : <N x E>`, `i` integer; a constant `i` must be `< N` | `E` |
-| `(insertelement v e i)` | `v : <N x E>`, `e : E`, `i` as above | `<N x E>` |
-| `(shufflevector a b m)` | `a`, `b : <N x E>`; `m` a literal `<M x i32>` with elements `< 2N` | `<M x E>` |
-| `(extractvalue s k₁ ..)` | `s` an aggregate; each `k` a constant index in range: a field of a struct, an element of an array (`extractvalue: index 4 out of range for [4 x i32]`) | the field's or element's type |
-| `(insertvalue s v k₁ ..)` | as above, `v` of the field's or element's type | `s`'s type |
+| `(EXTRACTELEMENT v i)` | `v : (VECTOR N E)`, `i` integer; a constant `i` must be `< N` | `E` |
+| `(INSERTELEMENT v e i)` | `v : (VECTOR N E)`, `e : E`, `i` as above | `(VECTOR N E)` |
+| `(SHUFFLEVECTOR a b m)` | `a`, `b : (VECTOR N E)`; `m` a literal `(VECTOR M I32)` with elements `< 2N` | `(VECTOR M E)` |
+| `(EXTRACTVALUE s k₁ ..)` | `s` an aggregate; each `k` a constant index in range: a field of a struct, an element of an array (`extractvalue: index 4 out of range for [4 x i32]`) | the field's or element's type |
+| `(INSERTVALUE s v k₁ ..)` | as above, `v` of the field's or element's type | `s`'s type |
 
 #### Horizontal reductions
 
 **Decided** (§14 item 12). A reduction folds the lanes of one vector into one
-scalar. `V` is a vector `<N x E>`.
+scalar. `V` is a vector `(VECTOR N E)`.
 
 | Form | Operands | Result |
 |---|---|---|
-| `(reduce-add v)` `reduce-mul` `reduce-and` `reduce-or` `reduce-xor` | `V` of integers (`<N x i1>` included: `reduce-or` is "any", `reduce-and` is "all") | `E` (`llvm.vector.reduce.add` and kin) |
-| `(reduce-smin v)` `reduce-smax` `reduce-umin` `reduce-umax` | `V` of integers | `E` |
-| `(reduce-fadd a v)` `(reduce-fmul a v)` | `a : E` the start value, `V` of floats | `E`: `a + v[0] + v[1] + ..` in lane order, each step rounded, unless the form carries `reassoc` (then the order is free) |
-| `(reduce-fmin v)` `(reduce-fmax v)` | `V` of floats | `E`: NaN if any lane is NaN (`llvm.vector.reduce.fminimum`, `fmaximum`) |
-| `(reduce-fminnum v)` `(reduce-fmaxnum v)` | `V` of floats | `E`: NaN lanes are ignored unless all are (`llvm.vector.reduce.fmin`, `fmax`) |
+| `(REDUCE-ADD v)` `reduce-mul` `reduce-and` `reduce-or` `reduce-xor` | `V` of integers (`(VECTOR N I1)` included: `reduce-or` is "any", `reduce-and` is "all") | `E` (`llvm.vector.reduce.add` and kin) |
+| `(REDUCE-SMIN v)` `reduce-smax` `reduce-umin` `reduce-umax` | `V` of integers | `E` |
+| `(REDUCE-FADD a v)` `(REDUCE-FMUL a v)` | `a : E` the start value, `V` of floats | `E`: `a + v[0] + v[1] + ..` in lane order, each step rounded, unless the form carries `reassoc` (then the order is free) |
+| `(REDUCE-FMIN v)` `(REDUCE-FMAX v)` | `V` of floats | `E`: NaN if any lane is NaN (`llvm.vector.reduce.fminimum`, `fmaximum`) |
+| `(REDUCE-FMINNUM v)` `(REDUCE-FMAXNUM v)` | `V` of floats | `E`: NaN lanes are ignored unless all are (`llvm.vector.reduce.fmin`, `fmax`) |
 
 The integer reductions are exact in any order. `reduce-fadd` without `reassoc`
 adds the lanes one after another, as written in a scalar loop, and is the
@@ -954,23 +1073,23 @@ reference a vectorised sum is compared to.
 
 | Form | Rule | Result |
 |---|---|---|
-| `(alloca (align N)? T)`, `(alloca (align N)? T n)` | `T` sized; `n` integer | `ptr` |
-| `(load volatile? (align N)? T p)` | `p : ptr`; `T` first-class | `T` |
-| `(load (range LO HI) (align N)? T p)` | as `load`, and the range rules of §6.13 (a fact: LLVM's `!range`) | `T` |
-| `(store volatile? (align N)? v p)` | `p : ptr`; `v` first-class | void |
-| `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) except into a `[0 x T]`, whose length is unknown | `ptr` |
+| `(ALLOCA (ALIGN N)? T)`, `(ALLOCA (ALIGN N)? T n)` | `T` sized; `n` integer | `ptr` |
+| `(LOAD VOLATILE? (ALIGN N)? T p)` | `p : ptr`; `T` first-class | `T` |
+| `(LOAD (RANGE LO HI) (ALIGN N)? T p)` | as `load`, and the range rules of §6.13 (a fact: LLVM's `!range`) | `T` |
+| `(STORE VOLATILE? (ALIGN N)? v p)` | `p : ptr`; `v` first-class | void |
+| `(GETELEMENTPTR INBOUNDS? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) except into a `(ARRAY 0 T)`, whose length is unknown | `ptr` |
 
-- A `getelementptr` with a **vector index** (**Decided**, §14 item 12): `(getelementptr T p idx)`
-  where `p : ptr` and `idx : <N x iK>` is the one and only index; the result is `<N x ptr>`, lane `i` being
+- A `getelementptr` with a **vector index** (**Decided**, §14 item 12): `(GETELEMENTPTR T p idx)`
+  where `p : ptr` and `idx : (VECTOR N T)`, `T` an integer type, is the one and only index; the result is `(VECTOR N PTR)`, lane `i` being
   `p` plus `idx[i]` elements of `T`: the addresses of a gather or scatter. `getelementptr: a vector
   index must be the only index`, `getelementptr: a vector index needs integer elements, found <4 x
   double>`. A vector base pointer is not in lIR.
-- A `store` whose pointer operand is directly `@c` of a `constant` is
+- A `store` whose pointer operand is directly `(GLOBAL c)` of a `constant` is
   `store to constant @c`.
 - **Direct accesses are typed.** When the pointer operand of `load`,
   `store`, `atomic-load`, `atomic-store`, `atomicrmw` or `cmpxchg` is
-  written as `@g` (a global of type `G`) or as a name bound directly to
-  `(alloca A)` without a count, the accessed type must be `G` or `A`:
+  written as `(GLOBAL g)` (a global of type `G`) or as a name bound directly to
+  `(ALLOCA A)` without a count, the accessed type must be `G` or `A`:
   `store of double through p, which is (alloca i32)`, `load of i32
   through @g, a global of type i64`. LLVM accepts such an access and it
   reads or writes past the object (liar compiled
@@ -981,11 +1100,11 @@ reference a vectorised sum is compared to.
   index into i64` (LLVM is phasing out indexing into vectors; an array
   is what indexes, §2.1).
 - Plain loads and stores use the ABI alignment of their type unless
-  `(align N)` says otherwise. **Decided** (owner, 2026-09-28; §14 item 11): `N` is
+  `(ALIGN N)` says otherwise. **Decided** (owner, 2026-09-28; §14 item 11): `N` is
   a power of two from 1 to 2^30 (`align must be a power of two, found
   3`); a smaller `N` than the ABI's is a promise that LLVM honours with
   slower code where the target needs it, a larger one a promise the
-  emitter must keep (an `alloca` with `(align N)` keeps it). `volatile`
+  emitter must keep (an `alloca` with `(ALIGN N)` keeps it). `volatile`
   is LLVM's: the access is performed exactly as written, neither
   removed, duplicated nor reordered against other volatile accesses,
   for memory-mapped registers and for a value a signal handler or a
@@ -994,16 +1113,16 @@ reference a vectorised sum is compared to.
 
 #### Masked loads and stores, gather and scatter
 
-**Decided** (§14 item 12). `V` is a vector type `<N x E>` and a mask is `<N x i1>`. A lane whose mask
+**Decided** (§14 item 12). `V` is a vector type `(VECTOR N E)` and a mask is `(VECTOR N I1)`. A lane whose mask
 bit is 0 is not accessed at all: it can neither fault nor race, so a masked access is how a tail
 of a loop reads and writes only the elements that exist.
 
 | Form | Operands | Result |
 |---|---|---|
-| `(masked-load V p mask passthru (align A)?)` | `p : ptr` to `N` contiguous elements; `mask : <N x i1>`; `passthru : V` | `V`: lane `i` is the element at `p + i` where `mask[i]` is 1, else `passthru[i]` |
-| `(masked-store v p mask (align A)?)` | `v : V`, `p : ptr`, `mask` as above | void: stores lane `i` where `mask[i]` is 1 |
-| `(gather V ptrs mask passthru (align A)?)` | `ptrs : <N x ptr>`; `mask`; `passthru : V` | `V`: lane `i` is the element at `ptrs[i]` where `mask[i]` is 1, else `passthru[i]` |
-| `(scatter v ptrs mask (align A)?)` | `v : V`, `ptrs : <N x ptr>`, `mask` | void: stores lane `i` at `ptrs[i]` where `mask[i]` is 1 |
+| `(MASKED-LOAD V p mask passthru (ALIGN A)?)` | `p : ptr` to `N` contiguous elements; `mask : (VECTOR N I1)`; `passthru : V` | `V`: lane `i` is the element at `p + i` where `mask[i]` is 1, else `passthru[i]` |
+| `(MASKED-STORE v p mask (ALIGN A)?)` | `v : V`, `p : ptr`, `mask` as above | void: stores lane `i` where `mask[i]` is 1 |
+| `(GATHER V ptrs mask passthru (ALIGN A)?)` | `ptrs : (VECTOR N PTR)`; `mask`; `passthru : V` | `V`: lane `i` is the element at `ptrs[i]` where `mask[i]` is 1, else `passthru[i]` |
+| `(SCATTER v ptrs mask (ALIGN A)?)` | `v : V`, `ptrs : (VECTOR N PTR)`, `mask` | void: stores lane `i` at `ptrs[i]` where `mask[i]` is 1 |
 
 - `A`, a power of two from 1 to 2^30 as for `load`, is the alignment of the address `p` of a
   masked access, or of each address of a gather or scatter. Without it the ABI alignment of `V` (masked)
@@ -1023,13 +1142,13 @@ of a loop reads and writes only the elements that exist.
 ### 6.6 Atomics
 
 ```
-ord ::= unordered | monotonic | acquire | release | acq_rel | seq_cst
-(atomic-load  singlethread? ord T p)          → T
-(atomic-store singlethread? ord v p)          → void
-(atomicrmw OP singlethread? ord p v)          → T, the old value
-(cmpxchg weak? singlethread? ord ord? p expected new)   → { T, i1 }
-(fence singlethread? ord)                     → void
-OP ::= xchg add sub and nand or xor max min umax umin fadd fsub fmax fmin
+ord   ::= UNORDERED | MONOTONIC | ACQUIRE | RELEASE | ACQ_REL | SEQ_CST
+atomic ::= (ATOMIC-LOAD SINGLETHREAD? ord T p)                  ; → T
+         | (ATOMIC-STORE SINGLETHREAD? ord v p)                 ; → void
+         | (ATOMICRMW op SINGLETHREAD? ord p v)                 ; → T, the old value
+         | (CMPXCHG WEAK? SINGLETHREAD? ord ord? p expected new) ; → (LITERAL-STRUCT T I1)
+         | (FENCE SINGLETHREAD? ord)                            ; → void
+op    ::= XCHG | ADD | SUB | AND | NAND | OR | XOR | MAX | MIN | UMAX | UMIN | FADD | FSUB | FMAX | FMIN
 ```
 
 - Without `singlethread` an atomic operation or fence has LLVM's
@@ -1065,8 +1184,8 @@ more than one core.
 
 | Form | Type | Meaning |
 |---|---|---|
-| `(spin-hint)` | void, not a terminator | the target's hint that this thread is spinning: `pause` on x86-64, `yield` on AArch64 (`llvm.x86.sse2.pause`, `llvm.aarch64.hint(1)`); nothing on a target that has none. It orders no memory and is not a fence; the optimiser may not remove it |
-| `(cache-line)` | `i64`, a constant | the **destructive interference size** of the target in bytes: how far apart two threads' writes must be not to share a line. 128 on x86-64 and AArch64, 64 elsewhere (a conservative table, `types.targets` `cache-line-of-arch`; the measurements that would replace a row are in docs/shootout/cache-line). It is the size of the target the module is generated for, so a library built for one CPU and run on another keeps the value it was built with |
+| `(SPIN-HINT)` | void, not a terminator | the target's hint that this thread is spinning: `pause` on x86-64, `yield` on AArch64 (`llvm.x86.sse2.pause`, `llvm.aarch64.hint(1)`); nothing on a target that has none. It orders no memory and is not a fence; the optimiser may not remove it |
+| `(CACHE-LINE)` | `i64`, a constant | the **destructive interference size** of the target in bytes: how far apart two threads' writes must be not to share a line. 128 on x86-64 and AArch64, 64 elsewhere (a conservative table, `types.targets` `cache-line-of-arch`; the measurements that would replace a row are in docs/shootout/cache-line). It is the size of the target the module is generated for, so a library built for one CPU and run on another keeps the value it was built with |
 
 Both take no operands (`spin-hint expects 0 operands, found 1`). Cases: `cases/lir/inline`.
 
@@ -1076,7 +1195,7 @@ Both take no operands (`spin-hint expects 0 operands, found 1`). Cases: `cases/l
 
 | Form | Type | Meaning |
 |---|---|---|
-| `(stack-addr)` | `i64` | the stack pointer of the executing function, as an integer (`llvm.stacksave` cast to `i64`). It is read after the function's frame is allocated, so the frame is already below the value. It is not a constant (two functions at different depths read different values), it reads no memory the program can name, and it needs no frame pointer |
+| `(STACK-ADDR)` | `i64` | the stack pointer of the executing function, as an integer (`llvm.stacksave` cast to `i64`). It is read after the function's frame is allocated, so the frame is already below the value. It is not a constant (two functions at different depths read different values), it reads no memory the program can name, and it needs no frame pointer |
 
 It takes no operands (`stack-addr expects 0 operands, found 1`). The calling convention word `preservemost` (LLVM `preserve_most`, number 14; `ccc` where the target has none, WebAssembly) goes where `tailcc` goes: the callee saves what it uses and keeps every other register, so a call on a cold path (the stack check's `fib.stack-slow`) makes its caller spill nothing. It is for runtime helpers called from lIR; a host cannot call one. The C backend gives `__builtin_frame_address(0)` and the JS backend the constant 2^47 (a JS runtime has no stack pointer; this is above every address a native stack has, so nothing that tests it for a low stack ever fires; a program that compares two depths gets equal ones) (neither has a use for it). Cases: `cases/lir/inline`.
 
@@ -1084,26 +1203,26 @@ It takes no operands (`stack-addr expects 0 operands, found 1`). The calling con
 
 | Form | Rule |
 |---|---|
-| `(ret v)`, `(ret)` | `v` has the function's result type; `(ret)` only in a `void` function (`tc/ret_wrong.lir`, `tc/ret_void_in_i32.lir`) |
-| `(br L)` | |
-| `(br c L₁ L₂)` | `c : i1` (`tc/brcond_i32.lir`; `tc/brcond_double.lir` crashed liar) |
-| `(switch v L_default ((iK c) L)*)` | `v` integer scalar (`switch needs an integer scalar, found double`); each case a literal of `v`'s type (`switch: case has type i64, expected i32`), no two equal (`switch: duplicate case 1`) |
-| `(unreachable)` | reaching it is undefined behaviour; it follows a call that does not return |
-| `(trap)` | void, not a terminator: `llvm.trap`, which aborts the process with the target's trap signal (`ud2`, SIGILL, on x86-64; `brk`, SIGTRAP, on AArch64) without unwinding or flushing; the block goes on to `unreachable` (**Decided**, §14 item 5). types.md §8.12's `fib.trap` writes its message first and calls `abort`, which flushes nothing either but raises SIGABRT, the signal the audit and the cases expect; `(trap)` is for the paths that have no message |
-| `(phi …)` | §5.4 |
+| `(RET v)`, `(RET)` | `v` has the function's result type; `(RET)` only in a `void` function (`tc/ret_wrong.lir`, `tc/ret_void_in_i32.lir`) |
+| `(BR L)` | |
+| `(BR c L₁ L₂)` | `c : i1` (`tc/brcond_i32.lir`; `tc/brcond_double.lir` crashed liar) |
+| `(SWITCH v L_default ((T c) L)*)` | `v` integer scalar (`switch needs an integer scalar, found double`); each case a literal of `v`'s type (`switch: case has type i64, expected i32`), no two equal (`switch: duplicate case 1`) |
+| `(UNREACHABLE)` | reaching it is undefined behaviour; it follows a call that does not return |
+| `(TRAP)` | void, not a terminator: `llvm.trap`, which aborts the process with the target's trap signal (`ud2`, SIGILL, on x86-64; `brk`, SIGTRAP, on AArch64) without unwinding or flushing; the block goes on to `unreachable` (**Decided**, §14 item 5). types.md §8.12's `fib.trap` writes its message first and calls `abort`, which flushes nothing either but raises SIGABRT, the signal the audit and the cases expect; `(TRAP)` is for the paths that have no message |
+| `(PHI …)` | §5.4 |
 
 ### 6.8 Calls
 
 | Form | Rule | Result |
 |---|---|---|
-| `(call @f a..)` | `@f` defined or declared (`call needs a function name @f, found f`); arguments as §7.1 | `f`'s result |
-| `(indirect-call p (fn cc? R (T..)) a..)` | `p : ptr` (`indirect-call needs a ptr callee, found i64`); arguments against the written type (`indirect-call: argument 1 has type i32, expected i64`); a bare result type in place of the function type, liar's form, is `indirect-call needs a function type (fn R (T..)), found i64` | `R` |
-| `(tailcall @f a..)` | terminator; §7.3 | — |
-| `(indirect-tailcall p (fn cc? R (T..)) a..)` | terminator; §7.3 | — |
+| `(CALL (GLOBAL f) a..)` | `(GLOBAL f)` defined or declared (`call needs a function name @f, found f`); arguments as §7.1 | `f`'s result |
+| `(INDIRECT-CALL p (FUNCTION cc? R (T..)) a..)` | `p : ptr` (`indirect-call needs a ptr callee, found i64`); arguments against the written type (`indirect-call: argument 1 has type i32, expected i64`); a bare result type in place of the function type, liar's form, is `indirect-call needs a function type (fn R (T..)), found i64` | `R` |
+| `(TAILCALL (GLOBAL f) a..)` | terminator; §7.3 | — |
+| `(INDIRECT-TAILCALL p (FUNCTION cc? R (T..)) a..)` | terminator; §7.3 | — |
 
 ### 6.9 let
 
-`(let ((x v)..) body..)` as §5.2 and §5.3. A `let` with no body is
+`(LET ((x v)..) body..)` as §5.2 and §5.3. A `let` with no body is
 `let without a body`.
 
 ### 6.9a Kernel forms (accepted by the owner on 2026-10-07; GPU-1, docs/design/gpu.md; the warp forms `laneid`, `warpsize`, `shfl-*`, `ballot` accepted on 2026-10-08, GPU-5)
@@ -1113,20 +1232,20 @@ assembly is PTX; nothing of them runs on a CPU target, and lair refuses them the
 
 | Form | Rule |
 |---|---|
-| `(define kernelcc (NAME void) (..) ..)` | the entry of a kernel: LLVM's `ptx_kernel` (71). `void` result, parameters scalars or `ptr`. Nothing in lIR calls it (a driver launches it by name); a `kernelcc` function on a target that is not a kernel target is `@NAME is kernelcc: only a kernel target .. lowers a kernel`; `tailcall` never targets it. `fn-type-str` prints it `(fn kernelcc void (..))` |
-| `(sreg R)` | `i32`: the special register `R` of the kernel's index space, one of `tid.{x,y,z}` (the thread's index in its block), `ctaid.{x,y,z}` (the block's in the grid), `ntid.{x,y,z}` (the block's size), `nctaid.{x,y,z}` (the grid's); any other `R` is the parse error `sreg: no special register R`. Lowered to `llvm.nvvm.read.ptx.sreg.R` |
-| `(barrier)` | void, not a terminator: every thread of the block waits until all have reached it (`bar.sync 0`; LLVM 21's `llvm.nvvm.barrier.cta.sync.aligned.all` with barrier 0: `llvm.nvvm.barrier0` is gone from LLVM 21). Not a phi operand |
-| `(global shared NAME T init)` | a global in the block-shared memory of a kernel target (LLVM address space 3, NVPTX `.shared`; accepted by the owner's GPU decision, implemented by GPU-2): `@NAME` is its generic address (an `addrspacecast` constant), so `load` and `store` through it are the ordinary forms and the backend makes `ld.shared`/`st.shared`; its content at block start is undefined (the initialiser is for the grammar: lair gives LLVM `undef`, NVPTX refuses an initialiser there); `internal` to the module. `shared` goes with `global` only (`constant cannot be shared`, `define cannot be shared`), once (`duplicate modifier shared`); on a target that is not a kernel target lair refuses it (`@NAME is shared: only a kernel target ..`). Emitted by `gpu/shared` (types.md 2.17) |
-| `(sreg laneid)` `(sreg warpsize)` (GPU-5) | `i32`: the thread's lane in its warp, and the width of the warp (`llvm.nvvm.read.ptx.sreg.laneid`, `.warpsize`; 32 on NVIDIA). Added to the list of `sreg` names; any other is still `sreg: no special register R` |
-| `(shfl-down v lane)` `(shfl-up v lane)` `(shfl-xor v lane)` `(shfl-idx v lane)` (GPU-5, intrinsic forms of lir.intrin, class `warp`) | `v` an `i32` or a `float`, `lane` an `i32`; the result has the type of `v`: the `v` of the lane `own + lane` / `own - lane` / `own ^ lane` / `lane` of the same warp. Every lane of the warp must execute it together (the full mask: `shfl.sync .. -1`). A source out of range answers the thread's own `v` (PTX: clamp 31, `up` clamp 0); another type is `shfl-down needs an i32 or float value, found T`, a lane that is not `i32` `shfl-down needs an i32 lane, found T`. Lowered to `llvm.nvvm.shfl.sync.{down,up,bfly,idx}.{i32,f32}` with the member mask all ones; the WGSL printer maps them to `subgroupShuffle*` (webgpu.md 3.8) |
-| `(ballot c)` (GPU-5) | `c` an `i1`, the result an `i32`: bit k is the vote of lane k, the same in every lane (`llvm.nvvm.vote.ballot.sync`, mask all ones); `ballot needs an i1 operand, found T`. WGSL: `subgroupBallot(c).x`, the lanes 0 to 31 |
+| `(DEFINE KERNELCC (NAME VOID) (..) ..)` | the entry of a kernel: LLVM's `ptx_kernel` (71). `void` result, parameters scalars or `ptr`. Nothing in lIR calls it (a driver launches it by name); a `kernelcc` function on a target that is not a kernel target is `@NAME is kernelcc: only a kernel target .. lowers a kernel`; `tailcall` never targets it. `fn-type-str` prints it `(FUNCTION KERNELCC VOID (..))` |
+| `(SREG R)` | `i32`: the special register `R` of the kernel's index space, one of `tid.{x,y,z}` (the thread's index in its block), `ctaid.{x,y,z}` (the block's in the grid), `ntid.{x,y,z}` (the block's size), `nctaid.{x,y,z}` (the grid's); any other `R` is the parse error `sreg: no special register R`. Lowered to `llvm.nvvm.read.ptx.sreg.R` |
+| `(BARRIER)` | void, not a terminator: every thread of the block waits until all have reached it (`bar.sync 0`; LLVM 21's `llvm.nvvm.barrier.cta.sync.aligned.all` with barrier 0: `llvm.nvvm.barrier0` is gone from LLVM 21). Not a phi operand |
+| `(GLOBAL SHARED NAME T init)` | a global in the block-shared memory of a kernel target (LLVM address space 3, NVPTX `.shared`; accepted by the owner's GPU decision, implemented by GPU-2): `(GLOBAL NAME)` is its generic address (an `addrspacecast` constant), so `load` and `store` through it are the ordinary forms and the backend makes `ld.shared`/`st.shared`; its content at block start is undefined (the initialiser is for the grammar: lair gives LLVM `undef`, NVPTX refuses an initialiser there); `internal` to the module. `shared` goes with `global` only (`constant cannot be shared`, `define cannot be shared`), once (`duplicate modifier shared`); on a target that is not a kernel target lair refuses it (`@NAME is shared: only a kernel target ..`). Emitted by `gpu/shared` (types.md 2.17) |
+| `(SREG laneid)` `(SREG warpsize)` (GPU-5) | `i32`: the thread's lane in its warp, and the width of the warp (`llvm.nvvm.read.ptx.sreg.laneid`, `.warpsize`; 32 on NVIDIA). Added to the list of `sreg` names; any other is still `sreg: no special register R` |
+| `(SHFL-DOWN v lane)` `(SHFL-UP v lane)` `(SHFL-XOR v lane)` `(SHFL-IDX v lane)` (GPU-5, intrinsic forms of lir.intrin, class `warp`) | `v` an `i32` or a `float`, `lane` an `i32`; the result has the type of `v`: the `v` of the lane `own + lane` / `own - lane` / `own ^ lane` / `lane` of the same warp. Every lane of the warp must execute it together (the full mask: `shfl.sync .. -1`). A source out of range answers the thread's own `v` (PTX: clamp 31, `up` clamp 0); another type is `shfl-down needs an i32 or float value, found T`, a lane that is not `i32` `shfl-down needs an i32 lane, found T`. Lowered to `llvm.nvvm.shfl.sync.{down,up,bfly,idx}.{i32,f32}` with the member mask all ones; the WGSL printer maps them to `subgroupShuffle*` (webgpu.md 3.8) |
+| `(BALLOT c)` (GPU-5) | `c` an `i1`, the result an `i32`: bit k is the vote of lane k, the same in every lane (`llvm.nvvm.vote.ballot.sync`, mask all ones); `ballot needs an i1 operand, found T`. WGSL: `subgroupBallot(c).x`, the lanes 0 to 31 |
 
 On a kernel target `atomicrmw` and `cmpxchg` (§6.6) are valid as they are, on a global pointer and on a `shared` global (GPU-3): `add sub and or xor xchg max min umax umin` on `i32` and `i64`, `fadd` on `float` (PTX `atom.global.add.f32`, `atom.shared.add.f32`), and (GPU-5) `fadd fsub fmax fmin` on `float` for WGSL as a compare-and-exchange loop (webgpu.md 3.7; PTX expands `fmax`/`fmin`/`fsub` itself); the address space comes from the pointer's origin (LLVM's InferAddressSpaces), `monotonic` is `atom.relaxed`. No new form was needed for atomics; types.md 2.17 lists the builtins that emit them (`gpu/atomic-*`), and webgpu.md 3.7 says what WGSL takes of them.
 
-`llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. `(align N)` on a `load` or
+`llvm.` stays reserved as a symbol prefix (§14 item 5): the two forms are instructions, as the fma family is. `(ALIGN N)` on a `load` or
 `store` means `N` on a kernel target as on every other (§6.5): a front end writes the alignment it means (the kernel subset indexes
 elements, never bytes, and a byte-aligned access on a GPU is four accesses of a byte, so fibber's emitter writes a scalar's own size on a
-kernel target, docs/design/gpu.md 3.3). Until 2026-10-25 lair read `(align 1)` on a scalar as the scalar's natural alignment there
+kernel target, docs/design/gpu.md 3.3). Until 2026-10-25 lair read `(ALIGN 1)` on a scalar as the scalar's natural alignment there
 (native.lower.memory `kernel-align`); **Decided** (owner, 2026-10-25: the text is the contract, and `align 1` means 1 in LLVM), that
 reading is gone.
 
@@ -1164,7 +1283,7 @@ that emits counts emits them as lIR's forms, which lair verifies). The
 answers to the five failures: the verifier runs inside `lir.check` on
 every path, is a dataflow over the CFG with a merge rule, every form
 lowers to the runtime call the front end wrote before, counted
-references are the primary case, and the managed type `(ptr 1)` is
+references are the primary case, and the managed type `(PTR (ADDRSPACE 1))` is
 distinct from `ptr`, with a named, counted escape.
 
 ### 6.11 Constants in instructions
@@ -1201,9 +1320,9 @@ end's to prove and to emit as these forms; lIR has no form for it.
 
 | Form | Meaning | LLVM |
 |---|---|---|
-| `(add nsw a b)`, `(add nuw a b)`, `(add nuw nsw a b)`; `sub`, `mul`, `shl` alike | the operation does not wrap as signed (`nsw`) or as unsigned (`nuw`); for `shl`, shifting the result back gives `a` again (arithmetically for `nsw`, logically for `nuw`) | the flags on the instruction (`add nuw nsw i64`) |
-| `(assume c)` | `c : i1` is true here; void, not a terminator | `call void @llvm.assume(i1 c)` |
-| `(load (range LO HI) (align N)? T p)` | the loaded integer is in `[LO, HI)`, read signed | `!range !{T LO, T HI}` on the load |
+| `(ADD NSW a b)`, `(ADD NUW a b)`, `(ADD NUW NSW a b)`; `sub`, `mul`, `shl` alike | the operation does not wrap as signed (`nsw`) or as unsigned (`nuw`); for `shl`, shifting the result back gives `a` again (arithmetically for `nsw`, logically for `nuw`) | the flags on the instruction (`add nuw nsw i64`) |
+| `(ASSUME c)` | `c : i1` is true here; void, not a terminator | `call void @llvm.assume(i1 c)` |
+| `(LOAD (RANGE LO HI) (ALIGN N)? T p)` | the loaded integer is in `[LO, HI)`, read signed | `!range !{T LO, T HI}` on the load |
 
 **A fact only removes behaviours.** A program whose facts are true
 computes the same results whether a backend uses a fact or ignores it, so
@@ -1225,7 +1344,7 @@ values:
 |---|---|
 | a repeated word | `duplicate flag nsw` |
 | another word on `add sub mul shl` | `unknown integer flag exact` (a fast-math word too: `unknown integer flag reassoc`); `nsw` on a float form is `unknown fast-math flag nsw`; on any other integer form it is the form's operand-count error |
-| two literal operands that break the flag | `add nsw wraps on its literal operands` (`(add nsw (i64 9223372036854775807) (i64 1))`), `sub nuw wraps ..`, `shl nsw wraps ..` |
+| two literal operands that break the flag | `add nsw wraps on its literal operands` (`(ADD NSW (I64 9223372036854775807) (I64 1))`), `sub nuw wraps ..`, `shl nsw wraps ..` |
 | `assume` | `assume needs an i1 operand, found i32`; `assume of a literal false`; as a value: `void value used as an operand` |
 | `range` | `range must be (range LO HI) with two integers`; `range needs an integer load type, found double` (a scalar integer only); `range needs LO < HI, found 5 5`; `range bound 129 is out of range for i8` (`-2^(K-1) <= LO < HI <= 2^(K-1)`, signed; `HI = 2^(K-1)` is a range open above, which LLVM spells with the minimum as its end); `range covers every value of i8` (LLVM's `!range` may not be the full set); `range on a volatile load` |
 
@@ -1300,13 +1419,13 @@ immediately before they read the tree, and by nothing earlier.
 
 #### 6.14.1 The managed type
 
-`(ptr 1)` is a counted reference that may be null: LLVM's `ptr
+`(PTR (ADDRSPACE 1))` is a counted reference that may be null: LLVM's `ptr
 addrspace(1)`, address space 1 being non-integral (`ni:1`), so a value
 of it has no integer. It is first-class: a value, parameter, result,
 `phi`, `select`, `load`, `store`, array element or `defstruct` field; not
 a vector element. It is a different type from `ptr`: no instruction
 accepts one where the other is expected (`call to @f: argument 1 has
-type (ptr 1), expected ptr`). The null of it is written `((ptr 1) null)`.
+type (ptr 1), expected ptr`). The null of it is written `((PTR (ADDRSPACE 1)) NULL)`.
 `ptrtoint`, `inttoptr` and `bitcast` never take it (`ptrtoint cannot
 convert (ptr 1): a managed reference has no integer value`, `inttoptr
 needs a ptr result type, found (ptr 1)`, `bitcast cannot convert (ptr
@@ -1316,73 +1435,73 @@ inside `unsafe` (§6.14.4). A `kernelcc` function never takes one (`@k
 is kernelcc: a kernel takes scalars and ptr, found (ptr 1)`).
 
 A `defstruct` says which of its fields are counted by giving them this
-type: `(defstruct P (%struct.fib.hdr i64 (ptr 1)))`. The text says what
+type: `(DEFSTRUCT P ((STRUCT fib.hdr) I64 (PTR (ADDRSPACE 1))))`. The text says what
 is counted, which types.md §8.1 had the fibber type decide.
 
 #### 6.14.2 Kinds
 
-Every value of type `(ptr 1)` has a **kind**, fixed by what defines it:
+Every value of type `(PTR (ADDRSPACE 1))` has a **kind**, fixed by what defines it:
 
 | Kind | Meaning | Defined by |
 |---|---|---|
-| `owned` | carries one count and must be consumed exactly once on every path | `alloc-object`, `copy-value`, `load copy`, `load take`, a call whose result is `(ptr 1)`, an `owned` parameter, a `phi` whose incoming values are owned or none |
+| `owned` | carries one count and must be consumed exactly once on every path | `alloc-object`, `copy-value`, `load copy`, `load take`, a call whose result is `(PTR (ADDRSPACE 1))`, an `owned` parameter, a `phi` whose incoming values are owned or none |
 | `guaranteed` | borrowed: valid while its **roots** are live, never consumed | a parameter without `owned` (its root is itself, live for the whole function), `load borrow` (roots: the base's), a `phi` of guaranteed and none values (roots: the union), a `select` (roots: the union; an owned arm is itself a root) |
-| `none` | needs no count work: usable as owned and as guaranteed any number of times | `((ptr 1) null)`; `(addrspacecast (ptr 1) p)` in an `unsafe` function (the author vouches for it) |
+| `none` | needs no count work: usable as owned and as guaranteed any number of times | `((PTR (ADDRSPACE 1)) NULL)`; `(ADDRSPACECAST (PTR (ADDRSPACE 1)) p)` in an `unsafe` function (the author vouches for it) |
 | `stack` | a scope-local object of this frame, ended by exactly one `dealloc-stack` | `alloc-stack` |
-| `interior` | the address of a field or element of an object, usable only as the address operand of a load, store, atomic or further `getelementptr` | `getelementptr` whose base is `(ptr 1)` (roots: the base's; an owned or stack base is itself the root) |
+| `interior` | the address of a field or element of an object, usable only as the address operand of a load, store, atomic or further `getelementptr` | `getelementptr` whose base is `(PTR (ADDRSPACE 1))` (roots: the base's; an owned or stack base is itself the root) |
 
 The **roots** of a value are the owned, stack or guaranteed-parameter
-values it was derived from. A parameter is written `((ptr 1) owned p)`
-or `((ptr 1) p)`; in a `declare` and in a function type the kind wraps the
-type, `(owned (ptr 1))` against `(ptr 1)` (`owned needs (ptr 1), found
+values it was derived from. A parameter is written `((PTR (ADDRSPACE 1)) OWNED p)`
+or `((PTR (ADDRSPACE 1)) p)`; in a `declare` and in a function type the kind wraps the
+type, `(OWNED (PTR (ADDRSPACE 1)))` against `(PTR (ADDRSPACE 1))` (`owned needs (ptr 1), found
 i64`; `owned is a parameter kind, not a type` anywhere but a parameter).
-A result of type `(ptr 1)` is always owned. The kinds are part of a
+A result of type `(PTR (ADDRSPACE 1))` is always owned. The kinds are part of a
 function's type: a `tailcall` under `ccc` needs them identical (§7.3), an
-`indirect-call` is checked against the kinds it writes, and a `(let ((y
+`indirect-call` is checked against the kinds it writes, and a `(LET ((y
 x)) ..)` of a managed `x` names the same value.
 
 #### 6.14.3 Forms
 
 | Form | Rule | Result |
 |---|---|---|
-| `(alloc-object %struct.T tid)` | `T` a struct whose first field is the header struct (§6.14.6); `tid : i32`, what the runtime's `alloc` receives | `(ptr 1)`, owned, and **fresh** (§6.14.5 rule 8) |
-| `(alloc-object %struct.T tid n)` | as above; `T`'s last field is `[0 x E]` and `n : i64` the number of its elements | `(ptr 1)`, owned, fresh |
-| `(alloc-stack %struct.T tid)` | as `alloc-object`, in this frame | `(ptr 1)`, stack |
-| `(dealloc-stack s)` | ends the stack value `s` (SIL's `dealloc_stack`, MIR's `StorageDead`): a form of its own, so that erasure needs no kinds | void |
-| `(copy-value v)` | `v : (ptr 1)`, any kind but interior | `(ptr 1)`, owned |
-| `(destroy-value v)` | consumes `v`: owned or none | void |
-| `(is-unique v)` | `v : (ptr 1)`; on the true edge of a `br` on it, `v` has uniqueness evidence | `i1` |
-| `(load copy (ptr 1) a)` | `a` an interior address, or any `ptr` in an `unsafe` function | `(ptr 1)`, owned |
-| `(load borrow (ptr 1) a)` | `a` an interior address | `(ptr 1)`, guaranteed, rooted as `a` |
-| `(load take (ptr 1) a)` | as `load copy`; the slot is left null; `a`'s object must be mutable here (rule 8) | `(ptr 1)`, owned |
-| `(store init v a)` | `v : (ptr 1)` consumed; `a` as for `load copy`; the slot held nothing counted | void |
-| `(store assign v a)` | as `store init`, and the slot's old value is released; `a`'s object must be mutable here | void |
-| `(store borrow v a)` | `v` guaranteed or none, not consumed; `a` an interior address of a stack object (rule 6) | void |
-| `(addrspacecast ptr v)`, `(addrspacecast (ptr 1) p)` | in an `unsafe` function only (rule 9); `v : (ptr 1)` is used, not consumed, and the `ptr` made of it is untracked; the `(ptr 1)` made of `p : ptr` is `none` | `ptr` or `(ptr 1)` |
+| `(ALLOC-OBJECT (STRUCT T) tid)` | `T` a struct whose first field is the header struct (§6.14.6); `tid : i32`, what the runtime's `alloc` receives | `(PTR (ADDRSPACE 1))`, owned, and **fresh** (§6.14.5 rule 8) |
+| `(ALLOC-OBJECT (STRUCT T) tid n)` | as above; `T`'s last field is `(ARRAY 0 E)` and `n : i64` the number of its elements | `(PTR (ADDRSPACE 1))`, owned, fresh |
+| `(ALLOC-STACK (STRUCT T) tid)` | as `alloc-object`, in this frame | `(PTR (ADDRSPACE 1))`, stack |
+| `(DEALLOC-STACK s)` | ends the stack value `s` (SIL's `dealloc_stack`, MIR's `StorageDead`): a form of its own, so that erasure needs no kinds | void |
+| `(COPY-VALUE v)` | `v : (PTR (ADDRSPACE 1))`, any kind but interior | `(PTR (ADDRSPACE 1))`, owned |
+| `(DESTROY-VALUE v)` | consumes `v`: owned or none | void |
+| `(IS-UNIQUE v)` | `v : (PTR (ADDRSPACE 1))`; on the true edge of a `br` on it, `v` has uniqueness evidence | `i1` |
+| `(LOAD COPY (PTR (ADDRSPACE 1)) a)` | `a` an interior address, or any `ptr` in an `unsafe` function | `(PTR (ADDRSPACE 1))`, owned |
+| `(LOAD BORROW (PTR (ADDRSPACE 1)) a)` | `a` an interior address | `(PTR (ADDRSPACE 1))`, guaranteed, rooted as `a` |
+| `(LOAD TAKE (PTR (ADDRSPACE 1)) a)` | as `load copy`; the slot is left null; `a`'s object must be mutable here (rule 8) | `(PTR (ADDRSPACE 1))`, owned |
+| `(STORE INIT v a)` | `v : (PTR (ADDRSPACE 1))` consumed; `a` as for `load copy`; the slot held nothing counted | void |
+| `(STORE ASSIGN v a)` | as `store init`, and the slot's old value is released; `a`'s object must be mutable here | void |
+| `(STORE BORROW v a)` | `v` guaranteed or none, not consumed; `a` an interior address of a stack object (rule 6) | void |
+| `(ADDRSPACECAST PTR v)`, `(ADDRSPACECAST (PTR (ADDRSPACE 1)) p)` | in an `unsafe` function only (rule 9); `v : (PTR (ADDRSPACE 1))` is used, not consumed, and the `ptr` made of it is untracked; the `(PTR (ADDRSPACE 1))` made of `p : ptr` is `none` | `ptr` or `(PTR (ADDRSPACE 1))` |
 
-A plain `load` of `(ptr 1)`, or a plain `store` of a `(ptr 1)` value, is
+A plain `load` of `(PTR (ADDRSPACE 1))`, or a plain `store` of a `(PTR (ADDRSPACE 1))` value, is
 refused everywhere (rule 9: `a managed value is loaded with copy, borrow
 or take`, `a managed value is stored with init, assign or borrow`), which
 is what keeps an alias from outliving a count. The words after `load`
-and `store` are read by their count: `(load copy (ptr 1) a)` has three
-operands and a plain load two, `(store init v a)` three and a plain store
-two, so a local named `copy` or `init` stays a name. `(getelementptr T p
-i..)` with `p : (ptr 1)` is `(ptr 1)` (LLVM keeps the address space) of
+and `store` are read by their count: `(LOAD COPY (PTR (ADDRSPACE 1)) a)` has three
+operands and a plain load two, `(STORE INIT v a)` three and a plain store
+two, so a local named `copy` or `init` stays a name. `(GETELEMENTPTR T p
+i..)` with `p : (ptr 1)` is `(PTR (ADDRSPACE 1))` (LLVM keeps the address space) of
 kind interior; outside `unsafe` it may not address the header (rule 9).
-The type operand of the managed loads is `(ptr 1)` (`load copy needs (ptr
+The type operand of the managed loads is `(PTR (ADDRSPACE 1))` (`load copy needs (ptr
 1), found ptr`).
 
 #### 6.14.4 The fence: `unsafe`
 
-`(define unsafe ..)` marks a function in which the managed world meets
-raw memory: `addrspacecast` between `ptr` and `(ptr 1)`, the managed
+`(DEFINE UNSAFE ..)` marks a function in which the managed world meets
+raw memory: `addrspacecast` between `ptr` and `(PTR (ADDRSPACE 1))`, the managed
 loads and stores through a plain `ptr`, and the address of the header are
 allowed there and nowhere else. Ownership is still verified inside an
 `unsafe` function: only those three things are unlocked. `unsafe` is a
 `define` modifier (`declare cannot be unsafe`, `global cannot be unsafe:
 unsafe is for a function`), once (`duplicate modifier unsafe`), and the
 gate counts the `unsafe` functions of the runtime against a ratchet
-(lir-language.md stage 2, step 5). `ptrtoint` of `(ptr 1)` is refused in
+(lir-language.md stage 2, step 5). `ptrtoint` of `(PTR (ADDRSPACE 1))` is refused in
 `unsafe` too: it is a type error, not a fence.
 
 #### 6.14.5 The verifier
@@ -1393,7 +1512,7 @@ backends): a check that can be skipped is no check (lir-language.md
 section 3, rule 3). It is one forward dataflow per function over the
 CFG `lir.check` built, keeping for each owned and stack value whether it
 is live or consumed at each point, and for each fresh value whether its
-uniqueness evidence holds. A function with no `(ptr 1)` value and no
+uniqueness evidence holds. A function with no `(PTR (ADDRSPACE 1))` value and no
 ownership form costs one walk. The rules, each with its diagnostic
 (`FILE:LINE:COL: error: ownership rule N: ..` at the form at fault):
 
@@ -1412,12 +1531,12 @@ ownership form costs one walk. The rules, each with its diagnostic
 2. **No use after consume.** No use of a value is reachable from a
    consuming use of it without a new definition: `ownership rule 2: x
    used after it was consumed`. Within one instruction the consuming
-   positions take effect before the others, so `(call @f x x)` with the
+   positions take effect before the others, so `(CALL (GLOBAL f) x x)` with the
    first parameter owned is this error.
 3. **Merge agreement.** At every block entry the predecessors agree on
    live or consumed for every value, so there are no drop flags:
    `ownership rule 3: x is live from A and consumed from B at block L`. A
-   `phi` of `(ptr 1)` whose incoming values are owned on one edge and
+   `phi` of `(PTR (ADDRSPACE 1))` whose incoming values are owned on one edge and
    guaranteed on another is `ownership rule 3: phi in L mixes owned (from
    A) and guaranteed (from B) values`; a front end retains on the
    guaranteed edge instead.
@@ -1439,7 +1558,7 @@ ownership form costs one walk. The rules, each with its diagnostic
    a `phi` operand (`stack s is a phi operand`) or the operand of
    `destroy-value` (`stack s consumed by destroy-value: a stack value is
    ended by dealloc-stack`; and `dealloc-stack of owned x` the other way
-   round). `(store borrow g a)`
+   round). `(STORE BORROW g a)`
    into a stack object `s` is accepted only if `s` is ended before every
    consume of `g`'s roots on every path: `ownership rule 6: stack s still
    holds a borrow of r, which is consumed here`.
@@ -1452,10 +1571,10 @@ ownership form costs one walk. The rules, each with its diagnostic
 8. **Mutation needs evidence.** A `store` of any kind, an atomic write,
    or a `load take` through an interior address of a managed object
    needs the object to be **mutable here**: it is a stack object, its
-   struct is `(defstruct mutable ..)` (cells, atoms, task frames), or it
+   struct is `(DEFSTRUCT MUTABLE ..)` (cells, atoms, task frames), or it
    has uniqueness evidence: it is fresh from `alloc-object`, or the
    block is reached through the true edge of a `br` whose condition is
-   `(is-unique x)`, and the evidence has not been lost. Evidence is lost
+   `(IS-UNIQUE x)`, and the evidence has not been lost. Evidence is lost
    at the first `copy-value` of the value, at a call it is an argument of
    (the callee may have copied it), at a `store borrow` of it and at a
    merge with a path without it (D8: evidence is checked from the start,
@@ -1472,9 +1591,9 @@ ownership form costs one walk. The rules, each with its diagnostic
    and an interior address anywhere but as an address (`interior address
    x returned`, `.. stored`, `.. passed to @f`, `.. consumed`).
 10. **Signatures.** A call is checked against the callee's kinds: an
-    owned position consumes, a guaranteed one borrows, a `(ptr 1)` result
+    owned position consumes, a guaranteed one borrows, a `(PTR (ADDRSPACE 1))` result
     is owned. The one place a module can write a signature that is not
-    the callee's is an indirect call whose callee is written `@f`:
+    the callee's is an indirect call whose callee is written `(GLOBAL f)`:
     `ownership rule 10: indirect-call through @f writes (fn void ((ptr
     1))), but @f is (fn void ((owned (ptr 1))))`. The functions of the
     `ownership` form must have the types §6.14.6 gives.
@@ -1499,14 +1618,14 @@ a verifier whose rule is disabled.
 
 #### 6.14.6 The binding: what the forms lower to
 
-A module that uses `(ptr 1)` or any form of §6.14.3 names, once, the
+A module that uses `(PTR (ADDRSPACE 1))` or any form of §6.14.3 names, once, the
 runtime functions the forms lower to, so that lair hard-codes no runtime
 name (`the module uses (ptr 1) but has no ownership form`, `a module has
 at most one ownership form`):
 
 ```
-(ownership (retain @fib.retain) (release @fib.release) (unique @fib.unique?) (alloc @fib.alloc)
-           (stack-init @fib.stack-init) (stack-end @fib.stack-end) (header %struct.fib.hdr))
+(OWNERSHIP (RETAIN (GLOBAL fib.retain)) (RELEASE (GLOBAL fib.release)) (UNIQUE (GLOBAL fib.unique?)) (ALLOC (GLOBAL fib.alloc))
+           (STACK-INIT (GLOBAL fib.stack-init)) (STACK-END (GLOBAL fib.stack-end)) (HEADER (STRUCT fib.hdr)))
 ```
 
 Each field is required (`ownership form needs (retain @f)`, `ownership:
@@ -1518,9 +1637,9 @@ form anywhere in the program is `ownership: FILE also has an ownership
 form`. The functions are
 `unsafe` defines or declares (`ownership: @f must be an unsafe define or a
 declare`) with these types (`ownership: retain must be (fn void (ptr)),
-@f is (fn void (i64))`): `retain`, `release` and `stack-end` `(fn void
-(ptr))`, `unique` `(fn i1 (ptr))`, `alloc` `(fn ptr (i64 i32))`,
-`stack-init` `(fn void (ptr i32))`. They take `ptr`, since they are
+@f is (fn void (i64))`): `retain`, `release` and `stack-end` `(FUNCTION VOID
+(PTR))`, `unique` `(FUNCTION I1 (PTR))`, `alloc` `(FUNCTION PTR (I64 I32))`,
+`stack-init` `(FUNCTION VOID (PTR I32))`. They take `ptr`, since they are
 called after erasure. `header` names a defined struct: the first field of
 every object struct, addressable only in `unsafe` (rule 9).
 
@@ -1534,30 +1653,30 @@ function.
 
 After the verifier, and before LLVM, the C, JS or WGSL printer, lair
 erases the section: the result is a module of §2 to §6.13 that checks
-under §10 and is what the front end wrote before this section. `@RETAIN`
+under §10 and is what the front end wrote before this section. `(GLOBAL RETAIN)`
 and the others are the module's `ownership` form; `S` is the size of
-`%struct.T` by LLVM's layout for the target (each field at the natural
+`(STRUCT T)` by LLVM's layout for the target (each field at the natural
 alignment of its type, the whole rounded up to the largest, pointers the
 target's width, as emit.layout computes it); fresh names are ones the
 function does not bind.
 
 | Form | Erased to |
 |---|---|
-| `(ptr 1)`, `(owned (ptr 1))`, `((ptr 1) null)` | `ptr`, `ptr`, `(ptr null)`, everywhere a type or literal is written |
-| `(x (alloc-object %struct.T tid))` | `(x (call @ALLOC (i64 S) tid))` |
-| `(x (alloc-object %struct.T tid n))` | `(x (call @ALLOC (add (i64 S) (mul (i64 E) n)) tid))`, `E` the size of the element of `T`'s last field |
-| `(x (alloc-stack %struct.T tid))` | `(x (alloca %struct.T))` in the entry block, before everything else there, and `(call @STACK-INIT x tid)` where the form stood |
-| `(x (copy-value v))` | `(call @RETAIN v)` where the binding stood, and `v` for `x` after it |
-| `(copy-value v)` as a statement or an operand | `(call @RETAIN v)`, or `(let ((t v)) (call @RETAIN t) t)` |
-| `(destroy-value v)` | `(call @RELEASE v)` |
-| `(dealloc-stack s)` | `(call @STACK-END s)` |
-| `(is-unique v)` | `(call @UNIQUE v)` |
-| `(x (load copy (ptr 1) a))` | `(x (load ptr a))` then `(call @RETAIN x)`; as an operand `(let ((t (load ptr a))) (call @RETAIN t) t)` |
-| `(load borrow (ptr 1) a)` | `(load ptr a)` |
-| `(x (load take (ptr 1) a))` | `(x (load ptr a))` then `(store (ptr null) a)`; as an operand `(let ((t (load ptr a))) (store (ptr null) a) t)` |
-| `(store init v a)`, `(store borrow v a)` | `(store v a)` |
-| `(store assign v a)` | `(let ((o (load ptr a))) (store v a) (call @RELEASE o))` |
-| `(addrspacecast T v)` | `v` |
+| `(PTR (ADDRSPACE 1))`, `(OWNED (PTR (ADDRSPACE 1)))`, `((PTR (ADDRSPACE 1)) NULL)` | `ptr`, `ptr`, `(PTR NULL)`, everywhere a type or literal is written |
+| `(x (ALLOC-OBJECT (STRUCT T) tid))` | `(x (CALL (GLOBAL ALLOC) (I64 S) tid))` |
+| `(x (ALLOC-OBJECT (STRUCT T) tid n))` | `(x (CALL (GLOBAL ALLOC) (ADD (I64 S) (MUL (I64 E) n)) tid))`, `E` the size of the element of `T`'s last field |
+| `(x (ALLOC-STACK (STRUCT T) tid))` | `(x (ALLOCA (STRUCT T)))` in the entry block, before everything else there, and `(CALL (GLOBAL STACK-INIT) x tid)` where the form stood |
+| `(x (COPY-VALUE v))` | `(CALL (GLOBAL RETAIN) v)` where the binding stood, and `v` for `x` after it |
+| `(COPY-VALUE v)` as a statement or an operand | `(CALL (GLOBAL RETAIN) v)`, or `(LET ((t v)) (CALL (GLOBAL RETAIN) t) t)` |
+| `(DESTROY-VALUE v)` | `(CALL (GLOBAL RELEASE) v)` |
+| `(DEALLOC-STACK s)` | `(CALL (GLOBAL STACK-END) s)` |
+| `(IS-UNIQUE v)` | `(CALL (GLOBAL UNIQUE) v)` |
+| `(x (LOAD COPY (PTR (ADDRSPACE 1)) a))` | `(x (LOAD PTR a))` then `(CALL (GLOBAL RETAIN) x)`; as an operand `(LET ((t (LOAD PTR a))) (CALL (GLOBAL RETAIN) t) t)` |
+| `(LOAD BORROW (PTR (ADDRSPACE 1)) a)` | `(LOAD PTR a)` |
+| `(x (LOAD TAKE (PTR (ADDRSPACE 1)) a))` | `(x (LOAD PTR a))` then `(STORE (PTR NULL) a)`; as an operand `(LET ((t (LOAD PTR a))) (STORE (PTR NULL) a) t)` |
+| `(STORE INIT v a)`, `(STORE BORROW v a)` | `(STORE v a)` |
+| `(STORE ASSIGN v a)` | `(LET ((o (LOAD PTR a))) (STORE v a) (CALL (GLOBAL RELEASE) o))` |
+| `(ADDRSPACECAST T v)` | `v` |
 | `unsafe`, `mutable`, the `ownership` form | dropped |
 
 An `alloc-object`, `alloc-stack`, `copy-value`, `load copy` or `load
@@ -1589,8 +1708,8 @@ written as an `i8` reads three bytes of whatever was there.
 ### 7.2 main
 
 A module run by `lair run` or built by `lair build` into an executable
-must define `main` as `(define (main i32) () ..)` or `(define (main
-i32) ((i32 argc) (ptr argv)) ..)`, with the C convention: `main must be
+must define `main` as `(DEFINE (main I32) () ..)` or `(DEFINE (main
+I32) ((I32 argc) (PTR argv)) ..)`, with the C convention: `main must be
 (main i32) with no parameters or (i32 ptr)`, or `no main function`,
 and exported: `main must not be private or internal` (§4.3). The
 process exit status is `main`'s result, as C gives it (the low 8
@@ -1605,7 +1724,7 @@ turned the rule off).
 
 ### 7.3 Tail calls
 
-`(tailcall @g a..)` lowers to `musttail call` of `g` followed by `ret`
+`(TAILCALL (GLOBAL g) a..)` lowers to `musttail call` of `g` followed by `ret`
 of its result (or `ret void`); `indirect-tailcall` likewise through a
 pointer. A `musttail` call is **guaranteed** not to grow the stack:
 LLVM either emits a jump or fails, and lIR's checker rejects every
@@ -1635,7 +1754,7 @@ overflows the stack.) The rules, checked against the callee's type
    the `musttail` ("failed to perform tail call elimination on a call
    site marked musttail"; x86-64 gives up beyond three integer or four
    floating leaves, `adversarial/tail-result-memory.lir`). The bound
-   is what every 64-bit target returns in registers; `{ ptr, ptr }`,
+   is what every 64-bit target returns in registers; `(LITERAL-STRUCT PTR PTR)`,
    the dyn value of types.md §8, is within it.
 
 A `tailcall` whose callee takes a pointer to one of the caller's
@@ -1652,24 +1771,24 @@ reads `undef`; the orderings of §6.6 are LLVM's, which match C++11's
 ## 9. Globals and constants
 
 ```
-(global mod* NAME T init)     ; mutable
-(constant mod* NAME T init)   ; read-only; a store to it is undefined behaviour
-(declare-global hidden? NAME T)   ; defined elsewhere (§4.4)
-init ::= (iK INT) | (float FLT) | (double FLT) | (ptr null) | @NAME
-       | (string STR) | (<N x E> ..) | { init* } | (%struct.S init*)
-       | ([N x T] init*) | (zeroinitializer T)
+(GLOBAL mod* NAME T init)     ; mutable
+(CONSTANT mod* NAME T init)   ; read-only; a store to it is undefined behaviour
+(DECLARE-GLOBAL HIDDEN? NAME T)   ; defined elsewhere (§4.4)
+init ::= (I1 INT) | (I8 INT) | (I16 INT) | (I32 INT) | (I64 INT) | (FLOAT FLT) | (DOUBLE FLT) | (PTR NULL) | (GLOBAL NAME)
+       | (STRING STR) | ((VECTOR N T) ..) | (LITERAL-STRUCT init*) | ((STRUCT NAME) init*)
+       | ((ARRAY N T) init*) | (ZEROINITIALIZER T)
 ```
 
-- `@NAME` in an expression is the global's address, a `ptr`; its value
-  is read with `(load T @NAME)`.
+- `(GLOBAL NAME)` in an expression is the global's address, a `ptr`; its value
+  is read with `(LOAD T (GLOBAL NAME))`.
 - The initialiser has type `T` (`initializer of @g has type i64,
-  expected i32`). `(string "…")` initialises a `ptr` global with the
-  address of a private constant holding the bytes and a NUL: `(load ptr
-  @g)` gives a pointer to the text. (liar stored the bytes themselves
+  expected i32`). `(STRING "…")` initialises a `ptr` global with the
+  address of a private constant holding the bytes and a NUL: `(LOAD PTR
+  (GLOBAL g))` gives a pointer to the text. (liar stored the bytes themselves
   in the slot, so the load returned the text read as an address and
-  crashed: `t/gstr.lir`.) `@f` initialises a `ptr` with a function's or
+  crashed: `t/gstr.lir`.) `(GLOBAL f)` initialises a `ptr` with a function's or
   global's address. Struct, array and vector initialisers nest;
-  `(zeroinitializer T)` zeroes a global of any type, a large buffer
+  `(ZEROINITIALIZER T)` zeroes a global of any type, a large buffer
   included.
 - `constant` was documented by liar's `doc/lIR.md` but not parsed
   (`t/const.lir`).
@@ -1846,13 +1965,25 @@ lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [--library] [-L DIR].. [
 lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair expand FILE.lir             ; print the module with its macros expanded, as lIR text (§4.6): the input of a backend with no compile-time runtime
 lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
+lair words                       ; the words of lIR (§2): each word's text and its canonical name, one per line
+lair --old-spelling ..           ; admit the old spelling beside the new (§2, transitional); --new-spelling refuses it, the default
+lair respell FILE.lir [--in-place|--check]   ; the text in the new spelling (§2), comments and layout kept; --check: exit 1 unless it is already
 ```
+
+`lair respell` rewrites a text into the new spelling token by token: it reads the old spelling whatever the mode, walks the forms with
+the shape of the grammar, and replaces only the words in a word position (a head, a modifier, a type, a flag, an ordering, a literal
+word), the sigils and the bracket types; every other byte is copied, so comments, case headers and layout stay, a name stays as it was
+written (a local `add`, a label `entry`), and an `;; error:` header that quotes `@f`, `%struct.s` or `(ptr 1)` is respelled with the
+text. A form the grammar does not know, a macro use, is walked generically: every word in it is respelled. The result parses to the same
+tree as the input and is its own respelling (`compiler/tests/lir/respell.sh` holds both over every lIR file of the tree); what a macro
+builds at macro time (`(lir.sexp.symbol "add")`) is no text and is not seen.
 
 `FIB_TARGET_CPU` names the CPU code is generated for when the module has
 no `target` form (§4.5): unset, empty or `host` mean the host's CPU and
 features; any other value names a CPU with no extra features.
-`FIB_LIR_FACTS` is the check mode of the facts (§6.13) and `FIB_LIR_OWN`
-the mode of the ownership verifier (§6.14.5).
+`FIB_LIR_FACTS` is the check mode of the facts (§6.13), `FIB_LIR_OWN`
+the mode of the ownership verifier (§6.14.5), and `FIB_LIR_SPELLING`
+(`old` or `new`) whether the old spelling is admitted (§2).
 
 ## 13. Cases
 
@@ -1919,4 +2050,5 @@ one the passes used.
 | 18 | ownership in lIR: the managed type `(ptr 1)` (LLVM's `ptr addrspace(1)`), kinds on SSA values and parameters, SIL's forms `alloc-object alloc-stack dealloc-stack copy-value destroy-value is-unique`, `load copy|borrow|take`, `store init|assign|borrow`, `addrspacecast` inside `(define unsafe ..)`, the `ownership` form naming what the forms lower to (one per program, in the interface of the module that carries it), a verifier of ten rules inside `lir.check` on every path (`FIB_LIR_OWN`, `report` the default until the emitter emits the forms), erasure as the last pass before LLVM or a printer after an optimisation slot on the explicit forms; MIR's words weighed and recorded | **Decided** (owner, 2026-10-25: lIR is the language, lair the only compiler; docs/design/lir-language.md stage 2, D4 to D10 as recommended) | §2, §4, §4.7, §6.10, §6.14, §10, §12, §13, cases/lir/own |
 | 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
 | 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |
-| 21 | string constants: each `(string ..)` is its own constant, so lair writes no `unnamed_addr` and LLVM merges none (D12: the code follows the spec) | **Decided** (owner, 2026-10-25) | §3, cases/lir/instr/string-own-constant.lir |
+| 21 | lIR spells names out and every word it owns is upper case (owner, 2026-10-25: "lir should prefer spelled out names not abbreviations or macros. So @ should be 'global'"; "I'm also ok with using CAPS for lir"): `(GLOBAL f)` for `@f`, `(STRUCT S)` for `%struct.S`, `(PTR (ADDRSPACE 1))` for `(ptr 1)`, `FUNCTION` for `fn`, `ALWAYSINLINE` for `inline`, `PRESERVE_MOSTCC` for `preservemost`, `INF`/`NAN`, `(VECTOR N T)`, `(ARRAY N T)` and `(LITERAL-STRUCT ..)` for LLVM's bracket syntax; names as written; a name that is a word refused; the reserved words and the reserved macro names gone; one table of the words (`compiler/lir/words.fib`) held equal to the grammar by `compiler/tests/lir/words.sh`; `lair respell` converts a text. The audit and the plan: `/tank/data/fibber-scratch/lir-language/respell-audit.md` | **Decided** (owner, 2026-10-25) | §1, §2, §3, §4, §5.1, §5.3, §6, §9, §12 |
+| 22 | string constants: each `(STRING ..)` is its own constant, so lair writes no `unnamed_addr` and LLVM merges none (D12: the code follows the spec) | **Decided** (owner, 2026-10-25) | §3, cases/lir/instr/string-own-constant.lir |

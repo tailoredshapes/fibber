@@ -5,7 +5,8 @@
 
 (ns lir.parse.expr
   (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty lir.parse.literal
-        lir.parse.instr lir.parse.intrin lir.parse.memory lir.parse.atomics lir.parse.control lir.parse.own))
+        lir.parse.instr lir.parse.intrin lir.parse.memory lir.parse.atomics lir.parse.control lir.parse.own)
+  (:require [lir.words :as words]))
 
 ;; `parse-expr` as the value the instruction modules take.
 (defun expr-parser () -> ExprParser (ExprParser parse-expr))
@@ -16,13 +17,16 @@
     ((SxAtom a p) (atom-expr a p))
     ((SxSymbol a p) (atom-expr a p))
     ((SxStr _ p) (err p "a string must be written (string \"…\")"))
-    ((SxBrace items p) (try-let ((fields (parse-exprs items))) (Ok (expr-new (KStruct nil fields) p))))
+    ((SxBrace items p) (if (words/old-admitted?)
+                           (try-let ((fields (parse-exprs items))) (Ok (expr-new (KStruct nil fields) p)))
+                           (err p (str "expected a value, found " (sexp-describe s)))))
     ((SxVecType _ _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
     ((SxBracket _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
     ((SxList items p) (list-expr items p))))
 
+;; A bare atom: a name, or `@f` while the old spelling is admitted (`(GLOBAL f)` is a list, `named-form`).
 (defun atom-expr :private (a: str p: i64) -> (Result LExpr Diagnostic)
-  (cond (starts-with? a "@")
+  (cond (and (starts-with? a "@") (words/old-admitted?))
         (if (= (str-len a) 1)
             (err p "invalid name @")
             (Ok (expr-new (KGlobal (str-slice a 1 (str-len a))) p)))
@@ -38,16 +42,27 @@
           ((SxVecType _ _ _) (try-let ((ty (parse-type head))) (vector-literal ty args pos)))
           ((SxBracket _ _) (try-let ((ty (parse-type head))) (array-form ty args pos)))
           ((SxAtom name _) (named-form name args pos))
-          ((SxList hs _) (managed-null hs args pos))
+          ((SxList hs _) (typed-literal head hs args pos))
           (_ (err (sexp-pos head) (str "expected an instruction name, found " (sexp-describe head))))))))
 
-;; `((ptr 1) null)`: the null of the managed type (spec/lir.md 6.14.1), the form `managed-null` of lir.intrin.
-(defun managed-null :private (hs: (Vec Sexp) args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (if (and (= (count hs) 2) (atom-is? (nth hs 0) "ptr") (atom-is? (nth hs 1) "1"))
-      (if (and (= (count args) 1) (atom-is? (nth args 0) "null"))
+;; A literal headed by a spelled type: `((STRUCT S) v..)` (`(%struct.S v..)` in the old spelling is `named-form`'s), `((VECTOR N E) v..)`,
+;; `((ARRAY N T) v..)`, and `((PTR (ADDRSPACE 1)) NULL)`, the null of the managed type (spec/lir.md 6.14.1, the form `managed-null` of lir.intrin).
+(defun typed-literal :private (head: Sexp hs: (Vec Sexp) args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((w (if (= (count hs) 0) "" (word-of (nth hs 0)))))
+    (cond (= w "struct")
+          (try-let ((ty (parse-type head)) (fields (parse-exprs args)))
+            (Ok (expr-new (KStruct (some (match ty ((TNamed n) n) (_ ""))) fields) pos)))
+          (= w "vector") (try-let ((ty (parse-type head))) (vector-literal ty args pos))
+          (= w "array") (try-let ((ty (parse-type head))) (array-form ty args pos))
+          (= w "ptr") (managed-null head args pos)
+          :else (err pos (str "expected an instruction name, found " (if (= (count hs) 0) "()" (sexp-describe (nth hs 0))))))))
+
+(defun managed-null :private (head: Sexp args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (if (match (parse-type head) ((Ok t) (type-managed? t)) ((Err _) false))
+      (if (and (= (count args) 1) (atom-word? (nth args 0) "null"))
           (Ok (expr-new (KIntrin "managed-null" 0 (some ty-managed) (vec-empty) nil) pos))
           (err pos "the only (ptr 1) literal is ((ptr 1) null)"))
-      (err pos (str "expected an instruction name, found " (if (= (count hs) 0) "()" (sexp-describe (nth hs 0)))))))
+      (err pos "expected an instruction name, found ptr")))
 
 ;; `([N x T] e..)`: the shell of `array-literal` with its elements.
 (defun array-form :private (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
@@ -55,19 +70,31 @@
             (elems (parse-exprs args)))
     (Ok (expr-new (KArray ty elems) pos))))
 
+;; A form headed by an atom: a scalar literal, a struct literal (old spelling), `(GLOBAL f)`, `(LITERAL-STRUCT v..)`, `(STRING ..)`,
+;; `(ZEROINITIALIZER T)`, or an instruction; `name` is the atom as written, `k` the word it spells ("" for none: `unknown instruction`).
 (defun named-form :private (name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (let ((sub (expr-parser)))
-    (match (scalar-keyword name)
+  (let ((sub (expr-parser)) (k (canon name)))
+    (match (scalar-keyword k)
       ((some ty) (scalar-literal ty args pos))
       (nil
-       (cond (starts-with? name "%struct.")
+       (cond (and (starts-with? name "%struct.") (words/old-admitted?))
              (try-let ((fields (parse-exprs args)))
                (Ok (expr-new (KStruct (some (str-slice name 8 (str-len name))) fields) pos)))
-             (= name "string") (string-literal args pos)
-             (= name "zeroinitializer")
-             (try-let ((_ (arity name args 1 pos)) (ty (type-arg (nth args 0))))
+             (= k "global") (global-form args pos)
+             (= k "literal-struct") (try-let ((fields (parse-exprs args))) (Ok (expr-new (KStruct nil fields) pos)))
+             (= k "struct") (err pos "(STRUCT NAME) is a type: a struct value is ((STRUCT NAME) v..)")
+             (= k "string") (string-literal args pos)
+             (= k "zeroinitializer")
+             (try-let ((_ (arity k args 1 pos)) (ty (type-arg (nth args 0))))
                (Ok (expr-new (KZero ty) pos)))
-             :else (heads name args pos sub))))))
+             (= k "") (err pos (str "unknown instruction " name))
+             :else (heads k args pos sub))))))
+
+;; `(GLOBAL f)`: the address of a global or function (spec/lir.md 3).
+(defun global-form :private (args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity "global" args 1 pos))
+            (n (atom-text (nth args 0) "a global name")))
+    (if (= (str-len n) 0) (err pos "invalid name @") (Ok (expr-new (KGlobal n) pos)))))
 
 ;; The instruction modules in the Rust's order; the first that owns the head answers.
 (defun heads :private (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Result LExpr Diagnostic)
@@ -88,6 +115,7 @@
                          ((some r) r)
                          (nil (err pos (str "unknown instruction " name)))))))))))
 
+;; `(STRING "...")`.
 (defun string-literal :private (args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
   (if (= (count args) 1)
       (match (nth args 0)

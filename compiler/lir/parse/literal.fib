@@ -110,13 +110,22 @@
 
 (defun finite? :private (v: f64) -> bool (= (- v v) 0.0))
 
+;; The special float word a token spells: `inf`, `-inf` or `nan` (`INF`, `-INF`, `NAN`; the lower case while the old spelling is admitted); "" for none.
+(defun special-float :private (tok: str) -> str
+  (let ((k (canon (strip-minus tok))))
+    (cond (and (= k "inf") (starts-with? tok "-")) "-inf"
+          (= k "inf") "inf"
+          (and (= k "nan") (not (starts-with? tok "-"))) "nan"
+          :else "")))
+
 ;; The f64 a token reads as, or nil when it is not a float token.
 (defun float-token :private (tok: str) -> (Option f64)
-  (cond (= tok "inf") (some (bits->f64 9218868437227405312))
-        (= tok "-inf") (some (bits->f64 -4503599627370496))
-        (= tok "nan") (some (bits->f64 9221120237041090560))
-        (float-syntax tok) (some (read-f64 tok))
-        :else nil))
+  (let ((sp (special-float tok)))
+    (cond (= sp "inf") (some (bits->f64 9218868437227405312))
+          (= sp "-inf") (some (bits->f64 -4503599627370496))
+          (= sp "nan") (some (bits->f64 9221120237041090560))
+          (float-syntax tok) (some (read-f64 tok))
+          :else nil)))
 
 ;; The value of a `float` or `double` literal token (`inf`, `-inf`, `nan` included); a finite token that rounds to infinity is out of range.
 ;; A `float` token is read by `strtof`, rounded once to f32 (as a double it could round twice); the value is that f32, as an f64. (literal.rs `float_value`)
@@ -124,7 +133,7 @@
   (match (float-token tok)
     (nil (err pos (str "invalid float literal " tok)))
     ((some v)
-     (let ((finite-token (not (or (= tok "inf") (= tok "-inf") (= tok "nan"))))
+     (let ((finite-token (= (special-float tok) ""))
            (value (match ty ((TFloat) (if finite-token (read-f32 tok) v)) (_ v))))
        (if (and finite-token (not (finite? value)))
            (err pos (str "float literal out of range for " (type-str ty)))
@@ -141,7 +150,7 @@
 (defun scalar-token :private (ty: LType name: str tok: str ap: i64 pos: i64) -> (Result LExpr Diagnostic)
   (match ty
     ((TInt b) (try-let ((v (int-value b tok ap))) (Ok (expr-new (KInt ty v) pos))))
-    ((TPtr) (if (= tok "null") (Ok (expr-new kind-null pos)) (err pos "the only ptr literal is (ptr null)")))
+    ((TPtr) (if (= (canon tok) "null") (Ok (expr-new kind-null pos)) (err pos "the only ptr literal is (ptr null)")))
     (_ (try-let ((v (float-value ty tok ap))) (Ok (expr-new (KFloat ty v) pos))))))
 
 ;; `(<N x E> e..)`. (literal.rs `vector_literal`)
@@ -167,7 +176,7 @@
           (if (or (some-lit? (int-token tok)) (int-text? tok))
               (try-let ((v (int-value b tok pos))) (Ok (expr-new (KInt elem v) pos)))
               (err pos bad)))
-         ((TPtr) (if (= tok "null") (Ok (expr-new kind-null pos)) (err pos bad)))
+         ((TPtr) (if (= (canon tok) "null") (Ok (expr-new kind-null pos)) (err pos bad)))
          ((TFloat) (float-element elem tok pos))
          ((TDouble) (float-element elem tok pos))
          (_ (err pos bad))))

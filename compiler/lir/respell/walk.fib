@@ -1,0 +1,138 @@
+;; compiler/lir/respell/walk.fib: the types and words of the grammar-shaped walk of `lairf respell` (spec/lir.md 2; lir.respell.forms has the
+;; items, blocks and expressions, and the generic walk of a macro use): the walk visits the forms of lir.respell.tree with
+;; the shape of spec/lir.md's grammar, as lir.parse reads them, and records an edit for every token in a word position (a head, a
+;; modifier, a type, a flag, an ordering, a literal word) and for every sigil and bracket type: `@f` to `(GLOBAL f)`, `%struct.s` to
+;; `(STRUCT s)`, `(ptr 1)` to `(PTR (ADDRSPACE 1))`, `(fn ..)` to `(FUNCTION ..)`, `<N x T>` to `(VECTOR N T)`, `[N x T]` to `(ARRAY N T)`,
+;; `{ .. }` to `(LITERAL-STRUCT ..)`. A name in a name position (a local, a label, a global's or struct's name) is never touched, so a local
+;; named `add` survives. A form the grammar does not know (a macro use) is walked generically: every word in it is respelled.
+(ns lir.respell.walk
+  (:use lir.respell.tree lir.intrin)
+  (:require [lir.words :as words]))
+
+(defstruct Walk (src: str toks: (Vec RTok) ed: Edits))
+
+;; ---------------------------------------------------------------- atoms and words
+
+(defun tok-of :private (wk: Walk f: RForm) -> (Option RTok)
+  (match f ((RAtom i) (some (nth (. wk toks) i))) (_ nil)))
+
+;; The canonical word an atom form spells, "" for none (or no atom).
+(defun word-of (wk: Walk f: RForm) -> str
+  (match (tok-of wk f)
+    ((some t) (if (= (. t kind) tk-atom) (match (words/keyword-of-any (. t text)) ((some k) k) (nil "")) ""))
+    (nil "")))
+
+(defun atom-text (wk: Walk f: RForm) -> str
+  (match (tok-of wk f) ((some t) (if (= (. t kind) tk-atom) (. t text) "")) (nil "")))
+
+(defun put! :private (wk: Walk f: RForm text: str) -> unit
+  (match f ((RAtom i) (set-text! (. wk ed) i text)) (_ ())))
+
+;; The atom respelled when it is a word: `add` to `ADD`.
+(defun kw! (wk: Walk f: RForm) -> unit
+  (let ((k (word-of wk f)))
+    (if (= k "") () (put! wk f (words/word-text k)))))
+
+;; `@f` to `(GLOBAL f)` and `%struct.s` to `(STRUCT s)`; a spelled reference `(GLOBAL f)`, `(STRUCT s)` has its head respelled (nothing to do).
+(defun ref! (wk: Walk f: RForm) -> unit
+  (let ((a (atom-text wk f)))
+    (cond (and (starts-with? a "@") (> (str-len a) 1)) (put! wk f (str "(" (words/word-text "global") " " (str-slice a 1 (str-len a)) ")"))
+          (and (starts-with? a "%struct.") (> (str-len a) 8)) (put! wk f (str "(" (words/word-text "struct") " " (str-slice a 8 (str-len a)) ")"))
+          :else (match f ((RList _ _ items _) (if (> (count items) 0) (kw! wk (nth items 0)) ())) (_ ())))))
+
+;; A literal word written bare: `null`, `inf`, `-inf`, `nan` (in a scalar literal or a vector element).
+(defun literal-word! (wk: Walk f: RForm) -> unit
+  (let ((a (atom-text wk f))
+        (neg (starts-with? (atom-text wk f) "-")))
+    (let ((k (match (words/keyword-of-any (if neg (str-slice a 1 (str-len a)) a)) ((some k) k) (nil ""))))
+      (if (or (= k "null") (= k "inf") (= k "nan")) (put! wk f (str (if neg "-" "") (words/word-text k))) ()))))
+
+;; ---------------------------------------------------------------- types
+
+;; A type in any of its spellings.
+(defun type! (wk: Walk f: RForm) -> unit
+  (match f
+    ((RAtom i) (type-atom! wk f (nth (. wk toks) i)))
+    ((RList kind open items close)
+     (cond (= kind 1) (brace! wk open items close type!)
+           (= kind 2) (array-brackets! wk open items close)
+           :else (type-list! wk items)))))
+
+(defun type-atom! (wk: Walk f: RForm t: RTok) -> unit
+  (cond (= (. t kind) tk-vec)
+        (put! wk f (str "(" (words/word-text "vector") " " (. t text) " " (words/word-text (match (words/keyword-of-any (. t elem)) ((some k) k) (nil (. t elem)))) ")"))
+        (starts-with? (. t text) "%struct.") (ref! wk f)
+        :else (kw! wk f)))
+
+;; `{ T.. }` (or `{ v.. }`) to `(LITERAL-STRUCT ..)`: the braces, the gaps beside them, the commas between the items; `each` walks the items.
+(defun brace! (wk: Walk open: i64 items: (Vec RForm) close: i64 each: (fn (Walk RForm) unit) :borrow) -> unit
+  (do (set-text! (. wk ed) open (str "(" (words/word-text "literal-struct")))
+      (set-text! (. wk ed) close ")")
+      (set-gap! (. wk ed) close "")
+      (dotimes (i (count items))
+        (do (set-gap! (. wk ed) (first-token (nth items i)) (if (= i 0) " " (gap-without-commas wk (first-token (nth items i)))))
+            (each wk (nth items i))))))
+
+;; The index of the first token of a form.
+(defun first-token :private (f: RForm) -> i64
+  (match f ((RAtom i) i) ((RList _ open _ _) open)))
+
+;; The gap before token `i` with its commas removed, a single space when nothing is left.
+(defun gap-without-commas :private (wk: Walk i: i64) -> str
+  (let ((t (nth (. wk toks) i)) (prev (nth (. wk toks) (- i 1))))
+    (let ((gap (gap-text wk (. prev to) (. t from))))
+      (let ((kept (str-join (vec (filter (fn (c: str) (not (= c ","))) (char-strings gap))))))
+        (if (= kept "") " " kept)))))
+
+(defun gap-text :private (wk: Walk from: i64 to: i64) -> str
+  (str-slice (. wk src) from to))
+
+(defun char-strings :private (s: str) -> (Vec str)
+  (loop ((i 0) (out []))
+    (if (>= i (str-len s)) out (recur (+ i 1) (conj out (str-slice s i (+ i 1)))))))
+
+;; `[N x T]` to `(ARRAY N T)`: the brackets, the `x` dropped, `T` a type; another shape is left alone.
+(defun array-brackets! (wk: Walk open: i64 items: (Vec RForm) close: i64) -> unit
+  (if (and (= (count items) 3) (= (atom-text wk (nth items 1)) "x"))
+      (do (set-text! (. wk ed) open (str "(" (words/word-text "array")))
+          (set-gap! (. wk ed) (first-token (nth items 0)) " ")
+          (put! wk (nth items 1) "")
+          (type! wk (nth items 2))
+          (set-text! (. wk ed) close ")"))
+      ()))
+
+;; `(ptr 1)`, `(owned T)`, `(fn cc? R (T..))`, and the spelled types themselves (idempotence).
+(defun type-list! (wk: Walk items: (Vec RForm)) -> unit
+  (let ((h (if (= (count items) 0) "" (word-of wk (nth items 0)))))
+    (cond (= h "ptr") (do (kw! wk (nth items 0))
+                          (if (= (count items) 2)
+                              (if (= (atom-text wk (nth items 1)) "1")
+                                  (put! wk (nth items 1) (str "(" (words/word-text "addrspace") " 1)"))
+                                  (match (nth items 1) ((RList 0 _ xs _) (if (> (count xs) 0) (kw! wk (nth xs 0)) ())) (_ ())))
+                              ()))
+          (= h "owned") (do (kw! wk (nth items 0)) (each-from wk items 1 type!))
+          (= h "fn") (fn-type! wk items)
+          (or (= h "array") (= h "vector")) (do (kw! wk (nth items 0)) (if (= (count items) 3) (type! wk (nth items 2)) ()))
+          (= h "literal-struct") (do (kw! wk (nth items 0)) (each-from wk items 1 type!))
+          (= h "struct") (kw! wk (nth items 0))
+          :else ())))
+
+;; `(fn cc? R (T.. ...?))`.
+(defun fn-type! (wk: Walk items: (Vec RForm)) -> unit
+  (do (kw! wk (nth items 0))
+      (let ((i (if (and (> (count items) 1) (cc-word? (word-of wk (nth items 1)))) (do (kw! wk (nth items 1)) 2) 1)))
+        (do (if (< i (count items)) (type! wk (nth items i)) ())
+            (if (< (+ i 1) (count items)) (param-types! wk (nth items (+ i 1))) ())))))
+
+(defun cc-word? :private (w: str) -> bool
+  (or (= w "ccc") (= w "tailcc") (= w "kernelcc") (= w "preservemost")))
+
+;; `(T.. ...?)`: each a type; `...` is left.
+(defun param-types! :private (wk: Walk f: RForm) -> unit
+  (match f
+    ((RList 0 _ items _) (each-from wk items 0 (fn (w: Walk x: RForm) (if (= (atom-text w x) "...") () (type! w x)))))
+    (_ ())))
+
+(defun each-from (wk: Walk items: (Vec RForm) from: i64 each: (fn (Walk RForm) unit) :borrow) -> unit
+  (loop ((i from))
+    (if (>= i (count items)) () (do (each wk (nth items i)) (recur (+ i 1))))))

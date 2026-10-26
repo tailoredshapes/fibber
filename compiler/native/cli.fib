@@ -5,7 +5,8 @@
   (:require [fib.string :as s] [llvm.ffi :as ffi] [native.imports :as imports] [lir.dump :as dump] [lir.print :as lprint] [lir.diag :as diag] [native.pipeline :as pipe]
             [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
             [native.cases.walk :as walk] [native.fuzz :as fuzz] [native.cases.header :as hdr] [native.call :as call]
-            [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries])
+            [native.liro.build :as liro] [native.liro.file :as liro-file] [native.api :as api] [native.libraries :as libraries]
+            [lir.words :as words] [lir.respell :as respell])
   (:use lir.ast lir.types))
 
 (extern exit :private (i32) -> unit)
@@ -14,6 +15,8 @@
 
 (def usage: str "usage:
   lair [--target TRIPLE] ..     the target of check/build/emit-llvm: FIB_TARGET_TRIPLE (docs/design/aarch64.md); `build` then needs --emit
+  lair [--old-spelling|--new-spelling] ..   admit the old spelling of lIR beside the new, or refuse it (the default; spec/lir.md 2,
+                                             transitional for one release; FIB_LIR_SPELLING=old|new, which `cases` and `fuzz` pass on)
   lair check FILE.lir
   lair run [-O n] FILE.lir [ARGS..]
   lair build FILE.lir -o OUT [-O n] [--emit liro|obj|asm|llvm] [--library] [-L DIR].. [-l LIB]..   ; --library: no main rule, the output is a library (a wasm reactor)
@@ -21,6 +24,8 @@
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
   lair expand FILE.lir            ; the module with its macros expanded, as lIR text (for a backend with no compile-time runtime)
+  lair respell FILE.lir [--in-place|--check]   ; the text in the new spelling (spec/lir.md 2), comments and layout kept; --check: exit 1 and the differing lines when it is not already
+  lair words                      ; the words of lIR: TEXT and canonical name, one per line (lir.words)
   lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
   lair fuzz-one [-O n] FILE.lir")
@@ -65,6 +70,28 @@
         (match (imports/load-program src (nth rest 0))
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok p) (do (print-raw (lprint/print-module (. p module))) (Ok 0)))))))
+
+;; `respell FILE [--in-place|--check]` (spec/lir.md 2): the text rewritten in the new spelling at the token level (lir.respell), both
+;; spellings read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that differ and
+;; exit 1 when it is not already in the new spelling).
+(defun respell-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (let ((files (vec (filter (fn (a: str) (not (starts-with? a "--"))) rest)))
+        (in-place (some? (first (filter (fn (a: str) (= a "--in-place")) rest))))
+        (check (some? (first (filter (fn (a: str) (= a "--check")) rest)))))
+    (if (or (not (= (count files) 1)) (and in-place check) (not (= (+ (count files) (if in-place 1 0) (if check 1 0)) (count rest))))
+        (Err usage)
+        (try-let [src (read-src (nth files 0))
+                  out (match (respell/respell-text src) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d (nth files 0)))))]
+          (cond check (if (= out src) (Ok 0) (do (print-raw (respell/respell-diff src out)) (Ok 1)))
+                in-place (if (write-file (nth files 0) out) (Ok 0) (Err (str (nth files 0) ": cannot write")))
+                :else (do (print-raw out) (Ok 0)))))))
+
+;; `words`: the table of lir.words, `TEXT name` per line.
+(defun words-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (empty? rest))
+      (Err usage)
+      (do (doseq [wd (words/words-table)] (println (str (. wd text) " " (. wd name))))
+          (Ok 0))))
 
 ;; The canonical text of the parsed program (docs/design/lair-ast-dump.md): the module with its macros expanded and its imports joined to
 ;; it (spec/lir.md 4.7); it parses but does not check the module itself (an imported module is checked as it is loaded).
@@ -260,19 +287,31 @@
 
 ;; -------------------------------------------------------------------------------------------------- dispatch
 
+(defun set-env :private (name: str value: str) -> unit
+  (let ((k (ffi/bytes-new name)) (v (ffi/bytes-new value)))
+    (do (unsafe (setenv k v 1i32)) ())))
+
 ;; `--target TRIPLE` anywhere in the words: removed, and FIB_TARGET_TRIPLE set to the triple (the code generator and the checker's target read it).
+;; `--old-spelling` and `--new-spelling` (spec/lir.md 2, transitional): removed, and FIB_LIR_SPELLING set (lir.words: the variable is the mode),
+;; which the processes `cases` and `fuzz` start inherit.
 (defun take-target :private (args: (Vec str)) -> (Result (Vec str) str)
   (loop ((i 0) (out []))
     (cond (>= i (count args)) (Ok out)
+          (= (nth args i) "--old-spelling") (do (words/admit-old-spelling! true) (recur (+ i 1) out))
+          (= (nth args i) "--new-spelling") (do (words/admit-old-spelling! false) (recur (+ i 1) out))
           (not (= (nth args i) "--target")) (recur (+ i 1) (conj out (nth args i)))
           (>= (+ i 1) (count args)) (Err "--target needs a triple")
-          :else (let ((k (ffi/bytes-new "FIB_TARGET_TRIPLE")) (v (ffi/bytes-new (nth args (+ i 1)))))
-                  (do (unsafe (setenv k v 1i32)) (recur (+ i 2) out))))))
+          :else (do (set-env "FIB_TARGET_TRIPLE" (nth args (+ i 1))) (recur (+ i 2) out)))))
 
-;; Runs the command; the exit status, or the usage error. (cli.rs `dispatch`)
+;; The fuzzer's grammar writes the old spelling until the tree is converted (spec/lir.md 2), so `fuzz` and `fuzz-one` admit it by default.
+(defun fuzz-cmd? :private (words: (Vec str)) -> bool
+  (or (includes? "fuzz" words) (includes? "fuzz-one" words)))
+
+;; Runs the command; the exit status, or the usage error (cli.rs `dispatch`); the spelling's default first, the flags after it.
 (defun dispatch (words: (Vec str)) -> (Result i64 str)
-  (try-let [args (take-target words)]
-    (dispatch-cmd args)))
+  (do (words/default-spelling! (fuzz-cmd? words))
+      (try-let [args (take-target words)]
+        (dispatch-cmd args))))
 
 (defun dispatch-cmd :private (args: (Vec str)) -> (Result i64 str)
   (if (empty? args)
@@ -286,6 +325,8 @@
               (= cmd "emit-llvm") (emit-llvm-cmd rest)
               (= cmd "dump-ast") (dump-ast-cmd rest)
               (= cmd "expand") (expand-cmd rest)
+              (= cmd "respell") (respell-cmd rest)
+              (= cmd "words") (words-cmd rest)
               (= cmd "cases") (cases-cmd rest)
               (= cmd "fuzz-one") (fuzz-one-cmd rest)
               (= cmd "fuzz") (fuzz/fuzz-cmd rest)
