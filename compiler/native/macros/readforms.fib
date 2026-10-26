@@ -24,7 +24,7 @@
 ;; in the module's readtable; `(define-reader-depth N)`: the nesting the reader allows, 1 to 4096.
 (defun define-reader-setting (t: Readtable head: str form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (cond (and (= head "define-reader-class") (= (count its) 3))
            (match (try-let ((c (class-char (nth its 1))) (k (class-kind (nth its 2)))) (Ok (readtable-class! t c k)))
              ((Err d) (some d))
@@ -42,7 +42,7 @@
 ;; The one character of a string, as a Unicode scalar; lIR's own `(`, `)` and `;` are refused.
 (defun class-char :private (s: Sexp) -> (Result i64 Diagnostic)
   (match s
-    ((SxStr bs pos)
+    ((SxStr bs pos _)
      (match (scalar-of bs)
        (nil (err pos "define-reader-class: the character must be a string of one character"))
        ((some c) (if (or (= c 40) (= c 41) (= c 59))
@@ -80,7 +80,7 @@
 (defun parse-reader (head: str form: Sexp seq: (Cell i64)) -> (Result ReaderDef Diagnostic)
   (let ((token (= head "define-token-reader")) (usage (reader-usage head)))
     (match form
-      ((SxList its pos)
+      ((SxList its pos _)
        (if (< (count its) (if token 3 4))
            (err pos usage)
            (try-let ((c (if token (Ok 0) (reader-char head (nth its 1))))
@@ -102,7 +102,7 @@
 ;; The character of a reader or dispatch macro: a string of one printable ASCII character; a reader macro's not `(`, `)` or `;`.
 (defun reader-char :private (head: str s: Sexp) -> (Result i64 Diagnostic)
   (match s
-    ((SxStr bs pos)
+    ((SxStr bs pos _)
      (let ((c (if (= (array-len bs) 1) (zext i64 (array-get bs 0)) 0)))
        (cond (or (< c 33) (> c 126)) (err pos (str head ": the character must be a string of one printable ASCII character"))
              (and (= head "define-reader-macro") (or (= c 40) (= c 41) (= c 59))) (err pos (str head ": cannot bind " (str-from-bytes bs) ", which is lIR's own"))
@@ -112,7 +112,7 @@
 ;; `(STREAM)` or `(STREAM TOKEN)`: exactly `n` valid names, each once.
 (defun reader-names :private (s: Sexp n: i64 usage: str) -> (Result (Vec str) Diagnostic)
   (match s
-    ((SxList ps pos)
+    ((SxList ps pos _)
      (if (not (= (count ps) n))
          (err pos usage)
          (loop ((i 0) (out []))

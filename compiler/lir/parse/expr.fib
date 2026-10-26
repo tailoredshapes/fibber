@@ -14,15 +14,15 @@
 ;; One expression: an atom (a local, a global) or a list headed by a form name. (expr.rs `parse_expr`)
 (defun parse-expr (s: Sexp) -> (Result LExpr Diagnostic)
   (match s
-    ((SxAtom a p) (atom-expr a p))
-    ((SxSymbol a p) (atom-expr a p))
-    ((SxStr _ p) (err p "a string must be written (string \"…\")"))
-    ((SxBrace items p) (if (words/old-admitted?)
+    ((SxAtom a p _) (atom-expr a p))
+    ((SxSymbol a p _) (atom-expr a p))
+    ((SxStr _ p _) (err p "a string must be written (string \"…\")"))
+    ((SxBrace items p _) (if (words/old-admitted?)
                            (try-let ((fields (parse-exprs items))) (Ok (expr-new (KStruct nil fields) p)))
                            (err p (str "expected a value, found " (sexp-describe s)))))
-    ((SxVecType _ _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
-    ((SxBracket _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
-    ((SxList items p) (list-expr items p))))
+    ((SxVecType _ _ _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
+    ((SxBracket _ _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
+    ((SxList items p _) (list-expr items p))))
 
 ;; A bare atom: a name, or `@f` while the old spelling is admitted (`(GLOBAL f)` is a list, `named-form`).
 (defun atom-expr :private (a: str p: i64) -> (Result LExpr Diagnostic)
@@ -39,10 +39,10 @@
       (err pos "empty form ()")
       (let ((head (nth items 0)) (args (vec-from items 1)))
         (match head
-          ((SxVecType _ _ _) (try-let ((ty (parse-type head))) (vector-literal ty args pos)))
-          ((SxBracket _ _) (try-let ((ty (parse-type head))) (array-form ty args pos)))
-          ((SxAtom name _) (named-form name args pos))
-          ((SxList hs _) (typed-literal head hs args pos))
+          ((SxVecType _ _ _ _) (try-let ((ty (parse-type head))) (vector-literal ty args pos)))
+          ((SxBracket _ _ _) (try-let ((ty (parse-type head))) (array-form ty args pos)))
+          ((SxAtom name _ _) (named-form name args pos))
+          ((SxList hs _ _) (typed-literal head hs args pos))
           (_ (err (sexp-pos head) (str "expected an instruction name, found " (sexp-describe head))))))))
 
 ;; A literal headed by a spelled type: `((STRUCT S) v..)` (`(%struct.S v..)` in the old spelling is `named-form`'s), `((VECTOR N E) v..)`,
@@ -119,7 +119,7 @@
 (defun string-literal :private (args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
   (if (= (count args) 1)
       (match (nth args 0)
-        ((SxStr bytes _) (Ok (expr-new (KStr bytes) pos)))
+        ((SxStr bytes _ _) (Ok (expr-new (KStr bytes) pos)))
         (_ (err pos "string expects one string operand")))
       (err pos "string expects one string operand")))
 
