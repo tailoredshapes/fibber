@@ -503,8 +503,9 @@ as described.
 `liblair.so` that stage 2 called through `extern`. The compiler no longer calls any of them. Its users (`emit.defs.jit`, `macros.runner`,
 `driver.native`) require `native.api` (the names of `lair.jit`: `jit-new`, `jit-add-source`, `jit-c-entry`, `check-source`,
 `build-executable`, ...) and `native.call` (the names of `lair.call`: `call-i64`, the mailbox and its hooks), which are lair written in
-fibber (`compiler/lir/`, `compiler/native/`) over LLVM's C interface (`compiler/llvm/`); `native.fibm` and `native.expand` are `lair.fibm` and
-`lair.expand` moved onto them. A stage 2 links LLVM 21 itself (`fibc build compiler/fibc.fib -L DIR -l LLVM-21` for development, the static
+fibber (`compiler/lir/`, `compiler/native/`) over LLVM's C interface (`compiler/llvm/`); `native.fibm` and `native.expand` were `lair.fibm` and
+`lair.expand` moved onto them (`native.expand`, which nothing required, was deleted on 2026-10-26; `native.fibm` is now `macros.fibm`,
+`compiler/macros/fibm.fib`, since it is fibber's macro interface and not lair's). A stage 2 links LLVM 21 itself (`fibc build compiler/fibc.fib -L DIR -l LLVM-21` for development, the static
 archives through the ld script of `scripts/llvm-static.sh` for a release) and has no `liblair.so`: `ldd` of a release `bin/fibc` shows libc,
 libm, libstdc++, libgcc_s, libz and libzstd. Fibber cannot export a C function, so `lair.h` cannot be offered again: nothing of it is kept
 for third parties (owner decision D2 of docs/design/lair-in-fibber.md). `crates/lair` with its `liblair.so`, `compiler/lair/` (`lair.jit`,
