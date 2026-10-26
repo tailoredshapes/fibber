@@ -200,7 +200,7 @@ case $MODE in
   literal-counter-per-program) patch compiler/emit/program.fib '(generation-name name (family-generation p (family-name (program-g p) key)))' 'name' ;;
   specialisation-not-requested) patch compiler/serve/liveswap.fib '(ec/BodyRequest f (. b owned) [] nil (. b tys-text) (. b module))' '(ec/BodyRequest f (. b owned) [] nil [] (. b module))' ;;
   retire-without-pause) patch compiler/serve/live.fib '    (if (not (and (. t pausing) (. t quiescent)))' '    (if false' ;;
-  patch-plain-store) patch compiler/emit/runtime.fib '  (block entry (atomic-store release (inttoptr ptr v) slot) (ret)))' '  (block entry (store (inttoptr ptr v) slot) (ret)))' ;;
+  patch-plain-store) patch compiler/emit/runtime.fib '  (BLOCK entry (ATOMIC-STORE RELEASE (INTTOPTR PTR v) slot) (RET)))' '  (BLOCK entry (STORE (INTTOPTR PTR v) slot) (RET)))' ;;
   stale-never) patch compiler/serve/livetest.fib '(Pair "stale" (j/JBool (not (= (. run gen0) gen1))))' '(Pair "stale" (j/JBool false))' ;;
   rerun-old-registry)
     patch compiler/serve/livetest.fib '    (do (set! (. (. sx rc) clauses) (rc/merge-clauses @(. (. sx rc) clauses) (lw/test-clauses (. (. sx rts) with))))' '    (do (set! (. (. sx rc) clauses) (rc/merge-clauses @(. (. sx rc) clauses) (lw/test-clauses (. (. sx rts) with))))

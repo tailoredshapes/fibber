@@ -21,7 +21,7 @@
 #   TSAN_ULIMIT   `ulimit -v` for the instrumented run (default unlimited: TSAN reserves tens of terabytes of address space for its shadow
 #                 memory, so the 16 GB cap of the other tools cannot apply; the real memory is a few times the program's)
 #   TSAN_SED      a sed -E expression applied to the LLVM IR before instrumentation: a PLANTED fault (scripts/tsan-planted.sh)
-#   TSAN_APPEND   a file of lIR appended to the emitted program before it is turned into LLVM IR; the program's `(declare NAME ..)` of each
+#   TSAN_APPEND   a file of lIR appended to the emitted program before it is turned into LLVM IR; the program's `(DECLARE NAME ..)` of each
 #                 function the file defines is dropped (an `extern` of the program that the test, not the runtime, defines:
 #                 compiler/tests/live/stress-swapper.lir)
 #   FIB_LIB       the library directory (default: the tree's lib/)

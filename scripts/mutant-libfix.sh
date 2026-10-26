@@ -35,9 +35,9 @@ mut() {
   rm "$f.orig"
 }
 case $MODE in
-  push-old)      mut rt/array.lir 's/\(block big\n    \(let \(\(m \(and n \(sub n \(i64 1\)\)\)\)\)\n      \(ret \(icmp ne m \(i64 0\)\)\)\)\)/(block big (ret (i1 0)))/' ;;
-  push-shared)   mut rt/array.lir 's/\(br \(call \@fib\.unique\? a\) test no\)/(br (i1 1) test no)/' ;;
-  push-full)     mut rt/array.lir 's/\(ret \(icmp ne m \(i64 0\)\)\)/(ret (i1 1))/' ;;
+  push-old)      mut rt/array.lir 's/\(BLOCK big\n    \(LET \(\(m \(AND n \(SUB n \(I64 1\)\)\)\)\)\n      \(RET \(ICMP NE m \(I64 0\)\)\)\)\)/(BLOCK big (RET (I1 0)))/' ;;
+  push-shared)   mut rt/array.lir 's/\(BR \(CALL \(GLOBAL fib\.unique\?\) a\) test no\)/(BR (I1 1) test no)/' ;;
+  push-full)     mut rt/array.lir 's/\(RET \(ICMP NE m \(I64 0\)\)\)/(RET (I1 1))/' ;;
   kw-no-literal) mut compiler/emit/kwdyn.fib 's/\(icmp slt j \(i64 " ns "\)\) body miss/(icmp slt j (i64 0)) body miss/' ;;
 esac
 

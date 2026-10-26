@@ -39,13 +39,13 @@ mut() {
   rm "$f.orig"
 }
 case $MODE in
-  detach)   mut rt/thread.lir 's/    \(call \@pthread_detach \(load i64 handle\)\)\n//' ;;
+  detach)   mut rt/thread.lir 's/    \(CALL \(GLOBAL pthread_detach\) \(LOAD I64 handle\)\)\n//' ;;
   count-late)
     # the uncount leaves the thread entry (compiler) and the fail path (core.lir) and comes back in thread-done, after a delay
     mut compiler/emit/lower/threads.fib 's/\(completion cx head call true "      \(call \@fib\.thread-uncount\)\\n" tail/(completion cx head call true "" tail/'
-    mut rt/core.lir 's/    \(call \@fib\.thread-uncount\)\n//'
-    mut rt/thread.lir 's/    \(call \@fib\.guard-leave\)\n/    (call \@fib.guard-leave)\n    (let ((ts (alloca (align 8) i8 (i32 16)))) (store (i64 0) ts) (store (i64 20000000) (getelementptr i8 ts (i64 8))) (call \@nanosleep ts (ptr null)))\n    (call \@fib.thread-uncount)\n/' ;;
-  join-all) mut rt/thread.lir 's/\(icmp sgt \(load i32 \@fib\.threads-live\) \(i32 0\)\)/(icmp sgt (load i32 \@fib.threads-live) (i32 99999999))/' ;;
+    mut rt/core.lir 's/    \(CALL \(GLOBAL fib\.thread-uncount\)\)\n//'
+    mut rt/thread.lir 's/    \(CALL \(GLOBAL fib\.guard-leave\)\)\n/    (CALL (GLOBAL fib.guard-leave))\n    (LET ((ts (ALLOCA (ALIGN 8) I8 (I32 16)))) (STORE (I64 0) ts) (STORE (I64 20000000) (GETELEMENTPTR I8 ts (I64 8))) (CALL (GLOBAL nanosleep) ts (PTR NULL)))\n    (CALL (GLOBAL fib.thread-uncount))\n/' ;;
+  join-all) mut rt/thread.lir 's/\(ICMP SGT \(LOAD I32 \(GLOBAL fib\.threads-live\)\) \(I32 0\)\)/(ICMP SGT (LOAD I32 (GLOBAL fib.threads-live)) (I32 99999999))/' ;;
 esac
 
 cd "$OUT/tree" || exit 2

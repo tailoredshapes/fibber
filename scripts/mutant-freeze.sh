@@ -53,28 +53,28 @@ mut() {
 A=rt/atom.lir
 case $MODE in
   skip-children)
-    mut $A 's/\(block push\n    \(call \@fib\.wl-push wl p\)/(block push\n    (br (icmp eq mode (i64 3)) done pushreal))\n  (block pushreal\n    (call \@fib.wl-push wl p)/' ;;
+    mut $A 's/\(BLOCK push\n    \(CALL \(GLOBAL fib\.wl-push\) wl p\)/(BLOCK push\n    (BR (ICMP EQ mode (I64 3)) done pushreal))\n  (BLOCK pushreal\n    (CALL (GLOBAL fib.wl-push) wl p)/' ;;
   keep-count)
-    mut $A 's/\(store \(i64 0\) \(getelementptr %struct\.fib\.hdr p \(i32 0\) \(i32 0\)\)\)\n    \(br \(icmp eq mode/(store (i64 1) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))\n    (br (icmp eq mode/' ;;
+    mut $A 's/\(STORE \(I64 0\) \(GETELEMENTPTR \(STRUCT fib\.hdr\) p \(I32 0\) \(I32 0\)\)\)\n    \(BR \(ICMP EQ mode/(STORE (I64 1) (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))\n    (BR (ICMP EQ mode/' ;;
   shared-mask)
-    mut $A 's/\(i32 12\) \(i32 8\)\)\)\)\)/(i32 13) (i32 9)))))/' ;;
+    mut $A 's/\(I32 12\) \(I32 8\)\)\)\)\)/(I32 13) (I32 9)))))/' ;;
   write-in-place)
-    mut $A 's/\(store \(i64 0\) \(getelementptr %struct\.fib\.hdr p \(i32 0\) \(i32 0\)\)\)\n    \(br \(icmp eq mode/(store (i64 1) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))\n    (br (icmp eq mode/'
-    mut rt/core.lir 's/\(br \(icmp ne \(and f \(i32 15\)\) \(i32 0\)\) no test\)/(br (icmp ne (and f (i32 7)) (i32 0)) no test)/' ;;
+    mut $A 's/\(STORE \(I64 0\) \(GETELEMENTPTR \(STRUCT fib\.hdr\) p \(I32 0\) \(I32 0\)\)\)\n    \(BR \(ICMP EQ mode/(STORE (I64 1) (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))\n    (BR (ICMP EQ mode/'
+    mut rt/core.lir 's/\(BR \(ICMP NE \(AND f \(I32 15\)\) \(I32 0\)\) no test\)/(BR (ICMP NE (AND f (I32 7)) (I32 0)) no test)/' ;;
   no-check)
-    mut $A 's/\(br \(icmp eq k \(i8 0\)\) done refuse\)/(br (icmp eq (i8 0) (i8 0)) done refuse)/' ;;
+    mut $A 's/\(BR \(ICMP EQ k \(I8 0\)\) done refuse\)/(BR (ICMP EQ (I8 0) (I8 0)) done refuse)/' ;;
   frozen-false)
-    mut $A 's/\(block entry \(ret \(icmp ne \(and \(call \@fib\.flags p\) \(i32 8\)\) \(i32 0\)\)\)\)\)/(block entry (ret (i1 0))))/' ;;
+    mut $A 's/\(BLOCK entry \(RET \(ICMP NE \(AND \(CALL \(GLOBAL fib\.flags\) p\) \(I32 8\)\) \(I32 0\)\)\)\)\)/(BLOCK entry (RET (I1 0))))/' ;;
   no-send)
     mut compiler/types/builtins.fib 's/"\(\(Object a\) \(Send a\)\)"/"((Object a))"/' ;;
   chunk-no-copy)
     mut lib/fib/parallel/pmap.fib 's/\(let \[f \(private-copy f0\)\n        out \(cell \(array \(- hi lo\) \(f \(nth xs lo\)\)\)\)\]/(let [f f0\n        out (cell (array (- hi lo) (f (nth xs lo))))]/' ;;
   copy-same)
-    mut $A 's/\(block kind \(br \(icmp ne k \(i8 0\)\) identity copy\)\)/(block kind (br (icmp eq (i8 0) (i8 0)) identity copy))/' ;;
+    mut $A 's/\(BLOCK kind \(BR \(ICMP NE k \(I8 0\)\) identity copy\)\)/(BLOCK kind (BR (ICMP EQ (I8 0) (I8 0)) identity copy))/' ;;
   copy-no-retain)
-    mut $A 's/\(indirect-call \(load ptr rec\) \(fn void \(ptr ptr\)\) p \@fib\.retain\)\n      \(ret q\)/(ret q)/' ;;
+    mut $A 's/\(INDIRECT-CALL \(LOAD PTR rec\) \(FUNCTION VOID \(PTR PTR\)\) p \(GLOBAL fib\.retain\)\)\n      \(RET q\)/(RET q)/' ;;
   copy-shared)
-    mut $A 's/\(ret q\)\)\)\)\n\n\(define internal \(fib\.frozen/(atomicrmw or monotonic (getelementptr %struct.fib.hdr q (i32 0) (i32 2)) (i32 1))\n      (ret q))))\n\n(define internal (fib.frozen/' ;;
+    mut $A 's/\(RET q\)\)\)\)\n\n\(DEFINE INTERNAL \(fib\.frozen/(ATOMICRMW OR MONOTONIC (GETELEMENTPTR (STRUCT fib.hdr) q (I32 0) (I32 2)) (I32 1))\n      (RET q))))\n\n(DEFINE INTERNAL (fib.frozen/' ;;
 esac
 
 cd "$OUT/tree" || exit 2

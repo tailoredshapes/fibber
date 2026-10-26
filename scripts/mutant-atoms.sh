@@ -69,9 +69,9 @@ case $MODE in
   cas-obj-bits)
     mut $C 's/\(v-text \(same-bits cx cur old\)\) " " lyes/"(i1 1)" " " lyes/' ;;
   lock-none)
-    mut rt/atom.lir 's/\(define internal \(fib\.lock void\) \(\(ptr lockp\)\)\n  \(block entry \(br spin\)\)/(define internal (fib.lock void) ((ptr lockp))\n  (block entry (ret))/' ;;
+    mut rt/atom.lir 's/\(DEFINE INTERNAL \(fib\.lock VOID\) \(\(PTR lockp\)\)\n  \(BLOCK entry \(BR spin\)\)/(DEFINE INTERNAL (fib.lock VOID) ((PTR lockp))\n  (BLOCK entry (RET))/' ;;
   unlock-none)
-    mut rt/atom.lir 's/\(block entry \(atomic-store release \(i32 0\) lockp\) \(ret\)\)\)/(block entry (ret)))/' ;;
+    mut rt/atom.lir 's/\(BLOCK entry \(ATOMIC-STORE RELEASE \(I32 0\) lockp\) \(RET\)\)\)/(BLOCK entry (RET)))/' ;;
   adder-lost)
     mut lib/fib/adder.fib 's/\(do \(swap! \(nth \(\. a cells\) \(\* 2 \(bit-and \(sys-thread-stripe\) 31\)\)\) \(fn \(v\) \(\+ v n\)\)\)\n      \(\)\)\)/(let ((c (nth (. a cells) (* 2 (bit-and (sys-thread-stripe) 31))))) (reset! c (+ @c n))))/' ;;
   adder-one)
