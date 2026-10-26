@@ -13,10 +13,10 @@ export FIB_LIB=$root/lib
 T=$(mktemp -d "${TMPDIR:-/tmp}/a64-keys.XXXXXX"); trap 'rm -rf "$T"' EXIT
 bad=0; ok() { echo "ok   $*"; }; no() { echo "FAIL $*"; bad=1; }
 prog=compiler/tests/native/a64/o0-callee-pop.fib
-wide() { grep -q 'global internal fib.task-key i64' "$1" && grep -q 'global internal fib.exc-key i64' "$1" && grep -q 'declare pthread_getspecific ptr (i64)' "$1" \
-  && grep -q 'declare pthread_setspecific i32 (i64 ptr)' "$1" && ! grep -q 'load i32 @fib\.\(task\|exc\)-key' "$1"; }
-narrow() { grep -q 'global internal fib.task-key i32' "$1" && grep -q 'global internal fib.exc-key i32' "$1" && grep -q 'declare pthread_getspecific ptr (i32)' "$1" \
-  && grep -q 'load i32 @fib.task-key' "$1" && ! grep -q 'i64 @fib\.\(task\|exc\)-key' "$1"; }
+wide() { grep -q 'GLOBAL INTERNAL fib.task-key I64' "$1" && grep -q 'GLOBAL INTERNAL fib.exc-key I64' "$1" && grep -q 'DECLARE pthread_getspecific PTR (I64)' "$1" \
+  && grep -q 'DECLARE pthread_setspecific I32 (I64 PTR)' "$1" && ! grep -q 'LOAD I32 (GLOBAL fib\.\(task\|exc\)-key)' "$1"; }
+narrow() { grep -q 'GLOBAL INTERNAL fib.task-key I32' "$1" && grep -q 'GLOBAL INTERNAL fib.exc-key I32' "$1" && grep -q 'DECLARE pthread_getspecific PTR (I32)' "$1" \
+  && grep -q 'LOAD I32 (GLOBAL fib.task-key)' "$1" && ! grep -q 'I64 (GLOBAL fib\.\(task\|exc\)-key)' "$1"; }
 for t in arm64-apple-macosx13.0.0 arm64-apple-ios17.0 aarch64-apple-darwin; do
   "$F" emit --exe --target "$t" -I cases/stdlib/support "$prog" > "$T/d.lir" 2>/dev/null && wide "$T/d.lir" && ok "$t: i64 key globals, loads and parameters" || no "$t: keys not 8 bytes"
 done

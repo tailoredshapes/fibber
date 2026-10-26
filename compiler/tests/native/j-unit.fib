@@ -108,8 +108,8 @@
         (void (ast/LFnType types/cc-tail nil [] false)))
     (do (expect-str t "trampoline: the name" (tramp/tramp-name "loop") "loop.tramp")
         (expect-str t "trampoline: the source" (tramp/tramp-source "loop" ty)
-                    "(declare tailcc loop i64 (i64 ptr))\n(define (loop.tramp i64) ((i64 a0) (ptr a1)) (block entry (ret (call @loop a0 a1))))\n")
-        (say t (s-includes (tramp/tramp-source "f" void) "(block entry (call @f ) (ret))") "trampoline: a void function" (tramp/tramp-source "f" void))
+                    "(DECLARE TAILCC loop I64 (I64 PTR))\n(DEFINE (loop.tramp I64) ((I64 a0) (PTR a1)) (BLOCK entry (RET (CALL (GLOBAL loop) a0 a1))))\n")
+        (say t (s-includes (tramp/tramp-source "f" void) "(BLOCK entry (CALL (GLOBAL f) ) (RET))") "trampoline: a void function" (tramp/tramp-source "f" void))
         (say t (is-ok (front/parse-and-check (tramp/tramp-source "f" void))) "trampoline: the void source checks" ""))))
 
 (defun s-includes :private (s: str sub: str) -> bool
@@ -152,7 +152,7 @@
 ;; --------------------------------------------------------------------------------------------------------- kernel forms (docs/design/gpu.md, spec/lir.md 6.9)
 
 (defun kernel-tests :private (t: Tally) -> unit
-  (let ((src "(define kernelcc (k void) ((ptr a) (i64 n)) (block entry (let ((i (sreg tid.x)) (j (sreg ctaid.y))) (barrier)) (ret)))\n"))
+  (let ((src "(DEFINE KERNELCC (k VOID) ((PTR a) (I64 n)) (BLOCK entry (LET ((i (SREG tid.x)) (j (SREG ctaid.y))) (BARRIER)) (RET)))\n"))
     (do (expect-str t "kernel forms: kernelcc, sreg and barrier parse, check and print back" (print/print-module (module-of src)) src)
         (say t (match (front/parse-and-check "(define (f i32) () (block entry (ret (sreg bogus))))") ((Ok _) false) ((Err ds) (= (. (nth ds 0) message) "sreg: no special register bogus")))
              "kernel forms: an unknown special register is a parse error" "")
@@ -160,7 +160,7 @@
              "kernel forms: barrier takes no operand" "")
         (say t (match (front/parse-and-check "(define (f i64) () (block entry (ret (sreg tid.x))))") ((Ok _) false) ((Err _) true))
              "kernel forms: sreg is an i32, not an i64" "")
-        (let ((warp "(define kernelcc (w void) ((ptr a)) (block entry (let ((l (sreg laneid)) (n (sreg warpsize)) (v (shfl-down (i32 7) l)) (f (shfl-xor (float 1.5) n)) (u (shfl-up v n)) (x (shfl-idx f l)) (b (ballot (icmp eq l n)))) (ret))))\n"))
+        (let ((warp "(DEFINE KERNELCC (w VOID) ((PTR a)) (BLOCK entry (LET ((l (SREG laneid)) (n (SREG warpsize)) (v (SHFL-DOWN (I32 7) l)) (f (SHFL-XOR (FLOAT 1.5) n)) (u (SHFL-UP v n)) (x (SHFL-IDX f l)) (b (BALLOT (ICMP EQ l n)))) (RET))))\n"))
           (do (expect-str t "warp forms (GPU-5): laneid, warpsize, the four shuffles and ballot parse, check and print back"
                           (print/print-module (module-of warp))
                           warp)

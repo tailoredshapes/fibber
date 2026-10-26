@@ -27,7 +27,7 @@ bad=0
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/live-defs-guard.XXXXXX")
 mkdir -p "$tmp/src"; cp "$here/defs-cfg.fib" "$tmp/src/cfg.fib"
 if "$fibc" emit -I "$tmp/src" "$here/defs-app.fib" > "$tmp/plain.lir" 2> "$tmp/plain.err" && ! grep -q 'live\.d\.' "$tmp/plain.lir" \
-   && FIB_LIVE=1 "$fibc" emit -I "$tmp/src" "$here/defs-app.fib" 2> /dev/null | grep -q 'atomic-load acquire i64 @live.d.limit'
+   && FIB_LIVE=1 "$fibc" emit -I "$tmp/src" "$here/defs-app.fib" 2> /dev/null | grep -q 'ATOMIC-LOAD ACQUIRE I64 (GLOBAL live.d.limit)'
 then echo "ok guard: a plain emit has no def slot (the live emit reads live.d.limit)"
 else echo "FAIL guard: a def slot in a plain emit, or none in a live one ($(head -2 "$tmp/plain.err"))"; bad=1; fi
 printf '(def x: i64 1)\n(def x: i64 2)\n(defun main () -> i64 x)\n' > "$tmp/dup.fib"

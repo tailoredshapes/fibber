@@ -80,7 +80,7 @@ incs=(); for r in $(head -1 < <(sed -n 's/^;; roots:[ \t]*//p' "$prog")); do inc
 (ulimit -v 16000000; "$F" emit "${incs[@]}" "$prog" > "$w/p.lir") 2> "$w/emit.err" || { echo "tsan: emit failed: $(head -3 "$w/emit.err")" >&2; exit 2; }
 if [ -n "${TSAN_APPEND:-}" ]; then
   [ -f "$TSAN_APPEND" ] || { echo "tsan: no such file to append: $TSAN_APPEND" >&2; exit 2; }
-  for nm in $(sed -n 's/^(define \(internal \)\{0,1\}(\([^ )]*\).*/\2/p' "$TSAN_APPEND"); do sed -i "/^(declare $nm /d" "$w/p.lir"; done
+  for nm in $(sed -En 's/^\((define|DEFINE) (internal |INTERNAL )?\(([^ )]*).*/\3/p' "$TSAN_APPEND"); do sed -i "/^(DECLARE $nm /d" "$w/p.lir"; done
   cat "$TSAN_APPEND" >> "$w/p.lir"
 fi
 (ulimit -v 16000000; "$lairf" emit-llvm "$w/p.lir" > "$w/p.ll") 2> "$w/llvm.err" || { echo "tsan: emit-llvm failed: $(head -3 "$w/llvm.err")" >&2; exit 2; }

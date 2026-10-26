@@ -21,8 +21,8 @@
 
 ;; The text of the lIR function NAME in src, up to the next one ("" if there is none).
 (defun function (src: str name: str) -> str
-  (let ((head (str-join ["internal (" name " "])))
-    (unwrap-or (find-first (fn (part: str) (s/starts-with? part head)) (s/split src "(define ")) "")))
+  (let ((head (str-join ["INTERNAL (" name " "])))
+    (unwrap-or (find-first (fn (part: str) (s/starts-with? part head)) (s/split src "(DEFINE ")) "")))
 
 (defun includes (src: str word: str) -> bool (s/includes? src word))
 
@@ -45,7 +45,7 @@
         (objects-intern o "o.A" "A" (ObAtom t))
         (objects-intern o "o.R" "R" (ObArray t))
         (objects-intern o "o.K" "K" (ObClosure [LirI8 t]))
-        (into (into (filterv (fn (l: str) (s/starts-with? l "(defstruct")) (s/split (objects-render o) "\n"))
+        (into (into (filterv (fn (l: str) (s/starts-with? l "(DEFSTRUCT")) (s/split (objects-render o) "\n"))
                     (mapv (fn (i: i64) (str (obj-size (objects-get o i)))) (range (objects-len o))))
               [(str (obj-offsets (objects-get o 0) nil)) (str (obj-offsets (objects-get o 1) (some 1)))]))))
 
@@ -57,10 +57,10 @@
     (doseq [i (range 6)]
       (let ((d (str-join ["drop." (str i)])) (t (str-join ["trace." (str i)])) (h (str-join ["share." (str i)])))
         (do (is cs (and (not (includes (function raw d) "fib.defer"))
-                        (not (includes (function raw t) "indirect-call"))
+                        (not (includes (function raw t) "INDIRECT-CALL"))
                         (not (includes (function raw h) "fib.share-queue"))) (str-join ["kind " (str i) ": a raw slot is not released, traced or shared"]))
             (is cs (and (includes (function obj d) "fib.defer")
-                        (includes (function obj t) "indirect-call")
+                        (includes (function obj t) "INDIRECT-CALL")
                         (includes (function obj h) "fib.share-queue")) (str-join ["kind " (str i) ": an object slot is"])))))))
 
 (defun unit-steps () -> (Vec StepRun)
@@ -82,13 +82,13 @@
       (is cs (= [(obj-slots (objects-get o 0) nil) (obj-slots (objects-get o 1) (some 1)) (obj-slots (objects-get o 1) nil)]
                 [[(some LirI64)] [(some LirPtr) (some LirPtr)] []]) "slots of a struct and of a variant")
       (is cs (= (obj-variant-sname (objects-get o 1) 1) "o.List.v1") "the struct of a variant is named after its object")
-      (is cs (includes (objects-render o) "(defstruct o.List.v1 (i64 i32 i32 i32 ptr ptr))\n") "the struct of a variant: the header, the tag and the slots")
+      (is cs (includes (objects-render o) "(DEFSTRUCT o.List.v1 (I64 I32 I32 I32 PTR PTR))\n") "the struct of a variant: the header, the tag and the slots")
       (is cs (let ((r (objects-render o)))
-               (and (includes r "(defstruct o.Box (i64 i32 i32 i64))\n")
-                    (includes r "(defstruct fib.array.ptr (i64 i32 i32 i64 [0 x ptr]))\n"))) "a string and an array end in an unsized member")
+               (and (includes r "(DEFSTRUCT o.Box (I64 I32 I32 I64))\n")
+                    (includes r "(DEFSTRUCT fib.array.ptr (I64 I32 I32 I64 (ARRAY 0 PTR)))\n"))) "a string and an array end in an unsized member")
       (let ((raw (layouts LirRaw)) (obj (layouts LirPtr)))
         (do (is cs (= raw obj) "a raw pointer slot is laid out and written as a pointer slot is")
-            (is cs (and (includes (nth raw 0) "(defstruct o.S (i64 i32 i32 i32 ptr i8))") (= (nth raw (- (count raw) 2)) "[16 24 32]")) "not vacuous: i32 at 16, the pointer at 24, the i8 at 32, and the struct says ptr")))
+            (is cs (and (includes (nth raw 0) "(DEFSTRUCT o.S (I64 I32 I32 I32 PTR I8))") (= (nth raw (- (count raw) 2)) "[16 24 32]")) "not vacuous: i32 at 16, the pointer at 24, the i8 at 32, and the struct says ptr")))
       (walk-checks cs)
       (let ((p (emit.program/program-new (empty-typed) (owned-program-new))))
         (do (program-closure-object p "l.f.main.13645" [LirI64 LirPtr])
@@ -100,7 +100,7 @@
           (do (is cs (= (obj-size (objects-get t tid)) 80) "a task without a frame: header, three i32, five pointers (resume, result, waiters, closure, failure), a capture")
               (objects-set-task-frame t tid [(FrVal LirI64) (FrBytes 12)])
               (is cs (and (= (obj-size (objects-get t tid)) 104)
-                          (includes (objects-render t) "(defstruct task.k (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr ptr ptr i64 [12 x i8]))\n")) "the frame is known once the body is lowered: an i64, then 12 bytes at 8")
+                          (includes (objects-render t) "(DEFSTRUCT task.k (I64 I32 I32 I32 I32 I32 PTR PTR PTR PTR PTR PTR I64 (ARRAY 12 I8)))\n")) "the frame is known once the body is lowered: an i64, then 12 bytes at 8")
               (let ((c (objects-intern t "o.P" "P" (ObStruct [(some LirI64)]))))
                 (do (objects-set-task-frame t c [(FrVal LirI64)])
                     (is cs (= (obj-size (objects-get t c)) 24) "the frame of an object that is no task is left alone"))))))

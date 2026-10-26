@@ -41,13 +41,13 @@ if [ "$part" = all ] || [ "$part" = core ]; then
 # 1. hello
 if ! FIB_LIVE=1 run "$fibc" emit -I "$here" "$here/hello.fib" > "$out/hello.live.lir" 2> "$out/hello.live.err"; then echo "FAIL hello: emit --live failed"; head -5 "$out/hello.live.err"; bad=1; fi
 if ! run "$fibc" emit -I "$here" "$here/hello.fib" > "$out/hello.plain.lir" 2> "$out/hello.plain.err"; then echo "FAIL hello: emit failed"; head -5 "$out/hello.plain.err"; bad=1; fi
-slots=$(sed -n 's/^(global [a-z]* live\.\([^ ]*\) .*/\1/p' "$out/hello.live.lir" | tr '\n' ' ')
-# every item prints on one line: the slots (`(global .. live.NAME ..)`) and the stubs (the `define` of each NAME that has a slot)
+slots=$(sed -n 's/^(GLOBAL [A-Z]* live\.\([^ ]*\) .*/\1/p' "$out/hello.live.lir" | tr '\n' ' ')
+# every item prints on one line: the slots (`(GLOBAL .. live.NAME ..)`) and the stubs (the `DEFINE` of each NAME that has a slot)
 awk -v s="$slots" 'BEGIN { n = split(s, a, " "); for (i = 1; i <= n; i++) slots[a[i]] = 1 }
-  /^\(global / && $0 ~ / live\./ { print; next }
-  /^\(define / { for (i = 1; i <= NF; i++) { n = $i; sub(/^\(+/, "", n); if (n in slots) { print; break } } }' "$out/hello.live.lir" > "$out/hello.stubs"
-if [ -n "$update" ]; then cp "$out/hello.stubs" "$here/hello-stubs.golden"; echo "updated hello-stubs.golden ($(grep -c '^(global' "$out/hello.stubs") slots)"
-elif diff -u "$here/hello-stubs.golden" "$out/hello.stubs" > "$out/hello.diff"; then echo "ok hello stubs ($(grep -c '^(global' "$out/hello.stubs") slots, $(grep -c '^(define' "$out/hello.stubs") stubs)"
+  /^\(GLOBAL / && $0 ~ / live\./ { print; next }
+  /^\(DEFINE / { for (i = 1; i <= NF; i++) { n = $i; sub(/^\(+/, "", n); if (n in slots) { print; break } } }' "$out/hello.live.lir" > "$out/hello.stubs"
+if [ -n "$update" ]; then cp "$out/hello.stubs" "$here/hello-stubs.golden"; echo "updated hello-stubs.golden ($(grep -c '^(GLOBAL' "$out/hello.stubs") slots)"
+elif diff -u "$here/hello-stubs.golden" "$out/hello.stubs" > "$out/hello.diff"; then echo "ok hello stubs ($(grep -c '^(GLOBAL' "$out/hello.stubs") slots, $(grep -c '^(DEFINE' "$out/hello.stubs") stubs)"
 else echo "FAIL hello: the stubs differ from hello-stubs.golden"; head -40 "$out/hello.diff"; bad=1; fi
 # one stub per program function and none for the library: the slots are exactly main's and greet's bodies
 want="f.greet f.main"
@@ -56,7 +56,7 @@ if [ "$got" = "$want" ]; then echo "ok hello: slots are the program's functions 
 if grep -q 'live\.' "$out/hello.plain.lir"; then echo "FAIL hello: a plain emit mentions live."; bad=1; else echo "ok hello: no stub without FIB_LIVE"; fi
 if grep -q '\.g0' "$out/hello.plain.lir"; then echo "FAIL hello: a plain emit has a generation name"; bad=1; fi
 # the stub loads with acquire order and jumps: both words in every stub
-n_stub=$(grep -c '^(define' "$out/hello.stubs"); n_acq=$(grep -c 'atomic-load acquire ptr @live\.' "$out/hello.stubs"); n_tail=$(grep -c 'indirect-tailcall' "$out/hello.stubs")
+n_stub=$(grep -c '^(DEFINE' "$out/hello.stubs"); n_acq=$(grep -c 'ATOMIC-LOAD ACQUIRE PTR (GLOBAL live\.' "$out/hello.stubs"); n_tail=$(grep -c 'INDIRECT-TAILCALL' "$out/hello.stubs")
 if [ "$n_stub" -gt 0 ] && [ "$n_acq" = "$n_stub" ] && [ "$n_tail" = "$n_stub" ]; then echo "ok hello: every stub is an acquire load and a tail jump"; else echo "FAIL hello: $n_stub stubs, $n_acq acquire loads, $n_tail tail jumps"; bad=1; fi
 
 # 2. the deep recursion

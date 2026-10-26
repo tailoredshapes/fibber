@@ -4,7 +4,7 @@
 #   compiler/tests/live/project.sh [FIBC] [--update]     FIBC is stage 2 (default $FIBC); --update rewrites project-stubs.golden (read the diff)
 # A project `acme/app` (the git fixtures of compiler/tests/deps/fixtures.sh, offline) with one dependency, acme/util, which depends on
 # acme/base: src/main.fib and src/app/core.fib are the project's, dev/live.fib an entry outside its :paths, specs/ its test paths.
-# The slots (`(global .. live.NAME ..)`) of `fibc emit` in live mode, sorted, are project-stubs.golden, one line per way of asking:
+# The slots (`(GLOBAL .. live.NAME ..)`) of `fibc emit` in live mode, sorted, are project-stubs.golden, one line per way of asking:
 #   default   FIB_LIVE=1 in the project: the project's modules only (main, app.core); nothing of acme.util or acme.base
 #   deps      --live --live-deps: the libraries' too
 #   one       FIB_LIVE_DEPS=acme/base: that library's and not the other's
@@ -59,7 +59,7 @@ cat > "$T/p/app/specs/roots-spec.fib" <<'EOF'
       (then (expect = true (and (some? (s/index-of v "/p/app/src")) (some? (s/index-of v "/p/app/specs")) (nil? (s/index-of v "remotes/util"))))))))
 EOF
 cd "$T/p/app" || exit 2
-slots() { sed -n 's/^(global [a-z]* live\.\([^ ]*\) .*/\1/p' "$1" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//'; }
+slots() { sed -n 's/^(GLOBAL [A-Z]* live\.\([^ ]*\) .*/\1/p' "$1" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//'; }
 emit() { # emit NAME [ENV=V..] -- ARGS..: the slots of one emit as a golden line `NAME: slots`
   local name=$1; shift
   if ! env "$@" > "$T/$name.lir" 2> "$T/$name.err"; then echo "FAIL  $name: emit failed"; head -5 "$T/$name.err"; bad=1; fi
@@ -81,11 +81,11 @@ elif diff -u "$here/project-stubs.golden" "$T/stubs.txt" > "$T/stubs.diff"; then
 else echo "FAIL  the slots differ from project-stubs.golden"; cat "$T/stubs.diff"; bad=1; fi
 # the rule's shape, independent of the golden's text
 ck "default: no slot of a library" "$(grep -c 'live\.f\.acme\.' "$T/default.lir")" 0
-ck "default: the project's own module has slots" "$(grep -c '^(global [a-z]* live\.f\.app\.core\.' "$T/default.lir")" 2
-ck "deps: the libraries' functions have slots" "$(grep -c '^(global [a-z]* live\.f\.acme\.' "$T/deps.lir")" 2
-ck "one: base's slot and not util's" "$(grep -c '^(global [a-z]* live\.f\.acme\.base\.' "$T/one.lir") $(grep -c '^(global [a-z]* live\.f\.acme\.util\.' "$T/one.lir")" "1 0"
-ck "dev: an entry outside :paths is live, with the project's module (the one function it reaches)" "$(grep -c '^(global [a-z]* live\.f\.entry ' "$T/dev.lir") $(grep -c '^(global [a-z]* live\.f\.app\.core\.' "$T/dev.lir")" "1 1"
-ck "outside: the name rule stubs the libraries too" "$(grep -c '^(global [a-z]* live\.f\.acme\.' "$T/outside.lir")" 2
+ck "default: the project's own module has slots" "$(grep -c '^(GLOBAL [A-Z]* live\.f\.app\.core\.' "$T/default.lir")" 2
+ck "deps: the libraries' functions have slots" "$(grep -c '^(GLOBAL [A-Z]* live\.f\.acme\.' "$T/deps.lir")" 2
+ck "one: base's slot and not util's" "$(grep -c '^(GLOBAL [A-Z]* live\.f\.acme\.base\.' "$T/one.lir") $(grep -c '^(GLOBAL [A-Z]* live\.f\.acme\.util\.' "$T/one.lir")" "1 0"
+ck "dev: an entry outside :paths is live, with the project's module (the one function it reaches)" "$(grep -c '^(GLOBAL [A-Z]* live\.f\.entry ' "$T/dev.lir") $(grep -c '^(GLOBAL [A-Z]* live\.f\.app\.core\.' "$T/dev.lir")" "1 1"
+ck "outside: the name rule stubs the libraries too" "$(grep -c '^(GLOBAL [A-Z]* live\.f\.acme\.' "$T/outside.lir")" 2
 "$fibc" emit src/main.fib > "$T/plain.lir" 2> /dev/null
 ck "no live mode: no slot, no generation name" "$(grep -c 'live\.\|\.g0' "$T/plain.lir")" 0
 r=$(FIB_LIVE=1 "$fibc" run src/main.fib 2> "$T/run.err" | tail -n 1)

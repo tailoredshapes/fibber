@@ -1,6 +1,6 @@
 #!/bin/bash
 # SIMD P3: the code generation target. One decision (native.target/target-info: FIB_TARGET_CPU, else the host) gives the lane count of
-# `:native` and `f32xn` to the checker and the `(target ..)` form to the emitted module, so that `emit` and `build` agree.
+# `:native` and `f32xn` to the checker and the `(TARGET ..)` form to the emitted module, so that `emit` and `build` agree.
 #   the first line of `emit` is the module's target form for the CPU named by FIB_TARGET_CPU (no features: the name stands for them)
 #   unset, the target is the host's CPU with its feature list
 #   `f32xn` is 4 lanes on x86-64 and x86-64-v2 (128 bits), 8 on x86-64-v3 (256 bits): the same program is accepted or rejected by the CPU
@@ -11,12 +11,12 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/target.XXXXXX"); trap 'rm -rf "$T"' EXIT
 bad=0
 ck() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: wanted [$3] got [$2]"; bad=1; fi; }
 printf '(defun main () -> i64 7)\n' > "$T/plain.fib"
-ck "x86-64: the target form is the first line" "$(FIB_TARGET_CPU=x86-64 "$s2" emit "$T/plain.fib" | head -1)" '(target (cpu "x86-64"))'
-ck "x86-64-v3: the target form is the first line" "$(FIB_TARGET_CPU=x86-64-v3 "$s2" emit "$T/plain.fib" | head -1)" '(target (cpu "x86-64-v3"))'
+ck "x86-64: the target form is the first line" "$(FIB_TARGET_CPU=x86-64 "$s2" emit "$T/plain.fib" | head -1)" '(TARGET (CPU "x86-64"))'
+ck "x86-64-v3: the target form is the first line" "$(FIB_TARGET_CPU=x86-64-v3 "$s2" emit "$T/plain.fib" | head -1)" '(TARGET (CPU "x86-64-v3"))'
 host=$(env -u FIB_TARGET_CPU "$s2" emit "$T/plain.fib" | head -1)
 case $host in
-  '(target (cpu "'*'") (features "'*'"))') echo "ok   unset: the host's CPU and its features: ${host:0:60}..." ;;
-  '(target (cpu "'*'"))')
+  '(TARGET (CPU "'*'") (FEATURES "'*'"))') echo "ok   unset: the host's CPU and its features: ${host:0:60}..." ;;
+  '(TARGET (CPU "'*'"))')
     case "$(uname -s)-$(uname -m)" in
       Darwin-arm64|Darwin-aarch64) echo "ok   unset: the ARM host's CPU with no feature list: $host" ;;
       *) echo "FAIL unset: no host features on $(uname -s)-$(uname -m): [$host]"; bad=1 ;;
