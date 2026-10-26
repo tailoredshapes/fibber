@@ -37,15 +37,14 @@
                       (when (timing/enabled?) (eprintln (str "time lir.macros " (quot @(. env ns) 1000000) " ms"))))))))
 
 ;; One top-level form: collected for the module macro once one is armed (spec/lir.md 4.6: read, not expanded, directions included, as an
-;; object naming the file it was read from), except an include, which acts there: the file's forms are collected in its place; else a
-;; direction (a macro's definition, a library of them, an import, a macro-import, the module macro, an include), a splice, or a form expanded
-;; and parsed. A macro use is applied first (`top-result`, the children untouched), so that a result that is a splice is seen before
-;; anything in it is expanded.
+;; object naming the file it was read from), an include too, which then acts: the file's forms are collected after it, so the macro knows
+;; every file included, one with no forms as well; else a direction (a macro's definition, a library of them, an import, a macro-import,
+;; the module macro, an include), a splice, or a form expanded and parsed. A macro use is applied first (`top-result`, the children
+;; untouched), so that a result that is a splice is seen before anything in it is expanded.
 (defun top-form :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
   (match @(. env hook)
-    ((some _) (if (= (head-of form) "include")
-                  (include env items importer form)
-                  (do (set! (. env collected) (conj @(. env collected) (obj/to-object form (. env cfile)))) nil)))
+    ((some _) (do (set! (. env collected) (conj @(. env collected) (obj/to-object form (. env cfile))))
+                  (if (= (head-of form) "include") (include env items importer form) nil)))
     (nil (top-direction env items importer form))))
 
 (defun top-direction :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)

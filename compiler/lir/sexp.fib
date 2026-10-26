@@ -83,11 +83,11 @@
 ;; form (a discard), or the error.
 (defstruct ReaderEntry (addr: i64 name: str))
 (defstruct Readtable (chars: (Cell (Map i64 ReaderEntry)) dispatch: (Cell (Map i64 ReaderEntry)) token: (Cell (Option ReaderEntry)) active: (Cell bool)
-                      classes: Classes depth: (Cell i64)))
+                      classes: Classes depth: (Cell i64) bom: (Cell bool)))
 (defstruct Runner (run: (fn (Reader ReaderEntry i64 (Option Sexp)) (Result (Option Sexp) Diagnostic))))
 
 (defun readtable-new () -> Readtable
-  (Readtable (cell (map-empty)) (cell (map-empty)) (cell nil) (cell false) (classes-new) (cell max-depth)))
+  (Readtable (cell (map-empty)) (cell (map-empty)) (cell nil) (cell false) (classes-new) (cell max-depth) (cell false)))
 
 ;; Sets the class of a character (a Unicode scalar; `class-whitespace`, `class-constituent` or `class-terminating`), and the depth the
 ;; reader allows.
@@ -96,6 +96,10 @@
 
 (defun readtable-depth! (t: Readtable n: i64) -> unit
   (do (set! (. t depth) n) (set! (. t active) true)))
+
+;; Skips a byte order mark at the start of each text read after it (spec/lir.md 4.8, `define-reader-bom`).
+(defun readtable-bom! (t: Readtable) -> unit
+  (do (set! (. t bom) true) (set! (. t active) true)))
 
 ;; Binds byte `b` to a reader macro, a later binding replacing an earlier; `readtable-bind-dispatch!` the byte after `#`;
 ;; `readtable-token!` the token reader.
@@ -122,7 +126,14 @@
 (def filler: Sexp (SxList [] 0 0))
 
 (defun reader-new :private (src: str table: Readtable) -> Reader
-  (Reader (lexer-with src (. table classes)) (cell false) (cell (array 64 filler)) (cell 0) table (cell 0)))
+  (let ((lx (lexer-with src (. table classes))))
+    (do (if (and @(. table bom) (bom-first? src)) (lex-seek! lx 3 1 1) ())
+        (Reader lx (cell false) (cell (array 64 filler)) (cell 0) table (cell 0)))))
+
+;; Whether the text starts with a byte order mark, U+FEFF (EF BB BF): under `define-reader-bom` it is skipped, the offsets counting it
+;; and the columns of line 1 not.
+(defun bom-first? :private (src: str) -> bool
+  (and (>= (str-len src) 3) (= (zext i64 (str-byte-at src 0)) 239) (= (zext i64 (str-byte-at src 1)) 187) (= (zext i64 (str-byte-at src 2)) 191)))
 
 ;; Reads every form of `src`; the first lexical or structural error (sexp/reader.rs `read`). A lexical error found anywhere in the text
 ;; wins over a parse error, because lir::parse reads all forms before it parses any, and over a structural error, because the Rust
@@ -274,14 +285,15 @@
                            (nil (do (push rd atom) nil))
                            ((some e) (run-entry rd run e pos start (some atom))))))))))
 
-;; The macro of the byte after `#`, the stream after both; `#` at the end of the text, or before an unbound byte, is an error at the `#`.
+;; The macro of the byte after `#`, the stream after both; `#` at the end of the text, or before an unbound byte, is an error at the `#`
+;; that names the character after it whole (a multibyte one too: its lead byte alone is no text).
 (defun read-dispatch :private (rd: Reader run: Runner pos: i64) -> (Option Diagnostic)
   (let ((lx (. rd lx)) (start (lex-offset lx)))
     (do (bump lx)
         (let ((c (lex-byte lx)))
           (match (if (< c 0) nil (get @(. (. rd table) dispatch) c))
             ((some e) (do (bump lx) (run-entry rd run e pos start nil)))
-            (nil (some (Diagnostic pos (if (< c 0) "unexpected end of input after #" (str "no dispatch macro for #" (byte-text c)))))))))))
+            (nil (some (Diagnostic pos (if (< c 0) "unexpected end of input after #" (str "no dispatch macro for #" (lex-char-text lx)))))))))))
 
 ;; The entry run by the host: its form pushed, spanning the text from `start` to where the run left the stream (`sexp-fill-span`), nothing
 ;; for no form. A reader macro's or a dispatch macro's run is a level of nesting, as a list is (it reads what is inside it); the token

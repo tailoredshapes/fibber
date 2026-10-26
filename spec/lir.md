@@ -245,6 +245,7 @@ item   ::= (DEFSTRUCT MUTABLE? NAME (type*))       ; mutable: its fields may be 
          | (DEFINE-DISPATCH-MACRO STR (PNAME) block+)   ; a reader macro on the character after # (§4.8)
          | (DEFINE-READER-CLASS STR class)              ; a character's class (§4.8)
          | (DEFINE-READER-DEPTH N)                         ; the nesting the reader allows (§4.8)
+         | (DEFINE-READER-BOM SKIP)                        ; a byte order mark at the start of a text read after it is skipped (§4.8)
          | (DEFINE-TOKEN-READER (PNAME PNAME) block+)      ; the module's token reader (§4.8)
          | (BEGIN item*)                                   ; a splice: each form a top-level form in its place (§4.6)
 class  ::= WHITESPACE | CONSTITUENT | TERMINATING
@@ -264,7 +265,7 @@ Anything else at the top level is an error `expected a top-level form
 (liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`). The
 message names the forms of the first M3 pass; `(TARGET ..)` (§4.5) is a top-level form too, and
 is left out of the text so that the Rust `lair`, the oracle of the compare scripts, says the same;
-so are `define-macro` and `require-macros` (§4.6), `import` (§4.7) and the five reader forms of §4.8, which are not items but directions to the
+so are `define-macro` and `require-macros` (§4.6), `import` (§4.7) and the six reader forms of §4.8, which are not items but directions to the
 reader, and a macro use whose macro is not yet defined gets this message too.
 Items may appear in any order and refer to each other in any order; a macro must be defined
 before it is used (§4.6).
@@ -479,8 +480,8 @@ form in one); line and column 0 and a null file for an object a macro made. The 
 offset in its file of its first character and of the byte after its last, counted from 0 (a list ends after its closing bracket, a
 string after its closing quote, whatever its escapes; `cases/lir/macros/span.lir`); a form a reader macro returned spans the text the
 run consumed (§4.8). A form no text made, an object a macro made, has no span: start and end 0, and it gets none when the macro
-returns (the expander gives it the use's position, not the use's span), unless `lir.sexp.at` gave it one; a form a macro passed
-through keeps its span. Spans are offsets
+returns (the expander gives it the use's position, not the use's span), unless `lir.sexp.at` or `lir.sexp.at-position` gave it one; a
+form a macro passed through keeps its span. Spans are offsets
 below 2³²; the reader keeps one word per form for them. Going back, an integer prints in decimal, a float as the
 shortest decimal that reads back to it or `inf`, `-inf`, `nan`. The layout is the contract: a macro may read the fields with
 `getelementptr`, but the functions below are the way, and they are declared in every macro's body without a `declare` (they and the
@@ -491,7 +492,9 @@ stream's functions of §4.8 are the only names that are):
 | `(lir.sexp.tag s) : i64`, `(lir.sexp.line s) : i64`, `(lir.sexp.column s) : i64`, `(lir.sexp.file s) : ptr` | the tag and the position of any object |
 | `(lir.sexp.start s) : i64`, `(lir.sexp.end s) : i64` | the span of any object: the byte offsets of its first character and of the byte after its last, 0 and 0 for a made one |
 | `(lir.sexp.at made orig) : ptr` | `made` given `orig`'s position and span (line, column, file, start, end); `made`. A macro that rebuilds a form (a definition without a marker) keeps where it was written, and the parser's errors in the copy are reported there (`cases/lir/macros/at.lir`, `reject-at-position.lir`) |
+| `(lir.sexp.at-position made line column start end) : ptr` | `made` given the position `line:column` and the span `start..end` by value, its file kept (a made form's is null; `lir.sexp.at` gives it another's); `made`. A form made where no object stands gets the place it has in the text: a reader macro that reads `7/2` as three forms puts each at its own column and bytes, and a prefix reader macro spans its head over the prefix character alone (`cases/lir/readers/prefix-span.lir`); the parser's errors in it are reported there (`cases/lir/macros/reject-at-position-value.lir`) |
 | `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(STRING "DEFINE")`), copied |
+| `(lir.sexp.string-bytes p n) : ptr` | a string of the `n` bytes at `p`, any bytes, a NUL among them included, copied with a NUL after them (null for `n < 0`): a string a NUL-terminated text cannot give, made without a write into an object (`cases/lir/macros/string-bytes.lir`) |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
 | `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
 | `(lir.sexp.list bracket) : ptr` | an empty list with that bracket |
@@ -528,10 +531,13 @@ program nor exported, and a library may hold it beside `define-macro`.
 **module-macro.** `(MODULE-MACRO NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
 parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
 of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
-`define-macro` or `module-macro` written there is data the macro sees), except `include`, the one direction that acts in the collected
-region: the file is read there under the readtable and its forms are collected in the include's place, each object naming the file it
-was read from, a nested include acting the same way, under include's once and cycle rules (below; `module-include.lir`,
-`module-include-rearm.lir`, `reject-module-include-cycle.lir`); at the end of the text `NAME` is applied to them as its `...`
+`define-macro` or `module-macro` written there is data the macro sees), `include` too, the one direction that also acts in the
+collected region: it is collected, and then the file is read there under the readtable and its forms are collected after it, each object
+naming the file it was read from, a nested include acting the same way, under include's once and cycle rules (below; `module-include.lir`,
+`module-include-rearm.lir`, `reject-module-include-cycle.lir`), so the macro knows every file included, one with no forms too
+(`module-include-names.lir`: an `(INCLUDE "FILE")` is the trace of a file of comments only; the forms of an included file name it
+resolved, `FILE` beside the including file, and the include names it as written; the form written is the trace, as a C preprocessor's
+line marker is, and no word or function is added for it), and an include the macro splices back reads nothing, its file read already; at the end of the text `NAME` is applied to them as its `...`
 argument and its result is one top-level form, expanded as any is, a `begin` splice usually, whose spliced directions then take effect in
 order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that is no top-level form is the parser's error at the direction
 (`reject-module-result.lir`). A library may hold the direction, so a `require-macros` arms it and the text after is the macro's
@@ -548,8 +554,11 @@ While a module macro is armed, written or spliced, the forms are collected for i
 above), so a whole program's files reach one macro: a wrapper that arms the macro and includes them is the program. A diagnostic in the
 macro's result is reported in the module's file, at the line and column the form carries.
 
-A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
-list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a
+A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, a
+symbol whose text is not UTF-8 (a symbol is the parser's atom; a string is any bytes), an object at no place a text has (a line and a
+column from 1, both 0 for none; a span whose start is at most its end, below 2³², both 0 for none: what `lir.sexp.at-position` could
+otherwise set), or a list deeper than 512, is `macro NAME returned ..` (`cases/lir/macros/reject-symbol-not-utf8.lir`,
+`reject-at-position-span.lir`). The objects live until the module is parsed and are never freed before that; a
 macro that traps ends lair as it would a program. The functions are implemented as an lIR module of lair's (`compiler/native/macros/lib.fib`),
 compiled once into the macro session of a module that defines a macro; a module that defines none makes no session.
 
@@ -659,6 +668,7 @@ forms on without consulting anything.
 (DEFINE-TOKEN-READER (STREAM TOKEN) block+)    ; after every atom: the atom's text as a symbol, and the macro returns the form to use
 (DEFINE-READER-CLASS "C" CLASS)                ; C is whitespace, constituent or terminating to the lexer from here on
 (DEFINE-READER-DEPTH N)                        ; forms nest N deep at most (1024 unless set; at most 4096)
+(DEFINE-READER-BOM SKIP)                       ; a byte order mark at the start of a text read after this is skipped
 ```
 
 **Character classes.** lIR's own whitespace (§1: space, tab, the other ASCII controls 9 to 13, comma, Unicode's White_Space) and its
@@ -680,6 +690,15 @@ list is a level, and so is a reader macro's or a dispatch macro's run (it reads 
 as fibber counts them); the token reader's run is not. fibber's 1000 (`TooDeep` at the 1001st frame) is `(DEFINE-READER-DEPTH 1000)`,
 which gloss's layer 2 sets; a comparison harness that wraps a module in one more form sets one more.
 
+**The byte order mark.** U+FEFF (the bytes EF BB BF) at offset 0 of a text is, to lIR's own lexer, a character like any other (§1:
+it is no Unicode White_Space), so it starts an atom. A language may skip it: `(DEFINE-READER-BOM SKIP)` makes the reader pass a byte
+order mark at offset 0 of every text read after the form under the table (an included file, a required library), the byte offsets of
+spans counting its three bytes and the columns of line 1 not (the first form of a file that starts with one is at 1:1, its span from
+3), as fibber's reader does; one anywhere else is still the lexer's (an atom's character, which the language's token reader may
+refuse, as fibber refuses one with InvalidCharacter). The form is read after the text that holds it began, so it never reaches that
+text's own start: a wrapper or a library sets it for the files it includes (`cases/lir/readers/bom.lir`, `reject-bom-elsewhere.lir`).
+`SKIP` is the one choice (`define-reader-bom expects skip`); lIR's own reading is the default, and there is nothing to set back.
+
 **Definition.** Each body is compiled as a macro's is (§4.6: blocks only, checked when read, the `lir.sexp.*` functions and the
 stream's below declared in it, errors prefixed `reader macro C:`, `dispatch macro #C:` or `token reader:`), under a name of its own in
 the module's macro session; a reader macro may call an earlier `(GLOBAL lir.macro.NAME)`. `"C"` is a string of one printable ASCII character
@@ -693,8 +712,8 @@ and `;` included (`#(`, `#;`), since the `#` is read first. A later binding of a
 
 **Reading.** At each form the reader looks at its first character. A bound character runs its reader macro with the stream just after
 it. `#`, once any dispatch macro is bound and `#` itself is not a reader macro, runs the dispatch macro of the character after it with the
-stream after both; `#` before an unbound character is `no dispatch macro for #C` at the `#`, and at the end of the text `unexpected end
-of input after #`. With `#` bound as a reader macro, that macro runs and the dispatch macros are not reached. Anything else is lIR's own
+stream after both; `#` before an unbound character is `no dispatch macro for #C` at the `#`, `C` the character whole, a multibyte one
+included (`#é`, `cases/lir/readers/reject-dispatch-multibyte.lir`), and at the end of the text `unexpected end of input after #`. With `#` bound as a reader macro, that macro runs and the dispatch macros are not reached. Anything else is lIR's own
 syntax; an atom (§1: its delimiters are the reader's and the classes', so `7/2`, `1_000` and `1.5f32` are one atom each) is read as it
 always was, and when the module has a token reader it is then called with the stream after the atom and the atom's text as a
 **symbol** object, whatever the text (`42` and `1.5` arrive as the symbols `42` and `1.5`: a number of lIR's is the token reader's to
@@ -707,7 +726,9 @@ digits it read makes one with `lir.sexp.float-text` (§4.6). The form a macro re
 character (the `'` of `'x`, the `#` of `#(..)`); a form it read with `lir.read.form` keeps its own position
 (`cases/lir/readers/positions.lir`). Its span is the text the run consumed, from the macro character (the `#` of a dispatch macro, the
 atom's first for the token reader) to where the run left the stream, and so is that of every form in it the macro made (the `quote` of
-`(quote x)`); a form it read with `lir.read.form`, and the token reader's atom, keep their own (`cases/lir/readers/span.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
+`(quote x)`) unless the macro gave it a place (`lir.sexp.at`, `lir.sexp.at-position`: the `quote` over the `'` alone,
+`cases/lir/readers/prefix-span.lir`); a form it read with `lir.read.form`, and the token reader's atom, keep their own
+(`cases/lir/readers/span.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
 stood there, inside a list or at the top level, which is how `#_` discards the next form (`cases/lir/readers/discard.lir`). A failure
 recorded with `lir.read.fail` is the module's error, at the position the macro gave or at the character; an error in a form the macro
 read through `lir.read.form` (a lexical error, an unclosed list, a nested macro's failure) is the module's error where it is, whatever
@@ -717,8 +738,8 @@ does for a module with no readtable, §1), since that text is the macros' to rea
 
 **Scope.** A binding applies to the forms after the form that made it, in the module and in a library it is made in; the bindings a
 library makes with `require-macros` (§4.6) are the requiring module's from the require on: a library's reader forms go into the one
-readtable the module and its libraries share (its classes and its depth too), so the smallest import carries syntax as it carries macros
-(`lib/lir/readers.lir`, `cases/lir/readers/required.lir`). A library may hold the five reader forms beside `define-macro` and
+readtable the module and its libraries share (its classes, its depth and its byte order mark too), so the smallest import carries syntax as it carries macros
+(`lib/lir/readers.lir`, `cases/lir/readers/required.lir`). A library may hold the six reader forms beside `define-macro` and
 `require-macros`. The readtable is the module's and ends with it; another module starts with none. An `import` (§4.7) crosses no
 readtable: an imported module is read under its own table, with the bindings its own text and its own required libraries make, and
 none of the importer's (`cases/lir/readers/reject-import-leak.lir`: the importer's `?` is `undefined name ?` in the module it imports);
@@ -736,8 +757,10 @@ every macro's body:
 | Function | Does |
 |---|---|
 | `(lir.read.peek s) : i64` | the byte at the stream, -1 at the end of the text; nothing is consumed |
+| `(lir.read.peek-at s n) : i64` | the byte `n` bytes from the stream (`n < 0`: behind it), -1 outside the text; nothing is consumed: a macro that looks further than the next byte asks for it, and no macro reads the struct's words (`cases/lir/readers/peek-at.lir`) |
 | `(lir.read.next s) : i64` | that byte, consumed: a newline starts the next line at column 1, a UTF-8 continuation byte leaves the column, any other byte advances it |
 | `(lir.read.position s) : i64` | the position of the stream, `line << 32 \| column`, what `lir.read.fail` takes |
+| `(lir.read.offset s) : i64` | the byte offset of the stream in its text, what a span is made of (`lir.sexp.at-position`) |
 | `(lir.read.skip s) : i64` | whitespace, commas and comments (§1 and the classes, the reader's own definition) consumed; the byte after them, -1 at the end |
 | `(lir.read.form s) : ptr` | the next form of the text, read through the readtable, discards passed over: what a `[` macro calls until it sees `]`. Null when it cannot be read (the error is then the module's, above, and `lir.read.failed` says so), and null with nothing recorded when a discard stood before a closer or the end of the text (`[1 #_2]`: the closer is left for the macro to look at, `cases/lir/readers/discard-closer.lir`) |
 | `(lir.read.failed s) : i1` | whether a failure is recorded on the stream: the macro's own (`lir.read.fail`) or a form's that `lir.read.form` could not read; a macro that got null tells no form from a failure by it |

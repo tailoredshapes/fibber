@@ -18,8 +18,10 @@
 (DECLARE lir.sexp.start I64 (PTR))
 (DECLARE lir.sexp.end I64 (PTR))
 (DECLARE lir.sexp.at PTR (PTR PTR))
+(DECLARE lir.sexp.at-position PTR (PTR I64 I64 I64 I64))
 (DECLARE lir.sexp.symbol PTR (PTR))
 (DECLARE lir.sexp.string PTR (PTR))
+(DECLARE lir.sexp.string-bytes PTR (PTR I64))
 (DECLARE lir.sexp.integer PTR (I64))
 (DECLARE lir.sexp.float PTR (DOUBLE))
 (DECLARE lir.sexp.float-text PTR (PTR))
@@ -91,6 +93,11 @@
 
 (DEFINE (lir.sexp.symbol PTR) ((PTR cstr)) (BLOCK entry (RET (CALL (GLOBAL lir.sexp.text-new) (I64 1) cstr (CALL (GLOBAL strlen) cstr)))))
 (DEFINE (lir.sexp.string PTR) ((PTR cstr)) (BLOCK entry (RET (CALL (GLOBAL lir.sexp.text-new) (I64 4) cstr (CALL (GLOBAL strlen) cstr)))))
+;; a string of the n bytes at p, any bytes (a NUL among them), copied with a NUL after them; null for n < 0
+(DEFINE (lir.sexp.string-bytes PTR) ((PTR p) (I64 n))
+  (BLOCK entry (BR (ICMP SLT n (I64 0)) none some))
+  (BLOCK none (RET (PTR NULL)))
+  (BLOCK some (RET (CALL (GLOBAL lir.sexp.text-new) (I64 4) p n))))
 (DEFINE (lir.sexp.integer PTR) ((I64 v))
   (BLOCK entry
     (LET ((s (CALL (GLOBAL lir.sexp.new) (I64 2) (I64 56))))
@@ -207,5 +214,13 @@
     (STORE (LOAD PTR (GETELEMENTPTR (STRUCT lir.sexp) orig (I64 0) (I32 3))) (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 3)))
     (STORE (LOAD I64 (GETELEMENTPTR (STRUCT lir.sexp) orig (I64 0) (I32 4))) (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 4)))
     (STORE (LOAD I64 (GETELEMENTPTR (STRUCT lir.sexp) orig (I64 0) (I32 5))) (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 5)))
+    (RET made)))
+;; `made` given the position line:column and the span start..end by value (spec/lir.md 4.6), its file kept; `made`
+(DEFINE (lir.sexp.at-position PTR) ((PTR made) (I64 line) (I64 column) (I64 start) (I64 end))
+  (BLOCK entry
+    (STORE line (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 1)))
+    (STORE column (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 2)))
+    (STORE start (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 4)))
+    (STORE end (GETELEMENTPTR (STRUCT lir.sexp) made (I64 0) (I32 5)))
     (RET made)))
 ")

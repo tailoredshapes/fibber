@@ -16,12 +16,13 @@
   (or (= head "define-reader-macro") (= head "define-dispatch-macro") (= head "define-token-reader")))
 
 (defun reader-setting? (head: str) -> bool
-  (or (= head "define-reader-class") (= head "define-reader-depth")))
+  (or (= head "define-reader-class") (= head "define-reader-depth") (= head "define-reader-bom")))
 
 ;; ---------------------------------------------------------------- the settings
 
 ;; `(define-reader-class "C" whitespace|constituent|terminating)`: the class of the character C (one UTF-8 character; not `(`, `)` or `;`)
-;; in the module's readtable; `(define-reader-depth N)`: the nesting the reader allows, 1 to 4096.
+;; in the module's readtable; `(define-reader-depth N)`: the nesting the reader allows, 1 to 4096; `(define-reader-bom skip)`: a byte order
+;; mark at the start of a text read after it is skipped.
 (defun define-reader-setting (t: Readtable head: str form: Sexp) -> (Option Diagnostic)
   (match form
     ((SxList its pos _)
@@ -33,11 +34,15 @@
            (match (class-depth (nth its 1))
              ((Err d) (some d))
              ((Ok n) (do (readtable-depth! t n) nil)))
+           (and (= head "define-reader-bom") (= (count its) 2) (names/atom-word? (nth its 1) "skip"))
+           (do (readtable-bom! t) nil)
            :else (some (Diagnostic pos (setting-usage head)))))
     (_ (some (Diagnostic (sexp-pos form) (setting-usage head))))))
 
 (defun setting-usage :private (head: str) -> str
-  (if (= head "define-reader-depth") "define-reader-depth expects a count from 1 to 4096" "define-reader-class expects a character and whitespace, constituent or terminating"))
+  (cond (= head "define-reader-depth") "define-reader-depth expects a count from 1 to 4096"
+        (= head "define-reader-bom") "define-reader-bom expects skip"
+        :else "define-reader-class expects a character and whitespace, constituent or terminating"))
 
 ;; The one character of a string, as a Unicode scalar; lIR's own `(`, `)` and `;` are refused.
 (defun class-char :private (s: Sexp) -> (Result i64 Diagnostic)

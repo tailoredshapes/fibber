@@ -108,6 +108,20 @@
 (defun text-of :private (p: ptr) -> (Array i8)
   (bytes-at (unsafe (load-ptr (ptr+ p object-header))) (word p (+ object-header 8))))
 
+;; Whether the bytes are UTF-8 text (a symbol's are: its text is the parser's atom), the rules of Unicode: no stray continuation byte, no
+;; overlong form, no surrogate, nothing above U+10FFFF, no sequence cut short.
+(defun utf8? :private (bs: (Array i8)) -> bool
+  (loop ((i 0))
+    (if (>= i (array-len bs)) true (let ((w (utf8-width bs i))) (if (= w 0) false (recur (+ i w)))))))
+
+(defun utf8-width :private (bs: (Array i8) i: i64) -> i64
+  (let ((n (array-len bs)) (b (zext i64 (array-get bs i))) (b1 (if (< (+ i 1) n) (zext i64 (array-get bs (+ i 1))) 0))
+        (w (cond (< b 128) 1 (and (>= b 194) (<= b 223)) 2 (and (>= b 224) (<= b 239)) 3 (and (>= b 240) (<= b 244)) 4 :else 0)))
+    (cond (or (= w 0) (> (+ i w) n)) 0
+          (or (and (= b 224) (< b1 160)) (and (= b 237) (>= b1 160)) (and (= b 240) (< b1 144)) (and (= b 244) (>= b1 144))) 0
+          (loop ((k 1)) (if (>= k w) true (if (= (bit-and (zext i64 (array-get bs (+ i k))) 192) 128) (recur (+ k 1)) false))) w
+          :else 0)))
+
 ;; A float as a token the reader takes: `inf`, `-inf`, `nan`, else the shortest decimal that reads back to it.
 (defun float-text :private (v: f64) -> str
   (cond (not (= v v)) "nan"
@@ -131,17 +145,30 @@
 (defun from-object (a: i64 at: i64) -> (Result Sexp str)
   (from-ptr (ffi/addr->ptr a) at 0))
 
+;; Why an object's place (its position and span, which lir.sexp.at-position sets to any words) is none a text has, nil when it is one:
+;; a line and a column from 1 (both 0: none), a span start <= end below 2^32 (both 0: none).
+(defun place-error :private (p: ptr) -> (Option str)
+  (let ((line (word p 8)) (col (word p 16)) (start (word p 32)) (end (word p 40)))
+    (cond (not (or (and (= line 0) (= col 0)) (and (>= line 1) (< line 2147483648) (>= col 1) (< col 4294967296))))
+          (some (str "an object at the position " line ":" col))
+          (not (or (and (= start 0) (= end 0)) (and (>= start 0) (<= start end) (< end 4294967296))))
+          (some (str "an object with the span " start ".." end))
+          :else nil)))
+
 (defun from-ptr :private (p: ptr at: i64 depth: i64) -> (Result Sexp str)
-  (if (= (ffi/ptr->addr p) 0)
-      (Err "a null object")
-      (let ((tag (word p 0)) (pos0 (pos-new (word p 8) (word p 16))) (pos (if (= pos0 0) at pos0))
-            (end (word p 40)) (sp (if (= end 0) 0 (span-new (word p 32) end))) (v (word p object-header)))
-        (cond (= tag tag-symbol) (Ok (symbol-form (str-from-bytes (text-of p)) pos sp))
-              (= tag tag-integer) (Ok (SxAtom (show v) pos sp))
-              (= tag tag-float) (Ok (SxAtom (float-text (bits->f64 v)) pos sp))
-              (= tag tag-string) (Ok (SxStr (text-of p) pos sp))
-              (= tag tag-list) (list-from p pos sp at depth)
-              :else (Err (str "an object with tag " tag ", which is no s-expression kind"))))))
+  (cond (= (ffi/ptr->addr p) 0) (Err "a null object")
+        (some? (place-error p)) (Err (unwrap-or (place-error p) ""))
+        :else (from-placed p at depth)))
+
+(defun from-placed :private (p: ptr at: i64 depth: i64) -> (Result Sexp str)
+  (let ((tag (word p 0)) (pos0 (pos-new (word p 8) (word p 16))) (pos (if (= pos0 0) at pos0))
+        (end (word p 40)) (sp (if (= end 0) 0 (span-new (word p 32) end))) (v (word p object-header)))
+    (cond (= tag tag-symbol) (let ((bs (text-of p))) (if (utf8? bs) (Ok (symbol-form (str-from-bytes bs) pos sp)) (Err "a symbol whose text is not UTF-8")))
+          (= tag tag-integer) (Ok (SxAtom (show v) pos sp))
+          (= tag tag-float) (Ok (SxAtom (float-text (bits->f64 v)) pos sp))
+          (= tag tag-string) (Ok (SxStr (text-of p) pos sp))
+          (= tag tag-list) (list-from p pos sp at depth)
+          :else (Err (str "an object with tag " tag ", which is no s-expression kind")))))
 
 (defun list-from :private (p: ptr pos: i64 sp: i64 at: i64 depth: i64) -> (Result Sexp str)
   (if (>= depth max-depth)
