@@ -40,7 +40,7 @@ An `extern` to a library of one's own is also not what `docs/adr/0011` allows ou
   An object is never an operand, so no count crosses and ownership has nothing to track: the form is `Scalar` for ownership, like `load-i64`.
 * `type` is a scalar, `ptr` or `unit`.
 * `body` is the blocks of an lIR function, as lIR text, in a string. Inside it each operand is a parameter of its own name and type, in the order written. A string and not
-  data because lIR's `@name` is a fibber cell read (`@x`), and a body of several blocks and `phi`s is ordinary lIR that people already write (`rt/*.lir`). Strings may
+  data because lIR's upper-case words and `(GLOBAL name)` are not fibber forms (the old spelling's `@name` was even a fibber cell read, `@x`), and a body of several blocks and `phi`s is ordinary lIR that people already write (`rt/*.lir`). Strings may
   span lines, and the diagnostics carry the line and column inside the string to the `.fib` position.
 
 ```
