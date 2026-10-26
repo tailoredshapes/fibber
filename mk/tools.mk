@@ -120,9 +120,7 @@ tool_sh-emit-vecfast := $(T)/emit/vecfast/check.sh $(F_ABS) | $(wildcard $(T)/em
 tool_sh-emit-fnattrs := $(T)/emit/fnattrs/check.sh $(F_ABS) | $(wildcard $(T)/emit/fnattrs/*) compiler/emit/lower/mod.fib compiler/types/lower/top.fib compiler/expand/core.fib compiler/native/lower.fib
 tool_sh-emit-windows := $(T)/emit/windows.sh $(F_ABS) | $(T)/emit/windows.sh $(T)/emit/inspect.fib
 tool_sh-fibref-heap-gold := $(T)/fibref/heap-gold.sh | $(wildcard $(T)/fibref/heap-gold*)
-tool_sh-native-h-checks := $(T)/native/h-checks.sh | $(wildcard $(T)/native/h-*) $(wildcard $(T)/native/h-cases/*)
 tool_jit-selfhosted-threads := $(T)/driver/jit-selfhosted.sh $(F_ABS) $(abspath $(BUILD)/F3) | $(T)/driver/jit-selfhosted.sh $(T)/driver/jit/threads.fib $(BUILD)/F3 $(wildcard rt/*.lir)
-tool_sh-native-l1-unit := $(T)/native/l1-unit.sh | $(wildcard $(T)/native/l1-*)
 # The liro suite is one stamp per independent job (checks, and one per planted fault: each builds its own probe), so make runs them side by side.
 LIRO_PLANTS := lookup-disabled stale-body-key optimization-omitted abi-check-disabled checksum-disabled
 LIRO_INPUTS := $(T)/native/liro.sh $(T)/native/liro/check.py $(T)/native/liro/mutants.py $(T)/native/liro/api.fib $(T)/native/liro/reuse.fib $(wildcard compiler/native/liro/*.fib)
@@ -132,17 +130,6 @@ LIRO_STAMPS := sh-native-liro-checks $(addprefix sh-native-liro-plant-,$(LIRO_PL
 # the facts the emitter proves (compiler/emit/lower/facts.fib): nsw steps and the vec-nth tail assume in the lIR, the boundary cases in both
 # check modes, and two planted false facts (copies of the emitter built by F) that FIB_LIR_FACTS=trap must catch
 tool_sh-emit-facts := env LLVM_LIBDIR=$(LLVM_LIBDIR) $(T)/emit/facts/check.sh $(F_ABS) --plant | $(wildcard $(T)/emit/facts/*) compiler/emit/lower/facts.fib compiler/emit/lower/arith.fib compiler/emit/lower/ctrl.fib compiler/emit/lower/builtins.fib $(wildcard cases/stdlib/885[0-3]-*.fib) cases/stdlib/8849-nth-at-the-edges-of-flat-trie-and-shared-vecs.fib cases/stdlib/8845-trap-aget-out-of-range.fib
-# the facts of lIR (spec/lir.md 6.13): cases/lir/facts and facts-verify through lairf in the three check modes, the trap mode's controls, and
-# lir2c and lir2js on lIR that carries facts
-tool_sh-native-facts := env LLVMLIB=$(LLVM_LIBDIR) $(T)/native/facts.sh $(F_ABS) | $(T)/native/facts.sh $(wildcard cases/lir/facts/*) $(wildcard cases/lir/facts-verify/*) $(wildcard compiler/lir/*.fib compiler/lir/*/*.fib) $(wildcard compiler/native/lower/*.fib) compiler/native/lower.fib compiler/llvm/metadata.fib compiler/c/module.fib compiler/js/module.fib compiler/native/cases/header.fib compiler/native/cases/verdict.fib
-# the words of lIR (spec/lir.md 2): compiler/lir/words.fib's table equal to the upper-case atoms of the spec's grammar; and `lairf respell` over every
-# lIR file of the tree (parse-equal, idempotent, and the new spelling alone where no macro library builds forms)
-tool_sh-lir-words := $(T)/lir/words.sh $(F_ABS) | $(T)/lir/words.sh compiler/lir/words.fib compiler/native/cli.fib spec/lir.md
-tool_sh-lir-respell := $(T)/lir/respell.sh $(F_ABS) | $(T)/lir/respell.sh compiler/lir/respell.fib $(wildcard compiler/lir/respell/*.fib) $(wildcard compiler/lir/*.fib compiler/lir/*/*.fib) $(wildcard cases/lir/*/*.lir) $(wildcard lib/lir/*.lir)
-# the paths bound for the lIR repository (scripts/lir-paths.txt) alone build lairf, lir2c and lir2js with the seed and its shipped library, and
-# that lairf passes cases/lir; a planted `(:use syntax.form)` in native/lower.fib must fail the build (no edge back into fibber's compiler)
-tool_sh-lir-standalone := env LLVM_LIBDIR=$(LLVM_LIBDIR) scripts/lir-standalone.sh $(abspath $(SEED_FIBC)) --jobs 4 | scripts/lir-standalone.sh scripts/lir-paths.txt $(SEED_FIBC) $(COMPILER_SRC) $(wildcard cases/lir/*/*.lir) $(wildcard lib/lir/*.lir)
-tool_sh-native-a64-sibcall := $(T)/native/a64-sibcall.sh $(F_ABS) | $(T)/native/a64-sibcall.sh cases/lir/instr/stackargs-sibcall.lir $(wildcard compiler/native/lower/*.fib)
 tool_sh-harness-proto-run := $(T)/harness-proto/run.sh | $(wildcard $(T)/harness-proto/*) $(wildcard $(T)/harness-proto/cases/*)
 tool_lsp-unit := env LSP_UNIT_OUT=$(TOOLS_OUT)/lsp-unit $(T)/lsp/run.sh | $(wildcard $(T)/lsp/*) $(wildcard $(T)/lsp/fix/*) $(wildcard compiler/lsp/*.fib)
 tool_lsp-server := $(T)/lsp/server.sh $(TOOLS_OUT)/lsp-server | $(wildcard $(T)/lsp/*) $(wildcard $(T)/lsp/fix/*) $(wildcard compiler/lsp/*.fib)
@@ -151,7 +138,6 @@ tool_fibref-heap := $(T)/fibref/heap.sh | $(wildcard $(T)/fibref/*) $(wildcard c
 tool_gen-rng := $(T)/gen/rng-check.sh | $(wildcard $(T)/gen/*)
 tool_gen-compare := bash -c "$(F_ABS) build compiler/fibgen.fib -I compiler -I lib -o $(TOOLS_OUT)/fibgen && $(T)/gen/compare.sh $(TOOLS_OUT)/fibgen pipelines 1 300" | $(wildcard $(T)/gen/*) $(wildcard compiler/gen/*.fib compiler/gen/*/*.fib)
 tool_gen-planted := $(T)/gen/planted.sh | $(wildcard $(T)/gen/*)
-tool_js-backend := $(T)/js/check.sh $(TOOLS_OUT)/js | $(wildcard $(T)/js/*) $(wildcard $(T)/js/cases/*) $(wildcard compiler/js/*.fib)
 tool_deps := $(T)/deps/run.sh $(F_ABS) | $(wildcard $(T)/deps/*)
 tool_sh-native-gpu-emit := $(T)/native/gpu-emit.sh | $(T)/native/gpu-emit.sh $(wildcard examples/gpu/*) $(wildcard compiler/native/*.fib)
 tool_sh-native-gpu-device := $(T)/native/gpu-device.sh | $(T)/native/gpu-device.sh $(wildcard compiler/tests/native/gpu/*) $(wildcard examples/gpu/*) $(wildcard lib/fib/gpu/*.fib) $(wildcard compiler/native/*.fib compiler/native/wgsl/*.fib)
@@ -175,8 +161,8 @@ tool_sh-live-defs-tsan := env TSAN_OUT=$(TOOLS_OUT)/live-defs-tsan $(T)/live/def
 TOOLS_FULL := $(TOOLS_QUICK) unit-api units-all units-rest units-pending shootout-compile sh-driver-cli sh-driver-demand sh-driver-muladd \
   sh-driver-no-fma sh-driver-cpu-check sh-driver-target sh-driver-test-cmd sh-driver-static-host sh-shared sh-driver-host-threads sh-emit-runtime sh-emit-defs-order sh-stack-stack \
   sh-own-peek sh-specs-plant-vec sh-lanes-lanes sh-repl-run sh-serve-run sh-live-stubs sh-live-stubs-own sh-live-stubs-sample sh-live-run sh-live-project sh-live-hooks sh-live-attach sh-live-mt sh-live-leak sh-live-stackcheck sh-shared-stackcheck sh-live-swap sh-live-lir sh-live-defcache sh-live-queue sh-live-test sh-live-testlive sh-live-watch sh-live-quotes sh-live-statics sh-live-load sh-live-parsed sh-live-stress sh-live-stress-tsan sh-live-defs sh-live-defs-tsan sh-live-retire \
-  $(PERSIST_STAMPS) sh-emit-resume sh-expand-fuseinline sh-emit-clospec sh-emit-vecfast sh-emit-fnattrs sh-emit-windows sh-fibref-heap-gold sh-native-h-checks \
-  sh-native-l1-unit $(LIRO_STAMPS) jit-selfhosted-threads sh-native-a64-sibcall sh-native-facts sh-lir-words sh-lir-respell sh-lir-standalone sh-emit-facts sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted js-backend deps
+  $(PERSIST_STAMPS) sh-emit-resume sh-expand-fuseinline sh-emit-clospec sh-emit-vecfast sh-emit-fnattrs sh-emit-windows sh-fibref-heap-gold \
+  $(LIRO_STAMPS) jit-selfhosted-threads sh-emit-facts sh-native-gpu-emit sh-native-gpu-device sh-harness-proto-run lsp-unit lsp-server lsp-hardening fibref-heap gen-rng gen-compare gen-planted deps
 # The command is every word up to the `|`, the inputs every word after it.
 upto_bar = $(if $(filter |,$(firstword $(1))),,$(if $(1),$(firstword $(1)) $(call upto_bar,$(wordlist 2,999999,$(1))),))
 after_bar = $(if $(1),$(if $(filter |,$(firstword $(1))),$(wordlist 2,999999,$(1)),$(call after_bar,$(wordlist 2,999999,$(1)))),)
@@ -189,7 +175,7 @@ endef
 $(foreach t,$(TOOLS_FULL),$(eval $(call tool_target,$(t))))
 TOOLS_QUICK_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_QUICK)))
 TOOLS_FULL_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_FULL)))
-tools: $(TOOLS_FULL_STAMPS)   ## every tool test (the unit programs, the language server, the fibref and fibgen ports, the js backend, deps)
+tools: $(TOOLS_FULL_STAMPS)   ## every tool test (the unit programs, the language server, the fibref and fibgen ports, deps)
 tools-quick: $(TOOLS_QUICK_STAMPS)   ## the quick gate's tool tests (the skeletons, the lint, check-lib, the build's own graph test, the lir copy's drift)
 .PHONY: tools tools-quick
 tools-list:   ## the stamps of the tool tests (TOOLS_MODE=quick for the quick gate's)

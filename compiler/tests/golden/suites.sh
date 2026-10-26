@@ -26,8 +26,5 @@ own-taken|own|--sections taken,error|fibref own|compiler/tests/own/taken-cases/*
 explain-amp|explain||fibref explain|compiler/tests/own/amp-cases/*.fib
 emit-fns|emit|--sections fns|fibc emit-dump|compiler/tests/emit/[a-z]*-*.fib
 emit-defs|emit|--sections statics,defs,fns|fibc emit-dump|compiler/tests/emit/def-*.fib
-lair-ast|lairf|dump-ast|lair|cases/lir/*/*.lir compiler/tests/native/h2-edge/*.lir
-lair-check|lairf|check|lair|cases/lir/*/*.lir compiler/tests/native/h2-edge/*.lir
-lair-llvm|lairf|emit-llvm|lair|cases/lir/*/*.lir
 EOF
 }

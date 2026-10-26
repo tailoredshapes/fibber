@@ -6,14 +6,14 @@
 # 2's own: after an intended change of a pass, regenerate with --update and read the diff in git before committing it.
 # usage: compiler/tests/golden/golden.sh [--update [--rescan]] [--only SUITE..] [--tools DIR | --fibc F]
 #        compiler/tests/golden/golden.sh --show SUITE FILE [--tools DIR | --fibc F]     stage 2's output for one input
-#   --tools DIR  a directory holding the pass tools (read expand types own explain emit lairf), built from compiler/TOOL.fib with a stage 2 fibc
+#   --tools DIR  a directory holding the pass tools (read expand types own explain emit), built from compiler/TOOL.fib with a stage 2 fibc
 #   --fibc F     (default: FIBC, else the gate's F) builds the tools it needs into $GOLDEN_OUT/tools first (about a minute)
 # --update keeps each suite's list of inputs (the ones the Rust agreed on); --rescan takes every file the suite's globs match now, and so
 # adds the inputs stage 2 alone has judged.
 # Environment: GOLDEN_JOBS suites (and tool builds) at a time, default 4 (the gate's GATE_SLOTS limit the heavy ones); GOLDEN_OUT scratch (default ~/.cache/fibber-scratch/golden), FIB_LIB is set to lib/ of this tree.
 # Prints `ok SUITE (N inputs)` or `FAIL SUITE: first differing input` for each suite; exit 0 only if none failed; 2 for a usage error.
 set -u
-# The tree's lIR is in the old spelling until it is converted (spec/lir.md 2, transitional): lairf admits it (mk/config.mk sets the same).
+# The tree's lIR is in the old spelling until it is converted (spec/lir.md 2, transitional): lair admits it (mk/config.mk sets the same).
 export FIB_LIR_SPELLING=${FIB_LIR_SPELLING:-old}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -43,7 +43,7 @@ if [ -z "$tools" ]; then
   stamp=$(sha1sum < "$fibc" | cut -c1-16)-$(cat "$root"/compiler/*/*.fib "$root"/lib/prelude.fib | sha1sum | cut -c1-16)   # the tools are rebuilt when the fibc or the sources change
   if [ "$(cat "$tools/.stamp" 2>/dev/null)" != "$stamp" ]; then
     pids=()
-    for t in read expand types own explain emit lairf; do
+    for t in read expand types own explain emit; do
       "$root/scripts/lib/slots.sh" "$fibc" build "compiler/$t.fib" -I compiler -I lib -L "${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}" -l LLVM-21 -o "$tools/$t" &
       pids+=($!)
       if [ ${#pids[@]} -ge "$jobs" ]; then wait "${pids[0]}" || { echo "golden: could not build a tool" >&2; exit 2; }; pids=("${pids[@]:1}"); fi

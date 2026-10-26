@@ -12,8 +12,8 @@ selects a target; cross-linking needs its toolchain/sysroot. C builds use
 tail-call limitations. Static Linux builds use `--static` and musl.
 A scratch image lacks CA certificates, NSS and timezone files. WASI needs a
 sysroot and runtime; bare wasm needs host imports. PTX/WGSL are kernel targets,
-not general application runtimes. See [WASM](../design/wasm.md),
-[C backend](../design/lir2c.md) and [static linking](../design/static-linking.md).
+not general application runtimes. See [WASM](../design/wasm.md) and
+[static linking](../design/static-linking.md); the C backend's design (`lir2c.md`) is in the lir repository.
 
 ```fib run
 (defun main () -> i64 (do (println "hello from fibber") 0))

@@ -6,7 +6,8 @@ not runnable documentation examples. Current guides are in the
 [documentation map](../README.md). A later “as built” section supersedes the
 earlier plan where they differ.
 
-- [AArch64: a sibling call out of a `tailcc` function corrupts the stack pointer (LLVM-REPRO)](aarch64-sibcall.md)
+The designs of lIR and lair (lair in fibber and its interfaces, the AST dump, lIR's facts, the C and JavaScript backends, the AArch64 sibling-call fault, and lIR is the language) moved with them to the lir repository, tailoredshapes/lir (`LIR` at the root names it).
+
 - [fibber on aarch64 (Apple Silicon macOS, iOS, Linux): package A64-0](aarch64.md)
 - [The large-block cache (ALLOC-1)](allocator.md)
 - [Automatic differentiation for fibber: a tape on `fib.tensor`, and the road to a compiler pass](autodiff.md)
@@ -30,14 +31,8 @@ earlier plan where they differ.
 - [HTTP client and server (HTTP-1, HTTP-2)](http.md)
 - [Inline lIR: `(unsafe (lir ...))`, ordered atomics and the cache line (proposed)](inline-lir.md)
 - [In-place update when uniquely held](in-place-update.md)
-- [A JavaScript backend for lIR](js-backend.md)
 - [fib.json.schema: JSON Schema for fib.json](json-schema.md)
 - [fib.json](json.md)
-- [The AST dump of lIR (`lair dump-ast`)](lair-ast-dump.md)
-- [lair in fibber](lair-in-fibber.md)
-- [lair in fibber: the shared interfaces (package S1)](lair-interfaces.md)
-- [lIR is the language; fibber is macros and functions on it (proposed)](lir-language.md)
-- [A C backend for lIR](lir2c.md)
 - [Live sessions: emit only what changed, and swap any module](live-incremental.md)
 - [A live REPL: change a running program without restarting it](live-repl.md)
 - [Live meshql-fib: tests from a REPL attached to the running server](live-meshql.md)

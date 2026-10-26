@@ -12,7 +12,7 @@
 # usage: scripts/llvm-static.sh DIR
 #   LLVM_CONFIG names llvm-config (Linux: llvm-config-21, else /usr/bin/llvm-config-21; macOS: /opt/homebrew/opt/llvm@21/bin/llvm-config)
 #   ZSTD_A (macOS) names the static libzstd.a (default: $(brew --prefix zstd)/lib/libzstd.a, else /opt/homebrew/opt/zstd/lib/libzstd.a)
-# Used by scripts/lib/stage2.sh (LLVM_LINK=static), scripts/package.sh and compiler/tests/llvm/build.sh.
+# Used by scripts/lib/stage2.sh (LLVM_LINK=static) and scripts/package.sh.
 set -eu
 dir=${1:?usage: llvm-static.sh DIR}
 mkdir -p "$dir"

@@ -1,7 +1,7 @@
 # mk/golden.mk: the golden checks of the passes (compiler/tests/golden): the pass tools built by F, then one stamp per suite of suites.sh,
 # depending on the tools the suite uses, its .files list, its .golden and every input the list names.
 GOLDEN_DIR := $(BUILD)/golden
-GOLDEN_TOOLS := read expand types own explain emit lairf
+GOLDEN_TOOLS := read expand types own explain emit
 GOLDEN_TOOL_BIN := $(addprefix $(GOLDEN_DIR)/tools/,$(GOLDEN_TOOLS))
 # NAME|TOOL rows of suites.sh
 GOLDEN_ROWS := $(shell bash -c '. compiler/tests/golden/suites.sh; suite_table' | cut -d'|' -f1,2)

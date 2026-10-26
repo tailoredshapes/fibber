@@ -54,7 +54,6 @@ Nothing recovers from the signal handler; the reasons of ADR 0009 stand for it.
 (rule "the cases and tests that pin it are in the tree"
   (missing repo ["cases/stdlib/8352-a-stack-overflow-under-try-is-caught.fib"
                  "cases/stdlib/7892-a-stack-overflow-unwinds-every-frame-and-releases-what-they-held.fib"
-                 "cases/lir/inline/stack-addr.lir"
                  "compiler/tests/live/stackcheck.sh"
                  "compiler/tests/shared/stackcheck.sh"])
   (plant-remove "compiler/tests/shared/stackcheck.sh")

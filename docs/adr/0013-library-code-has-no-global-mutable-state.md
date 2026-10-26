@@ -24,7 +24,7 @@ parameter or builds it in a function.
 - A library cannot keep a counter, a cache or a registry in the module: the caller owns it. Callers pass a value (a provider, a logger,
   a tape, a `DataSource`).
 - The allow-list has one entry today: `compiler/native/call.fib:the-host`, the loaded JIT host that `native.call` shares between the
-  macro runner and the driver (`docs/design/lair-in-fibber.md`: an explicit `dispose` is the plan). It is removed when that is passed.
+  macro runner and the driver (`docs/design/lair-in-fibber.md` of the lir repository: an explicit `dispose` is the plan). It is removed when that is passed.
 - `thread-local` state does not exist in the language (lIR has no thread-local storage), so there is nothing else to check there.
 
 ## Governance

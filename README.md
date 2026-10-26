@@ -96,6 +96,12 @@ identical compiler lIR. Maintained stage-2 goldens, audited cases, behaviour spe
 and executable ADRs provide additional evidence ([method](spec/method.md)). Rust
 tools are retired at tag `seed-1` ([history](docs/rust-legacy.md)).
 
+lIR and lair, its compiler, live in their own repository, tailoredshapes/lir,
+with lIR's cases, tests and designs. fibc compiles lair from source, so fibber
+keeps a pinned, read-only copy of lair's code and `spec/lir.md`: the file `LIR`
+names the commit, `scripts/sync-lir.sh` updates it, and the quick gate fails
+when the copy drifts.
+
 Fibber remains pre-1.0. The owner approves release promises alongside executable
 acceptance checks; [stability](docs/policy/stability.md) records the proposal.
 The [roadmap](ROADMAP.md), [changelog](CHANGELOG.md) and dated

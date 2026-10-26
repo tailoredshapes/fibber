@@ -2,9 +2,9 @@
 # Code generation for the targets of the table (compiler/lir/targets.fib, docs/design/targets.md) that this machine cannot run: wasm32-wasip1,
 # wasm32-unknown-unknown and riscv64-unknown-linux-gnu. Nothing is linked or run here (no wasm-ld, WASI sysroot, wasmtime or riscv64 sysroot).
 #   0. the table: `fibc targets` prints a row for each triple; the runtime's C functions of the table are exactly the `declare`s of rt/*.lir;
-#   1. lowering and code generation succeed for the accepted lIR cases (cases/lir/{simd,instr,mapping}) through `lairf build --emit obj` and for fibber
-#      programs (cases/ownership, the SIMD cases cases/stdlib/62xx, tensor kernels 7003 and 7007, the kernel targets/kernel.fib) through
-#      `fibc build --target T --emit obj`; what does not lower is compared with targets-emit.expected (a new failure, or a fixed one, fails the script);
+#   1. lowering and code generation succeed for fibber programs (cases/ownership, the SIMD cases cases/stdlib/62xx, tensor kernels 7003 and 7007, the
+#      kernel targets/kernel.fib) through `fibc build --target T --emit obj`; what does not lower is compared with targets-emit.expected (a new failure,
+#      or a fixed one, fails the script). The same over lIR's own cases through `lairf build --emit obj` is the lir repository's (tailoredshapes/lir, LIR);
 #   2. the object is what the row says (wasm: the magic \0asm and `file`'s WebAssembly; riscv64: ELF RISC-V, RVC, double-float ABI), the module's data
 #      layout is the row's, and the pointer width of that layout is the row's pointer-bits; node (if present) validates the wasm object;
 #   3. wasm32 tail calls are return_call (the row's +tail-call); the assembly of the kernel holds f64x2.mul, f64x2.add, f32x4.mul and f32x4.add (wasm32, SIMD128), fmadd.d (riscv64 RV64GC), and with a V CPU
@@ -12,7 +12,7 @@
 #   4. planted faults make the checks fail: a wrong triple (x86-64's assembly), a wrong data layout (riscv64's against the wasm row), a wrong pointer
 #      width (wasm64), wasm32 without the row's features (no return_call), a wrong vector width (<4 x double> is two f64x2.mul), RV64GC without V (no vfmul), a corrupt wasm object, a runtime function
 #      missing from the table, a nonsense triple. A check that passes with its fault planted is a failure of this script.
-# usage: targets-emit.sh [--quick]   F=stage-2 fibc, L=lairf (FIBC, LAIRF also read). --quick: 12 lIR cases and 10 programs per triple.
+# usage: targets-emit.sh [--quick]   F=stage-2 fibc, L=lairf (FIBC, LAIRF also read). --quick: 10 programs per triple.
 # Exit: 0 every check holds and every planted fault is caught; 1 otherwise; 2 no tools. Run from anywhere.
 set -u
 root=$(cd "$(dirname "$0")/../../.." && pwd); cd "$root"
@@ -49,18 +49,11 @@ table_fns() { sed -n '/(defun runtime-c-functions/,/^$/p' compiler/lir/targets.f
 if diff <(rt_decls) <(table_fns) > "$T/d"; then ok "runtime-c-functions is exactly the $(rt_decls | wc -l) declares of rt/*.lir"; else no "runtime-c-functions and rt/*.lir differ: $(tr '\n' ' ' < "$T/d")"; fi
 
 # 1. lowering and code generation
-if [ -n "$quick" ]; then lirs=$(grep -l '^;; expect: accept' cases/lir/simd/*.lir cases/lir/instr/*.lir | head -12)
-else lirs=$(grep -l '^;; expect: accept' cases/lir/simd/*.lir cases/lir/instr/*.lir cases/lir/mapping/*.lir); fi
 tensors="cases/stdlib/7003-tensor-linear-algebra-and-empty-inner-dimensions.fib cases/stdlib/7007-tensor-native-kernels-block-boundaries-and-tails.fib"
 if [ -n "$quick" ]; then fibs="cases/ownership/01-return-part-of-argument.fib cases/ownership/02-structural-sharing.fib cases/ownership/41-top-level-macro-splices-forms.fib cases/stdlib/6201-f64-lanewise-arithmetic-agrees-with-the-scalar-operation.fib cases/stdlib/6200-f32-lanewise-arithmetic-agrees-with-the-scalar-operation.fib cases/stdlib/6216-splat-and-the-literal-operand-make-every-lane-the-scalar.fib cases/stdlib/6255-float-functions-agree-with-the-scalar-references.fib $tensors $kernel"
 else fibs="$(grep -l -E '^;; expect: (accept|trap)' cases/ownership/*.fib | head -40) $(grep -l -E '^;; expect: (accept|trap)' cases/stdlib/62[0-5]*.fib | head -60) $tensors $kernel"; fi
 : > "$T/failed"
 for t in $triples; do
-  n=0; f=0
-  for lir in $lirs; do
-    if "$L" build "$lir" --target "$t" -o "$T/x.o" -O 2 --emit obj 2> "$T/err"; then n=$((n+1)); else f=$((f+1)); echo "$t $lir" >> "$T/failed"; echo "  $t $lir: $(head -c 150 "$T/err" | tr '\n' ' ')"; fi
-  done
-  ok "$t: $n of $((n+f)) lIR cases lower and generate code"
   n=0; f=0
   for p in $fibs; do
     iargs=(); for r in $(sed -n 's/^;; roots: *//p' "$p" | head -1); do iargs+=(-I "$(dirname "$p")/$r"); done
@@ -68,7 +61,7 @@ for t in $triples; do
   done
   ok "$t: $n of $((n+f)) fibber programs compile through fibc build --target --emit obj"
 done
-ran=" $(echo $lirs $fibs) "   # one line, single spaces
+ran=" $(echo $fibs) "   # one line, single spaces
 want_failed() { grep -v '^#' "$expected" | grep -v '^$' | while read -r t p; do case $ran in *" $p "*) echo "$t $p" ;; esac; done | sort; }
 if diff <(want_failed) <(sort "$T/failed") > "$T/d"; then ok "what does not lower is exactly targets-emit.expected ($(wc -l < "$T/failed") rows)"
 else no "what does not lower differs from targets-emit.expected (< expected, > now): $(tr '\n' ' ' < "$T/d")"; fi

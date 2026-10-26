@@ -14,7 +14,8 @@ also kept every build, CI job and script tied to `cargo` and an LLVM binding cra
 
 The Rust is retired. The tree has no `crates/`, no Cargo files and no Rust toolchain in the build, the gate, the release scripts or CI.
 Stage 2 is built by a released seed (`SEED`) and is the only compiler. What the Rust oracles pinned is pinned by recorded outputs: the
-golden suites of `compiler/tests/golden/`, one per pass tool, and by the specs and cases. The Rust lives in git (tag `seed-1`).
+golden suites of `compiler/tests/golden/`, one per pass tool, and by the specs and cases. The Rust lives in git (tag `seed-1`). (lair's three
+suites, `lair-ast`, `lair-check` and `lair-llvm`, went with lair to the lir repository on 2026-10-26: thirteen suites stay.)
 
 ## Consequences
 
@@ -45,8 +46,8 @@ golden suites of `compiler/tests/golden/`, one per pass tool, and by the specs a
         (grep-live repo [".gitlab-ci.yml" ".github/workflows/*.yml"] "crates/"))
   (plant ".gitlab-ci.yml" "\n  script: cargo test\n"))
 
-(rule "the pass tools keep their golden suites (one .golden per suite, at least sixteen)"
-  (at-least repo ["compiler/tests/golden/*.golden"] 16)
+(rule "the pass tools keep their golden suites (one .golden per suite, at least thirteen)"
+  (at-least repo ["compiler/tests/golden/*.golden"] 13)
   (plant-remove "compiler/tests/golden/reader-dump.golden"))
 
 (rule "every golden suite has the list of its inputs"
