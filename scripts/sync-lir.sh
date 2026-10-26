@@ -55,3 +55,6 @@ if [ -n "$changed" ]; then printf '%s\n' "$changed"; else echo "sync-lir: no cha
 if [ "$got" != "$want" ]; then
   echo "sync-lir: FAIL: the working tree's copy hashes to $got, not $want (an ignored or untracked file under the paths?)" >&2; exit 1
 fi
+# The copied files moved lines, so the reference pages that cite them (docs/reference/environment.md) are regenerated here, not
+# found by the gate's docs stage three syncs later.
+if command -v make > /dev/null && [ -f Makefile ]; then make doc-reference > /dev/null 2>&1 || echo "sync-lir: make doc-reference failed; run it by hand" >&2; fi
