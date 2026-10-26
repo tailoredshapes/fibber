@@ -144,7 +144,13 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
   2 has type i64, expected i32`). `(zeroinitializer T)` is a constant
   of any sized `T`; it emits no instruction.
 - `(string "…")` may appear in any function and as a global
-  initialiser (§9); each occurrence is its own constant.
+  initialiser (§9); each occurrence is its own constant: two equal
+  strings have two addresses, on both paths and at every optimisation
+  level. lair writes the constant `private` and never `unnamed_addr`
+  (LLVM merges only `unnamed_addr` constants; until 2026-10-25 lair
+  marked every string so and the spec and the code disagreed: decision
+  D12 of docs/design/lir-language.md, **Decided** owner 2026-10-25, the
+  code follows the spec; §14 item 21; `cases/lir/instr/string-own-constant.lir`).
 
 ## 4. Modules
 
@@ -1913,3 +1919,4 @@ one the passes used.
 | 18 | ownership in lIR: the managed type `(ptr 1)` (LLVM's `ptr addrspace(1)`), kinds on SSA values and parameters, SIL's forms `alloc-object alloc-stack dealloc-stack copy-value destroy-value is-unique`, `load copy|borrow|take`, `store init|assign|borrow`, `addrspacecast` inside `(define unsafe ..)`, the `ownership` form naming what the forms lower to (one per program, in the interface of the module that carries it), a verifier of ten rules inside `lir.check` on every path (`FIB_LIR_OWN`, `report` the default until the emitter emits the forms), erasure as the last pass before LLVM or a printer after an optimisation slot on the explicit forms; MIR's words weighed and recorded | **Decided** (owner, 2026-10-25: lIR is the language, lair the only compiler; docs/design/lir-language.md stage 2, D4 to D10 as recommended) | §2, §4, §4.7, §6.10, §6.14, §10, §12, §13, cases/lir/own |
 | 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
 | 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |
+| 21 | string constants: each `(string ..)` is its own constant, so lair writes no `unnamed_addr` and LLVM merges none (D12: the code follows the spec) | **Decided** (owner, 2026-10-25) | §3, cases/lir/instr/string-own-constant.lir |
