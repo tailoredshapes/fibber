@@ -8,232 +8,232 @@
 ;; pthread mutex with one condition variable, broadcast at every
 ;; enqueue and every completion, so an idle worker or a waiting joiner
 ;; sleeps instead of spinning.
-(declare sysconf i64 (i32))
-(declare pthread_mutex_init i32 (ptr ptr))
-(declare pthread_mutex_lock i32 (ptr))
-(declare pthread_mutex_unlock i32 (ptr))
-(declare pthread_cond_init i32 (ptr ptr))
-(declare pthread_cond_wait i32 (ptr ptr))
-(declare pthread_cond_broadcast i32 (ptr))
-(global internal fib.rq-head ptr (ptr null))
-(global internal fib.rq-tail ptr (ptr null))
-(global internal fib.rq-mutex ptr (ptr null))
-(global internal fib.rq-cond ptr (ptr null))
-(global internal fib.pool-started i32 (i32 0))
+(DECLARE sysconf I64 (I32))
+(DECLARE pthread_mutex_init I32 (PTR PTR))
+(DECLARE pthread_mutex_lock I32 (PTR))
+(DECLARE pthread_mutex_unlock I32 (PTR))
+(DECLARE pthread_cond_init I32 (PTR PTR))
+(DECLARE pthread_cond_wait I32 (PTR PTR))
+(DECLARE pthread_cond_broadcast I32 (PTR))
+(GLOBAL INTERNAL fib.rq-head PTR (PTR NULL))
+(GLOBAL INTERNAL fib.rq-tail PTR (PTR NULL))
+(GLOBAL INTERNAL fib.rq-mutex PTR (PTR NULL))
+(GLOBAL INTERNAL fib.rq-cond PTR (PTR NULL))
+(GLOBAL INTERNAL fib.pool-started I32 (I32 0))
 ;; Workers inside a task: counted under the mutex, for fib.pool-quiesce.
-(global internal fib.pool-busy i32 (i32 0))
+(GLOBAL INTERNAL fib.pool-busy I32 (I32 0))
 
 ;; From fib.init: the mutex (40 bytes on glibc x86-64) and the
 ;; condition variable (48 bytes), allocated and initialised.
-(define internal (fib.rq-init void) ()
-  (block entry
-    (let ((m (call @malloc (i64 64)))
-          (c (call @malloc (i64 64))))
-      (call @pthread_mutex_init m (ptr null))
-      (call @pthread_cond_init c (ptr null))
-      (store m @fib.rq-mutex)
-      (store c @fib.rq-cond)
-      (ret))))
+(DEFINE INTERNAL (fib.rq-init VOID) ()
+  (BLOCK entry
+    (LET ((m (CALL (GLOBAL malloc) (I64 64)))
+          (c (CALL (GLOBAL malloc) (I64 64))))
+      (CALL (GLOBAL pthread_mutex_init) m (PTR NULL))
+      (CALL (GLOBAL pthread_cond_init) c (PTR NULL))
+      (STORE m (GLOBAL fib.rq-mutex))
+      (STORE c (GLOBAL fib.rq-cond))
+      (RET))))
 
-(define internal (fib.rq-lock void) ()
-  (block entry (call @pthread_mutex_lock (load ptr @fib.rq-mutex)) (ret)))
+(DEFINE INTERNAL (fib.rq-lock VOID) ()
+  (BLOCK entry (CALL (GLOBAL pthread_mutex_lock) (LOAD PTR (GLOBAL fib.rq-mutex))) (RET)))
 
-(define internal (fib.rq-unlock void) ()
-  (block entry (call @pthread_mutex_unlock (load ptr @fib.rq-mutex)) (ret)))
+(DEFINE INTERNAL (fib.rq-unlock VOID) ()
+  (BLOCK entry (CALL (GLOBAL pthread_mutex_unlock) (LOAD PTR (GLOBAL fib.rq-mutex))) (RET)))
 
-(define internal (fib.rq-broadcast void) ()
-  (block entry (call @pthread_cond_broadcast (load ptr @fib.rq-cond)) (ret)))
+(DEFINE INTERNAL (fib.rq-broadcast VOID) ()
+  (BLOCK entry (CALL (GLOBAL pthread_cond_broadcast) (LOAD PTR (GLOBAL fib.rq-cond))) (RET)))
 
 ;; A queue node: task, next. Appended under the mutex; every sleeper
 ;; is woken.
-(define internal (fib.enqueue void) ((ptr task))
-  (block entry
-    (let ((node (call @malloc (i64 16))))
-      (store task node)
-      (store (ptr null) (getelementptr i8 node (i64 8)))
-      (call @fib.rq-lock)
-      (br (icmp eq (load ptr @fib.rq-tail) (ptr null)) first append)))
-  (block first
-    (store node @fib.rq-head)
-    (store node @fib.rq-tail)
-    (br out))
-  (block append
-    (store node (getelementptr i8 (load ptr @fib.rq-tail) (i64 8)))
-    (store node @fib.rq-tail)
-    (br out))
-  (block out
-    (call @fib.rq-broadcast)
-    (call @fib.rq-unlock)
-    (call @fib.pool-start)
-    (ret)))
+(DEFINE INTERNAL (fib.enqueue VOID) ((PTR task))
+  (BLOCK entry
+    (LET ((node (CALL (GLOBAL malloc) (I64 16))))
+      (STORE task node)
+      (STORE (PTR NULL) (GETELEMENTPTR I8 node (I64 8)))
+      (CALL (GLOBAL fib.rq-lock))
+      (BR (ICMP EQ (LOAD PTR (GLOBAL fib.rq-tail)) (PTR NULL)) first append)))
+  (BLOCK first
+    (STORE node (GLOBAL fib.rq-head))
+    (STORE node (GLOBAL fib.rq-tail))
+    (BR out))
+  (BLOCK append
+    (STORE node (GETELEMENTPTR I8 (LOAD PTR (GLOBAL fib.rq-tail)) (I64 8)))
+    (STORE node (GLOBAL fib.rq-tail))
+    (BR out))
+  (BLOCK out
+    (CALL (GLOBAL fib.rq-broadcast))
+    (CALL (GLOBAL fib.rq-unlock))
+    (CALL (GLOBAL fib.pool-start))
+    (RET)))
 
 ;; The head node unlinked, or null; the mutex is held.
-(define internal (fib.pop-locked ptr) ()
-  (block entry
-    (let ((node (load ptr @fib.rq-head)))
-      (br (icmp eq node (ptr null)) empty take)))
-  (block empty (ret (ptr null)))
-  (block take
-    (let ((next (load ptr (getelementptr i8 node (i64 8))))
-          (task (load ptr node)))
-      (store next @fib.rq-head)
-      (br (icmp eq next (ptr null)) last more)))
-  (block last (store (ptr null) @fib.rq-tail) (br out))
-  (block more (br out))
-  (block out (call @free node) (ret task)))
+(DEFINE INTERNAL (fib.pop-locked PTR) ()
+  (BLOCK entry
+    (LET ((node (LOAD PTR (GLOBAL fib.rq-head))))
+      (BR (ICMP EQ node (PTR NULL)) empty take)))
+  (BLOCK empty (RET (PTR NULL)))
+  (BLOCK take
+    (LET ((next (LOAD PTR (GETELEMENTPTR I8 node (I64 8))))
+          (task (LOAD PTR node)))
+      (STORE next (GLOBAL fib.rq-head))
+      (BR (ICMP EQ next (PTR NULL)) last more)))
+  (BLOCK last (STORE (PTR NULL) (GLOBAL fib.rq-tail)) (BR out))
+  (BLOCK more (BR out))
+  (BLOCK out (CALL (GLOBAL free) node) (RET task)))
 
 ;; The task at the head of the queue, or null.
-(define internal (fib.dequeue ptr) ()
-  (block entry
-    (call @fib.rq-lock)
-    (let ((task (call @fib.pop-locked)))
-      (call @fib.rq-unlock)
-      (ret task))))
+(DEFINE INTERNAL (fib.dequeue PTR) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.rq-lock))
+    (LET ((task (CALL (GLOBAL fib.pop-locked))))
+      (CALL (GLOBAL fib.rq-unlock))
+      (RET task))))
 
 ;; The head of the queue for a worker, sleeping until there is one;
 ;; the worker counts as busy from here until fib.worker-done.
-(define internal (fib.dequeue-wait ptr) ()
-  (block entry (call @fib.rq-lock) (br test))
-  (block test
-    (let ((task (call @fib.pop-locked)))
-      (br (icmp eq task (ptr null)) sleep got)))
-  (block sleep
-    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
-    (br test))
-  (block got
-    (store (add (load i32 @fib.pool-busy) (i32 1)) @fib.pool-busy)
-    (call @fib.rq-unlock)
-    (ret task)))
+(DEFINE INTERNAL (fib.dequeue-wait PTR) ()
+  (BLOCK entry (CALL (GLOBAL fib.rq-lock)) (BR test))
+  (BLOCK test
+    (LET ((task (CALL (GLOBAL fib.pop-locked))))
+      (BR (ICMP EQ task (PTR NULL)) sleep got)))
+  (BLOCK sleep
+    (CALL (GLOBAL pthread_cond_wait) (LOAD PTR (GLOBAL fib.rq-cond)) (LOAD PTR (GLOBAL fib.rq-mutex)))
+    (BR test))
+  (BLOCK got
+    (STORE (ADD (LOAD I32 (GLOBAL fib.pool-busy)) (I32 1)) (GLOBAL fib.pool-busy))
+    (CALL (GLOBAL fib.rq-unlock))
+    (RET task)))
 
 ;; A worker has finished a task: no longer busy; sleepers told.
-(define internal (fib.worker-done void) ()
-  (block entry
-    (call @fib.rq-lock)
-    (store (sub (load i32 @fib.pool-busy) (i32 1)) @fib.pool-busy)
-    (call @fib.rq-broadcast)
-    (call @fib.rq-unlock)
-    (ret)))
+(DEFINE INTERNAL (fib.worker-done VOID) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.rq-lock))
+    (STORE (SUB (LOAD I32 (GLOBAL fib.pool-busy)) (I32 1)) (GLOBAL fib.pool-busy))
+    (CALL (GLOBAL fib.rq-broadcast))
+    (CALL (GLOBAL fib.rq-unlock))
+    (RET)))
 
 ;; At the program's exit, after its spawned threads are joined: waits
 ;; until the queue is empty and no worker is inside a task, so every
 ;; release a worker owes has been done (compiler.md §4: the trace must
 ;; hold every free before the process ends); the work-stealing pool
 ;; (sched.lir) drains first.
-(define internal (fib.pool-quiesce void) ()
-  (block entry (call @fib.sched-quiesce) (call @fib.rq-lock) (br test))
-  (block test
-    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))
-  (block sleep
-    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
-    (br test))
-  (block done (call @fib.rq-unlock) (call @fib.lc-report) (ret)))
+(DEFINE INTERNAL (fib.pool-quiesce VOID) ()
+  (BLOCK entry (CALL (GLOBAL fib.sched-quiesce)) (CALL (GLOBAL fib.rq-lock)) (BR test))
+  (BLOCK test
+    (BR (AND (ICMP EQ (LOAD PTR (GLOBAL fib.rq-head)) (PTR NULL)) (ICMP EQ (LOAD I32 (GLOBAL fib.pool-busy)) (I32 0))) done sleep))
+  (BLOCK sleep
+    (CALL (GLOBAL pthread_cond_wait) (LOAD PTR (GLOBAL fib.rq-cond)) (LOAD PTR (GLOBAL fib.rq-mutex)))
+    (BR test))
+  (BLOCK done (CALL (GLOBAL fib.rq-unlock)) (CALL (GLOBAL fib.lc-report)) (RET)))
 
 ;; A joiner with nothing to run sleeps until the queue has a task or
 ;; its own task is done; both are broadcast.
-(define internal (fib.idle-wait void) ((ptr task))
-  (block entry
-    (call @fib.rq-lock)
-    (br (icmp ne (load ptr @fib.rq-head) (ptr null)) out check))
-  (block check
-    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task task (i32 0) (i32 3))) (i32 2)) out sleep))
-  (block sleep
-    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
-    (br out))
-  (block out (call @fib.rq-unlock) (ret)))
+(DEFINE INTERNAL (fib.idle-wait VOID) ((PTR task))
+  (BLOCK entry
+    (CALL (GLOBAL fib.rq-lock))
+    (BR (ICMP NE (LOAD PTR (GLOBAL fib.rq-head)) (PTR NULL)) out check))
+  (BLOCK check
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 3))) (I32 2)) out sleep))
+  (BLOCK sleep
+    (CALL (GLOBAL pthread_cond_wait) (LOAD PTR (GLOBAL fib.rq-cond)) (LOAD PTR (GLOBAL fib.rq-mutex)))
+    (BR out))
+  (BLOCK out (CALL (GLOBAL fib.rq-unlock)) (RET)))
 
 ;; Starts the workers once, on the first enqueue: one per processor,
 ;; and a T line in trace mode (compiler.md §4), since from here on the
 ;; program's allocations interleave with the workers'.
-(define internal (fib.pool-start void) ()
-  (block entry
-    (let ((r (cmpxchg acq_rel acquire @fib.pool-started (i32 0) (i32 1))))
-      (br (extractvalue r 1) start done)))
-  (block start
-    (atomic-store monotonic (i32 1) @fib.mt)
-    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced spawn))
-  (block traced (call @fib.trace-out (string "T\n") (i64 2)) (br spawn))
-  (block spawn
-    (let ((n0 (call @sysconf (i32 84)))
-          (n (select (icmp slt n0 (i64 1)) (i64 1) n0)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (spawn (i64 0)) (next i2))))
-      (br (icmp slt i n) one done)))
-  (block one
-    (let ((handle (alloca i64))
-          (attr (alloca (align 8) i8 (i32 128)))
-          (_a (call @fib.thread-attr attr))
-          (rc (call @pthread_create handle attr @fib.worker (ptr null))))
-      (atomicrmw add monotonic @fib.thread-total (i64 1))
-      (call @pthread_attr_destroy attr)
-      (br (icmp ne rc (i32 0)) failed next)))
-  (block failed
-    (call @fib.fatal-c (string "async: cannot start a worker thread"))
-    (unreachable))
-  (block next (let ((i2 (add i (i64 1)))) (br loop)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.pool-start VOID) ()
+  (BLOCK entry
+    (LET ((r (CMPXCHG ACQ_REL ACQUIRE (GLOBAL fib.pool-started) (I32 0) (I32 1))))
+      (BR (EXTRACTVALUE r 1) start done)))
+  (BLOCK start
+    (ATOMIC-STORE MONOTONIC (I32 1) (GLOBAL fib.mt))
+    (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced spawn))
+  (BLOCK traced (CALL (GLOBAL fib.trace-out) (STRING "T\n") (I64 2)) (BR spawn))
+  (BLOCK spawn
+    (LET ((n0 (CALL (GLOBAL sysconf) (I32 84)))
+          (n (SELECT (ICMP SLT n0 (I64 1)) (I64 1) n0)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (spawn (I64 0)) (next i2))))
+      (BR (ICMP SLT i n) one done)))
+  (BLOCK one
+    (LET ((handle (ALLOCA I64))
+          (attr (ALLOCA (ALIGN 8) I8 (I32 128)))
+          (_a (CALL (GLOBAL fib.thread-attr) attr))
+          (rc (CALL (GLOBAL pthread_create) handle attr (GLOBAL fib.worker) (PTR NULL))))
+      (ATOMICRMW ADD MONOTONIC (GLOBAL fib.thread-total) (I64 1))
+      (CALL (GLOBAL pthread_attr_destroy) attr)
+      (BR (ICMP NE rc (I32 0)) failed next)))
+  (BLOCK failed
+    (CALL (GLOBAL fib.fatal-c) (STRING "async: cannot start a worker thread"))
+    (UNREACHABLE))
+  (BLOCK next (LET ((i2 (ADD i (I64 1)))) (BR loop)))
+  (BLOCK done (RET)))
 
 ;; A worker: runs whatever the queue holds, sleeping when it is empty.
-(define internal (fib.worker ptr) ((ptr arg))
-  (block entry (call @fib.guard-enter (load i64 @fib.thread-stack)) (br loop))
-  (block loop
-    (let ((t (call @fib.dequeue-wait)))
-      (call @fib.run-one t)
-      (call @fib.worker-done)
-      (br loop))))
+(DEFINE INTERNAL (fib.worker PTR) ((PTR arg))
+  (BLOCK entry (CALL (GLOBAL fib.guard-enter) (LOAD I64 (GLOBAL fib.thread-stack))) (BR loop))
+  (BLOCK loop
+    (LET ((t (CALL (GLOBAL fib.dequeue-wait))))
+      (CALL (GLOBAL fib.run-one) t)
+      (CALL (GLOBAL fib.worker-done))
+      (BR loop))))
 
 ;; Runs a queued task under a claim of its driver; a task whose driver
 ;; is still held goes back on the queue; one a joiner drove meanwhile
 ;; to its completion or to a park is left alone. The queue's count on
 ;; the task is released afterwards.
-(define internal (fib.run-one void) ((ptr t))
-  (block entry
-    (let ((dp (getelementptr %struct.fib.task t (i32 0) (i32 4)))
-          (r (cmpxchg acq_rel acquire dp (i32 0) (i32 1))))
-      (br (extractvalue r 1) claimed busy)))
-  (block busy (call @sched_yield) (call @fib.enqueue t) (ret))
-  (block claimed
-    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task t (i32 0) (i32 3))) (i32 1)) resume unclaim))
-  (block resume
-    (indirect-call (load ptr (getelementptr %struct.fib.task t (i32 0) (i32 6))) (fn void (ptr)) t)
-    (br unclaim))
-  (block unclaim
-    (atomic-store release (i32 0) dp)
-    (call @fib.release t)
-    (ret)))
+(DEFINE INTERNAL (fib.run-one VOID) ((PTR t))
+  (BLOCK entry
+    (LET ((dp (GETELEMENTPTR (STRUCT fib.task) t (I32 0) (I32 4)))
+          (r (CMPXCHG ACQ_REL ACQUIRE dp (I32 0) (I32 1))))
+      (BR (EXTRACTVALUE r 1) claimed busy)))
+  (BLOCK busy (CALL (GLOBAL sched_yield)) (CALL (GLOBAL fib.enqueue) t) (RET))
+  (BLOCK claimed
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GETELEMENTPTR (STRUCT fib.task) t (I32 0) (I32 3))) (I32 1)) resume unclaim))
+  (BLOCK resume
+    (INDIRECT-CALL (LOAD PTR (GETELEMENTPTR (STRUCT fib.task) t (I32 0) (I32 6))) (FUNCTION VOID (PTR)) t)
+    (BR unclaim))
+  (BLOCK unclaim
+    (ATOMIC-STORE RELEASE (I32 0) dp)
+    (CALL (GLOBAL fib.release) t)
+    (RET)))
 
 ;; join/block-on (§8.8): drives the executor until the task is done,
 ;; resuming the task itself when it can claim it, running other queued
 ;; tasks meanwhile, sleeping when there is nothing to run. A pool task
 ;; (sched.lir) is joined by the pool's own join, which helps instead.
-(define internal (fib.drive void) ((ptr task))
-  (block entry
-    (let ((sp (getelementptr %struct.fib.task task (i32 0) (i32 3)))
-          (dp (getelementptr %struct.fib.task task (i32 0) (i32 4))))
-      (br (call @fib.sched-pool-task task) pool loop)))
-  (block pool (call @fib.sched-join task) (ret))
-  (block loop
-    (br (icmp eq (atomic-load acquire i32 sp) (i32 2)) done claim))
-  (block claim
-    (let ((r (cmpxchg acq_rel acquire dp (i32 0) (i32 1))))
-      (br (extractvalue r 1) claimed other)))
-  (block claimed
-    (let ((s (atomic-load acquire i32 sp)))
-      (br (icmp eq s (i32 2)) unclaim-done check-parked)))
-  (block check-parked (br (icmp eq s (i32 3)) parked resume))
-  (block unclaim-done (atomic-store release (i32 0) dp) (ret))
-  (block resume
-    (atomic-store release (i32 1) sp)
-    (indirect-call (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 6))) (fn void (ptr)) task)
-    (atomic-store release (i32 0) dp)
-    (br loop))
-  (block parked (atomic-store release (i32 0) dp) (br other))
-  (block other
-    (let ((u (call @fib.dequeue)))
-      (br (icmp eq u (ptr null)) idle run)))
-  (block idle (call @fib.idle-wait task) (br loop))
-  (block run (call @fib.run-one u) (br loop))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.drive VOID) ((PTR task))
+  (BLOCK entry
+    (LET ((sp (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 3)))
+          (dp (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 4))))
+      (BR (CALL (GLOBAL fib.sched-pool-task) task) pool loop)))
+  (BLOCK pool (CALL (GLOBAL fib.sched-join) task) (RET))
+  (BLOCK loop
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 sp) (I32 2)) done claim))
+  (BLOCK claim
+    (LET ((r (CMPXCHG ACQ_REL ACQUIRE dp (I32 0) (I32 1))))
+      (BR (EXTRACTVALUE r 1) claimed other)))
+  (BLOCK claimed
+    (LET ((s (ATOMIC-LOAD ACQUIRE I32 sp)))
+      (BR (ICMP EQ s (I32 2)) unclaim-done check-parked)))
+  (BLOCK check-parked (BR (ICMP EQ s (I32 3)) parked resume))
+  (BLOCK unclaim-done (ATOMIC-STORE RELEASE (I32 0) dp) (RET))
+  (BLOCK resume
+    (ATOMIC-STORE RELEASE (I32 1) sp)
+    (INDIRECT-CALL (LOAD PTR (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 6))) (FUNCTION VOID (PTR)) task)
+    (ATOMIC-STORE RELEASE (I32 0) dp)
+    (BR loop))
+  (BLOCK parked (ATOMIC-STORE RELEASE (I32 0) dp) (BR other))
+  (BLOCK other
+    (LET ((u (CALL (GLOBAL fib.dequeue))))
+      (BR (ICMP EQ u (PTR NULL)) idle run)))
+  (BLOCK idle (CALL (GLOBAL fib.idle-wait) task) (BR loop))
+  (BLOCK run (CALL (GLOBAL fib.run-one) u) (BR loop))
+  (BLOCK done (RET)))
 
 ;; A task that another thread is about to reach is SHARED first (its count atomic, what it captured marked too), as a spawned task is
 ;; (lcx-spawn): an `async` task is made, driven and released on one thread until it is awaited, so its counts are plain; from
@@ -243,86 +243,86 @@
 ;; mark must come BEFORE the other thread can have the task (a waker sets the state and queues it; after that a joiner may drive
 ;; it), so await-or-park does it while it still holds the task alone. The waiters of the task are not objects (nodes of a
 ;; list, slot 8), though the type's walker visits the slot: they are taken out of the task for the walk and put back.
-(define internal (fib.share-task void) ((ptr t))
-  (block entry
-    (br (icmp ne (and (call @fib.flags t) (i32 9)) (i32 0)) done mark))
-  (block mark
-    (let ((wp (getelementptr %struct.fib.task t (i32 0) (i32 8))))
-      (let ((saved (load ptr wp)))
-        (store (ptr null) wp)
-        (call @fib.share t)
-        (store saved wp)
-        (br done))))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.share-task VOID) ((PTR t))
+  (BLOCK entry
+    (BR (ICMP NE (AND (CALL (GLOBAL fib.flags) t) (I32 9)) (I32 0)) done mark))
+  (BLOCK mark
+    (LET ((wp (GETELEMENTPTR (STRUCT fib.task) t (I32 0) (I32 8))))
+      (LET ((saved (LOAD PTR wp)))
+        (STORE (PTR NULL) wp)
+        (CALL (GLOBAL fib.share) t)
+        (STORE saved wp)
+        (BR done))))
+  (BLOCK done (RET)))
 
 ;; `await e` from the running task `self`: 0 when `e` is done (the
 ;; result can be read at once), else `self` is registered as a waiter
 ;; of `e`, marked parked, and 1 says return from the resume. A pending
 ;; `e` is queued so that a worker or a joiner starts it (syntax §3.12:
 ;; the executor runs a task when it is awaited).
-(define internal (fib.await-or-park i1) ((ptr self) (ptr e))
-  (block entry
-    (let ((lockp (getelementptr %struct.fib.task e (i32 0) (i32 5)))
-          (sp (getelementptr %struct.fib.task e (i32 0) (i32 3))))
-      (call @fib.lock lockp)
-      (let ((s (atomic-load acquire i32 sp)))
-        (br (icmp eq s (i32 2)) done pending?))))
-  (block done (call @fib.unlock lockp) (ret (i1 0)))
-  (block pending? (br (icmp eq s (i32 0)) start register))
-  (block start
-    (atomic-store release (i32 1) sp)
-    (call @fib.share-task e)
-    (call @fib.retain e)
-    (call @fib.enqueue e)
-    (br register))
-  (block register
-    (call @fib.share-task self)
-    (let ((node (call @malloc (i64 16)))
-          (wp (getelementptr %struct.fib.task e (i32 0) (i32 8))))
-      (call @fib.retain self)
-      (store self node)
-      (store (load ptr wp) (getelementptr i8 node (i64 8)))
-      (atomic-store release node wp)
-      (atomic-store release (i32 3) (getelementptr %struct.fib.task self (i32 0) (i32 3)))
-      (call @fib.unlock lockp)
-      (ret (i1 1)))))
+(DEFINE INTERNAL (fib.await-or-park I1) ((PTR self) (PTR e))
+  (BLOCK entry
+    (LET ((lockp (GETELEMENTPTR (STRUCT fib.task) e (I32 0) (I32 5)))
+          (sp (GETELEMENTPTR (STRUCT fib.task) e (I32 0) (I32 3))))
+      (CALL (GLOBAL fib.lock) lockp)
+      (LET ((s (ATOMIC-LOAD ACQUIRE I32 sp)))
+        (BR (ICMP EQ s (I32 2)) done pending?))))
+  (BLOCK done (CALL (GLOBAL fib.unlock) lockp) (RET (I1 0)))
+  (BLOCK pending? (BR (ICMP EQ s (I32 0)) start register))
+  (BLOCK start
+    (ATOMIC-STORE RELEASE (I32 1) sp)
+    (CALL (GLOBAL fib.share-task) e)
+    (CALL (GLOBAL fib.retain) e)
+    (CALL (GLOBAL fib.enqueue) e)
+    (BR register))
+  (BLOCK register
+    (CALL (GLOBAL fib.share-task) self)
+    (LET ((node (CALL (GLOBAL malloc) (I64 16)))
+          (wp (GETELEMENTPTR (STRUCT fib.task) e (I32 0) (I32 8))))
+      (CALL (GLOBAL fib.retain) self)
+      (STORE self node)
+      (STORE (LOAD PTR wp) (GETELEMENTPTR I8 node (I64 8)))
+      (ATOMIC-STORE RELEASE node wp)
+      (ATOMIC-STORE RELEASE (I32 3) (GETELEMENTPTR (STRUCT fib.task) self (I32 0) (I32 3)))
+      (CALL (GLOBAL fib.unlock) lockp)
+      (RET (I1 1)))))
 
 ;; Completion (§8.8): state done, then every waiter is woken: marked
 ;; runnable and queued, the registration's count passing to the queue.
-(define internal (fib.task-complete void) ((ptr task))
-  (block entry
-    (let ((lockp (getelementptr %struct.fib.task task (i32 0) (i32 5)))
-          (wp (getelementptr %struct.fib.task task (i32 0) (i32 8))))
-      (atomic-store release (i32 2) (getelementptr %struct.fib.task task (i32 0) (i32 3)))
-      (call @fib.lock lockp)
-      (let ((list (load ptr wp)))
-        (atomic-store release (ptr null) wp)
-        (call @fib.unlock lockp)
-        (br wake))))
-  (block wake
-    (let ((node (phi ptr (entry list) (woken next))))
-      (br (icmp eq node (ptr null)) done woken)))
-  (block woken
-    (let ((w (load ptr node))
-          (next (load ptr (getelementptr i8 node (i64 8)))))
-      (call @free node)
-      (atomic-store release (i32 1) (getelementptr %struct.fib.task w (i32 0) (i32 3)))
-      (call @fib.enqueue w)
-      (br wake)))
-  (block done (call @fib.rq-lock) (call @fib.rq-broadcast) (call @fib.rq-unlock) (ret)))
+(DEFINE INTERNAL (fib.task-complete VOID) ((PTR task))
+  (BLOCK entry
+    (LET ((lockp (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 5)))
+          (wp (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 8))))
+      (ATOMIC-STORE RELEASE (I32 2) (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 3)))
+      (CALL (GLOBAL fib.lock) lockp)
+      (LET ((list (LOAD PTR wp)))
+        (ATOMIC-STORE RELEASE (PTR NULL) wp)
+        (CALL (GLOBAL fib.unlock) lockp)
+        (BR wake))))
+  (BLOCK wake
+    (LET ((node (PHI PTR (entry list) (woken next))))
+      (BR (ICMP EQ node (PTR NULL)) done woken)))
+  (BLOCK woken
+    (LET ((w (LOAD PTR node))
+          (next (LOAD PTR (GETELEMENTPTR I8 node (I64 8)))))
+      (CALL (GLOBAL free) node)
+      (ATOMIC-STORE RELEASE (I32 1) (GETELEMENTPTR (STRUCT fib.task) w (I32 0) (I32 3)))
+      (CALL (GLOBAL fib.enqueue) w)
+      (BR wake)))
+  (BLOCK done (CALL (GLOBAL fib.rq-lock)) (CALL (GLOBAL fib.rq-broadcast)) (CALL (GLOBAL fib.rq-unlock)) (RET)))
 
 ;; The message a task failed with (a share-marked str, null when it did not fail). `task-failure` and `fib.raise-failed` read it
 ;; after the task is done: the store of fib.fail-task precedes the release store of the state.
-(define internal (fib.task-failure ptr) ((ptr task))
-  (block entry
-    (ret (atomic-load acquire ptr (getelementptr %struct.fib.task task (i32 0) (i32 10))))))
+(DEFINE INTERNAL (fib.task-failure PTR) ((PTR task))
+  (BLOCK entry
+    (RET (ATOMIC-LOAD ACQUIRE PTR (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 10))))))
 
 ;; `join` and `@t` of a task that failed trap in the joiner with the task's own message; a task that did not fail is left alone.
-(define internal (fib.raise-failed void) ((ptr task))
-  (block entry
-    (let ((msg (call @fib.task-failure task)))
-      (br (icmp ne msg (ptr null)) failed done)))
-  (block failed
-    (call @fib.trap msg)
-    (unreachable))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.raise-failed VOID) ((PTR task))
+  (BLOCK entry
+    (LET ((msg (CALL (GLOBAL fib.task-failure) task)))
+      (BR (ICMP NE msg (PTR NULL)) failed done)))
+  (BLOCK failed
+    (CALL (GLOBAL fib.trap) msg)
+    (UNREACHABLE))
+  (BLOCK done (RET)))

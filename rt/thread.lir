@@ -8,95 +8,95 @@
 ;; a thread starts and decremented, with a broadcast, by the thread
 ;; entry's last runtime call (fib.thread-done), after the task is
 ;; released. Tasks, the run queue and the joins are in task.lir.
-(declare pthread_create i32 (ptr ptr ptr ptr))
-(declare pthread_detach i32 (i64))
-(declare pthread_attr_init i32 (ptr))
-(declare pthread_attr_setstacksize i32 (ptr i64))
-(declare pthread_attr_destroy i32 (ptr))
-(declare pthread_attr_setguardsize i32 (ptr i64))
-(global internal fib.threads-live i32 (i32 0))
+(DECLARE pthread_create I32 (PTR PTR PTR PTR))
+(DECLARE pthread_detach I32 (I64))
+(DECLARE pthread_attr_init I32 (PTR))
+(DECLARE pthread_attr_setstacksize I32 (PTR I64))
+(DECLARE pthread_attr_destroy I32 (PTR))
+(DECLARE pthread_attr_setguardsize I32 (PTR I64))
+(GLOBAL INTERNAL fib.threads-live I32 (I32 0))
 ;; The threads this runtime started and that are still running: spawned threads (fib.spawn .. fib.thread-done), async workers, pool workers. The program's own thread is not in it
 ;; (`fib_thread_count` adds it). The operating system's count is not the program's: a program run by `fibc run` shares its process with the compiler's own threads (its stack thread, the
 ;; parked first thread), and on macOS there is no /proc to tell them apart by name.
-(global internal fib.thread-total i64 (i64 0))
+(GLOBAL INTERNAL fib.thread-total I64 (I64 0))
 
 ;; What fib.os.process/thread-count answers (extern: bound to this definition): the threads of the program, its own thread and the ones the runtime started for it.
-;; extern: (declare fib_thread_count i64 ())
-(define internal (fib_thread_count i64) ()
-  (block entry (ret (add (i64 1) (atomic-load monotonic i64 @fib.thread-total)))))
+;; extern: (DECLARE fib_thread_count I64 ())
+(DEFINE INTERNAL (fib_thread_count I64) ()
+  (BLOCK entry (RET (ADD (I64 1) (ATOMIC-LOAD MONOTONIC I64 (GLOBAL fib.thread-total))))))
 ;; The stack of a task's thread and of a pool worker, in bytes (docs/design/stack.md), and the guard below it.
-(global internal fib.thread-stack i64 (i64 8388608))
-(global internal fib.thread-guard i64 (i64 65536))
+(GLOBAL INTERNAL fib.thread-stack I64 (I64 8388608))
+(GLOBAL INTERNAL fib.thread-guard I64 (I64 65536))
 
 ;; A thread attribute with the stack size set explicitly (8 MiB: glibc's default from `ulimit -s`; musl's own default is 128 KiB and Darwin's 512 KiB,
 ;; too small for the recursion a task may do). The attribute is 56 bytes on LP64 Linux and 64 on Darwin: 128 bytes, in the caller's frame, are enough.
 ;; The caller makes room for it and destroys it after pthread_create.
-(define internal (fib.thread-attr i32) ((ptr a))
-  (block entry
-    (call @pthread_attr_init a)
-    (call @pthread_attr_setguardsize a (load i64 @fib.thread-guard))
-    (ret (call @pthread_attr_setstacksize a (load i64 @fib.thread-stack)))))
+(DEFINE INTERNAL (fib.thread-attr I32) ((PTR a))
+  (BLOCK entry
+    (CALL (GLOBAL pthread_attr_init) a)
+    (CALL (GLOBAL pthread_attr_setguardsize) a (LOAD I64 (GLOBAL fib.thread-guard)))
+    (RET (CALL (GLOBAL pthread_attr_setstacksize) a (LOAD I64 (GLOBAL fib.thread-stack))))))
 
 ;; Starts entry(task) on a new detached thread and counts it; in trace
 ;; mode writes the T line (compiler.md §4).
-(define internal (fib.spawn void) ((ptr task) (ptr entry))
-  (block entry
-    (atomicrmw add monotonic @fib.thread-total (i64 1))
-    (atomic-store monotonic (i32 1) @fib.mt)
-    (call @fib.rq-lock)
-    (store (add (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
-    (call @fib.rq-unlock)
-    (let ((handle (alloca i64))
-          (attr (alloca (align 8) i8 (i32 128)))
-          (_a (call @fib.thread-attr attr))
-          (rc (call @pthread_create handle attr entry task)))
-      (call @pthread_attr_destroy attr)
-      (br (icmp ne rc (i32 0)) failed started)))
-  (block failed
-    (call @fib.fatal-c (string "spawn: cannot start a thread"))
-    (unreachable))
-  (block started
-    (call @pthread_detach (load i64 handle))
-    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
-  (block traced (call @fib.trace-out (string "T\n") (i64 2)) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.spawn VOID) ((PTR task) (PTR entry))
+  (BLOCK entry
+    (ATOMICRMW ADD MONOTONIC (GLOBAL fib.thread-total) (I64 1))
+    (ATOMIC-STORE MONOTONIC (I32 1) (GLOBAL fib.mt))
+    (CALL (GLOBAL fib.rq-lock))
+    (STORE (ADD (LOAD I32 (GLOBAL fib.threads-live)) (I32 1)) (GLOBAL fib.threads-live))
+    (CALL (GLOBAL fib.rq-unlock))
+    (LET ((handle (ALLOCA I64))
+          (attr (ALLOCA (ALIGN 8) I8 (I32 128)))
+          (_a (CALL (GLOBAL fib.thread-attr) attr))
+          (rc (CALL (GLOBAL pthread_create) handle attr entry task)))
+      (CALL (GLOBAL pthread_attr_destroy) attr)
+      (BR (ICMP NE rc (I32 0)) failed started)))
+  (BLOCK failed
+    (CALL (GLOBAL fib.fatal-c) (STRING "spawn: cannot start a thread"))
+    (UNREACHABLE))
+  (BLOCK started
+    (CALL (GLOBAL pthread_detach) (LOAD I64 handle))
+    (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced done))
+  (BLOCK traced (CALL (GLOBAL fib.trace-out) (STRING "T\n") (I64 2)) (BR done))
+  (BLOCK done (RET)))
 
 ;; The first runtime call of a thread entry: the task this thread runs is what a trap on it fails (fib.trap-bytes).
-(define internal (fib.thread-enter void) ((ptr task))
-  (block entry
-    (call @pthread_setspecific (load i32 @fib.task-key) task)
-    (call @fib.guard-enter (load i64 @fib.thread-stack))
-    (ret)))
+(DEFINE INTERNAL (fib.thread-enter VOID) ((PTR task))
+  (BLOCK entry
+    (CALL (GLOBAL pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key)) task)
+    (CALL (GLOBAL fib.guard-enter) (LOAD I64 (GLOBAL fib.thread-stack)))
+    (RET)))
 
 ;; The thread gives itself back to the program's count (fib_thread_count) BEFORE it completes its task: completing publishes the done state a joiner
 ;; waits for, so a joiner that returns from `join` then reads a count without this thread (RACE-8780: with the decrement after the completion, a
 ;; joiner could read the count in the window and find the finished threads still in it). The release store of the done state orders it.
-(define internal (fib.thread-uncount void) ()
-  (block entry
-    (atomicrmw sub monotonic @fib.thread-total (i64 1))
-    (ret)))
+(DEFINE INTERNAL (fib.thread-uncount VOID) ()
+  (BLOCK entry
+    (ATOMICRMW SUB MONOTONIC (GLOBAL fib.thread-total) (I64 1))
+    (RET)))
 
 ;; The last runtime call of a thread entry: one thread fewer for main's return (the count of the program is fib.thread-uncount's, before the
 ;; completion), and whoever waits in fib.join-all is told.
-(define internal (fib.thread-done void) ()
-  (block entry
-    (call @fib.guard-leave)
-    (call @fib.rq-lock)
-    (store (sub (load i32 @fib.threads-live) (i32 1)) @fib.threads-live)
-    (call @fib.rq-broadcast)
-    (call @fib.rq-unlock)
-    (ret)))
+(DEFINE INTERNAL (fib.thread-done VOID) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.guard-leave))
+    (CALL (GLOBAL fib.rq-lock))
+    (STORE (SUB (LOAD I32 (GLOBAL fib.threads-live)) (I32 1)) (GLOBAL fib.threads-live))
+    (CALL (GLOBAL fib.rq-broadcast))
+    (CALL (GLOBAL fib.rq-unlock))
+    (RET)))
 
 ;; Waits until every thread started so far, including those started
 ;; while waiting, has finished.
-(define internal (fib.join-all void) ()
-  (block entry (call @fib.rq-lock) (br test))
-  (block test
-    (br (icmp sgt (load i32 @fib.threads-live) (i32 0)) sleep done))
-  (block sleep
-    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
-    (br test))
-  (block done (call @fib.rq-unlock) (ret)))
+(DEFINE INTERNAL (fib.join-all VOID) ()
+  (BLOCK entry (CALL (GLOBAL fib.rq-lock)) (BR test))
+  (BLOCK test
+    (BR (ICMP SGT (LOAD I32 (GLOBAL fib.threads-live)) (I32 0)) sleep done))
+  (BLOCK sleep
+    (CALL (GLOBAL pthread_cond_wait) (LOAD PTR (GLOBAL fib.rq-cond)) (LOAD PTR (GLOBAL fib.rq-mutex)))
+    (BR test))
+  (BLOCK done (CALL (GLOBAL fib.rq-unlock)) (RET)))
 
 ;; ---- The stack guard (docs/design/stack.md). A stack that overflows ends in a SIGSEGV on its guard page: no code of the program runs, so it cannot be a
 ;; trap that unwinds (docs/adr/0009: stack overflow is fatal, in a `try` too). What the runtime does is say so: every thread that runs the program keeps a
@@ -106,184 +106,184 @@
 ;; The handler uses write, sigaltstack, abort and sigaction only (all async-signal-safe). `main` runs on a stack the runtime makes (`fib.run-main`).
 ;; Left out of a WASI runtime (emit.wasi), which has neither signals nor threads, and adapted for Darwin by emit.os.
 ;; guard-begin
-(declare sigaction i32 (i32 ptr ptr))
-(declare sigaltstack i32 (ptr ptr))
-(declare pthread_join i32 (i64 ptr))
-(declare getrlimit i32 (i32 ptr))
-(declare prctl i32 (i32 ptr i64 i64 i64))
-(declare strtol i64 (ptr ptr i32))
-(global internal fib.guard-sigbus i32 (i32 7))
-(global internal fib.guard-ss-disable i32 (i32 2))
-(global internal fib.main-fn ptr (ptr null))
-(global internal fib.main-stack i64 (i64 0))
+(DECLARE sigaction I32 (I32 PTR PTR))
+(DECLARE sigaltstack I32 (PTR PTR))
+(DECLARE pthread_join I32 (I64 PTR))
+(DECLARE getrlimit I32 (I32 PTR))
+(DECLARE prctl I32 (I32 PTR I64 I64 I64))
+(DECLARE strtol I64 (PTR PTR I32))
+(GLOBAL INTERNAL fib.guard-sigbus I32 (I32 7))
+(GLOBAL INTERNAL fib.guard-ss-disable I32 (I32 2))
+(GLOBAL INTERNAL fib.main-fn PTR (PTR NULL))
+(GLOBAL INTERNAL fib.main-stack I64 (I64 0))
 ;; The distance from the end of a stack within which a fault is its overflow (the guard of the main stack is a megabyte, of a task's thread 64 KiB).
-(global internal fib.guard-window i64 (i64 1048576))
+(GLOBAL INTERNAL fib.guard-window I64 (I64 1048576))
 
 ;; Fills the stack_t at ss. Linux: ss_sp, ss_flags (int, at 8), ss_size (at 16). Darwin: ss_sp, ss_size (at 8), ss_flags (int, at 16).
-(define internal (fib.guard-ss void) ((ptr ss) (ptr sp) (i64 size) (i32 flags))
-  (block entry
-    (store sp ss)
-    (store flags (getelementptr i8 ss (i64 8)))
-    (store size (getelementptr i8 ss (i64 16)))
-    (ret)))
+(DEFINE INTERNAL (fib.guard-ss VOID) ((PTR ss) (PTR sp) (I64 size) (I32 flags))
+  (BLOCK entry
+    (STORE sp ss)
+    (STORE flags (GETELEMENTPTR I8 ss (I64 8)))
+    (STORE size (GETELEMENTPTR I8 ss (I64 16)))
+    (RET)))
 
 ;; This thread is about to run program code on a stack of `size` bytes whose top is near here: gives it its signal stack, 64 KiB with the bounds
 ;; of the stack in its first 16 bytes. Fails quietly (the thread then has no guard message, as before) when there is no memory for it.
-(define internal (fib.guard-enter void) ((i64 size))
-  (block entry
-    (let ((here (alloca i64))
-          (ss (alloca (align 8) i8 (i32 32)))
-          (blk (call @malloc (i64 65536))))
-      (br (icmp eq blk (ptr null)) out set)))
-  (block set
-    (let ((hi (ptrtoint i64 here)))
-      (store (sub hi size) blk)
-      (store hi (getelementptr i8 blk (i64 8)))
-      (call @fib.guard-ss ss (getelementptr i8 blk (i64 16)) (i64 65520) (i32 0))
-      (br (icmp ne (call @sigaltstack ss (ptr null)) (i32 0)) undo out)))
-  (block undo (call @free blk) (br out))
-  (block out (ret)))
+(DEFINE INTERNAL (fib.guard-enter VOID) ((I64 size))
+  (BLOCK entry
+    (LET ((here (ALLOCA I64))
+          (ss (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (blk (CALL (GLOBAL malloc) (I64 65536))))
+      (BR (ICMP EQ blk (PTR NULL)) out set)))
+  (BLOCK set
+    (LET ((hi (PTRTOINT I64 here)))
+      (STORE (SUB hi size) blk)
+      (STORE hi (GETELEMENTPTR I8 blk (I64 8)))
+      (CALL (GLOBAL fib.guard-ss) ss (GETELEMENTPTR I8 blk (I64 16)) (I64 65520) (I32 0))
+      (BR (ICMP NE (CALL (GLOBAL sigaltstack) ss (PTR NULL)) (I32 0)) undo out)))
+  (BLOCK undo (CALL (GLOBAL free) blk) (BR out))
+  (BLOCK out (RET)))
 
 ;; This thread ends: its signal stack is disabled and freed (a task's thread comes and goes; a program that spawns in a loop must not leak one each).
-(define internal (fib.guard-leave void) ()
-  (block entry
-    (call @fib.stk-leave)
-    (let ((cur (alloca (align 8) i8 (i32 32)))
-          (off (alloca (align 8) i8 (i32 32)))
-          (_q (call @sigaltstack (ptr null) cur))
-          (sp (load ptr cur)))
-      (br (icmp eq sp (ptr null)) out drop)))
-  (block drop
-    (call @fib.guard-ss off (ptr null) (i64 0) (load i32 @fib.guard-ss-disable))
-    (call @sigaltstack off (ptr null))
-    (call @free (getelementptr i8 sp (i64 -16)))
-    (br out))
-  (block out (ret)))
+(DEFINE INTERNAL (fib.guard-leave VOID) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.stk-leave))
+    (LET ((cur (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (off (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (_q (CALL (GLOBAL sigaltstack) (PTR NULL) cur))
+          (sp (LOAD PTR cur)))
+      (BR (ICMP EQ sp (PTR NULL)) out drop)))
+  (BLOCK drop
+    (CALL (GLOBAL fib.guard-ss) off (PTR NULL) (I64 0) (LOAD I32 (GLOBAL fib.guard-ss-disable)))
+    (CALL (GLOBAL sigaltstack) off (PTR NULL))
+    (CALL (GLOBAL free) (GETELEMENTPTR I8 sp (I64 -16)))
+    (BR out))
+  (BLOCK out (RET)))
 
 ;; What fib.os.process asks around a `fork` (extern: bound to this definition). op 0: the base of this thread's signal stack, 0 when it has none (taken in the
 ;; parent just before the fork). op 1: in the child, with that base: a thread that has no signal stack gets the parent's back (the child's memory has it, with its
 ;; bounds header). Linux keeps the signal stack across a fork, so there it does nothing; XNU does not (the new thread starts with none, and a child that
 ;; outruns its stack was killed by SIGILL, the kernel having no stack to push the signal frame on, with no message). Returns 1 when it set the stack.
-;; extern: (declare fib_guard_ctl i64 (i64 i64))
-(define internal (fib_guard_ctl i64) ((i64 op) (i64 saved))
-  (block entry
-    (let ((cur (alloca (align 8) i8 (i32 32)))
-          (ss (alloca (align 8) i8 (i32 32)))
-          (_q (call @sigaltstack (ptr null) cur))
-          (sp (load ptr cur)))
-      (br (icmp eq op (i64 0)) query restore)))
-  (block query (ret (ptrtoint i64 sp)))
-  (block restore
-    (br (and (icmp eq sp (ptr null)) (icmp ne saved (i64 0))) set none))
-  (block set
-    (call @fib.guard-ss ss (inttoptr ptr saved) (i64 65520) (i32 0))
-    (br (icmp eq (call @sigaltstack ss (ptr null)) (i32 0)) done none))
-  (block done (ret (i64 1)))
-  (block none (ret (i64 0))))
+;; extern: (DECLARE fib_guard_ctl I64 (I64 I64))
+(DEFINE INTERNAL (fib_guard_ctl I64) ((I64 op) (I64 saved))
+  (BLOCK entry
+    (LET ((cur (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (ss (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (_q (CALL (GLOBAL sigaltstack) (PTR NULL) cur))
+          (sp (LOAD PTR cur)))
+      (BR (ICMP EQ op (I64 0)) query restore)))
+  (BLOCK query (RET (PTRTOINT I64 sp)))
+  (BLOCK restore
+    (BR (AND (ICMP EQ sp (PTR NULL)) (ICMP NE saved (I64 0))) set none))
+  (BLOCK set
+    (CALL (GLOBAL fib.guard-ss) ss (INTTOPTR PTR saved) (I64 65520) (I32 0))
+    (BR (ICMP EQ (CALL (GLOBAL sigaltstack) ss (PTR NULL)) (I32 0)) done none))
+  (BLOCK done (RET (I64 1)))
+  (BLOCK none (RET (I64 0))))
 
 ;; "fatal signal N at 0xADDR\n" in one write: N is a signal number of at most two digits.
-(define internal (fib.guard-unknown void) ((i32 sig) (i64 addr))
-  (block entry
-    (let ((buf (alloca (align 8) i8 (i32 64)))
-          (_h (call @memcpy buf (string "fatal signal ") (i64 13)))
-          (tens (udiv sig (i32 10)))
-          (ones (urem sig (i32 10))))
-      (br (icmp eq tens (i32 0)) units two)))
-  (block two
-    (store (trunc i8 (add tens (i32 48))) (getelementptr i8 buf (i64 13)))
-    (store (trunc i8 (add ones (i32 48))) (getelementptr i8 buf (i64 14)))
-    (call @memcpy (getelementptr i8 buf (i64 15)) (string " at 0x") (i64 6))
-    (br digits))
-  (block units
-    (store (trunc i8 (add ones (i32 48))) (getelementptr i8 buf (i64 13)))
-    (call @memcpy (getelementptr i8 buf (i64 14)) (string " at 0x") (i64 6))
-    (br digits))
-  (block digits
-    (let ((at (phi i64 (two (i64 21)) (units (i64 20)))))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (digits (i64 0)) (loop2 i2)))
-          (nib (and (lshr addr (sub (i64 60) (shl i (i64 2)))) (i64 15)))
-          (ch (select (icmp ult nib (i64 10)) (add nib (i64 48)) (add nib (i64 87)))))
-      (store (trunc i8 ch) (getelementptr i8 buf (add at i)))
-      (br loop2)))
-  (block loop2
-    (let ((i2 (add i (i64 1))))
-      (br (icmp ult i2 (i64 16)) loop done)))
-  (block done
-    (store (i8 10) (getelementptr i8 buf (add at (i64 16))))
-    (call @fib.trace-flush)
-    (call @write (i32 2) buf (add at (i64 17)))
-    (ret)))
+(DEFINE INTERNAL (fib.guard-unknown VOID) ((I32 sig) (I64 addr))
+  (BLOCK entry
+    (LET ((buf (ALLOCA (ALIGN 8) I8 (I32 64)))
+          (_h (CALL (GLOBAL memcpy) buf (STRING "fatal signal ") (I64 13)))
+          (tens (UDIV sig (I32 10)))
+          (ones (UREM sig (I32 10))))
+      (BR (ICMP EQ tens (I32 0)) units two)))
+  (BLOCK two
+    (STORE (TRUNC I8 (ADD tens (I32 48))) (GETELEMENTPTR I8 buf (I64 13)))
+    (STORE (TRUNC I8 (ADD ones (I32 48))) (GETELEMENTPTR I8 buf (I64 14)))
+    (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 buf (I64 15)) (STRING " at 0x") (I64 6))
+    (BR digits))
+  (BLOCK units
+    (STORE (TRUNC I8 (ADD ones (I32 48))) (GETELEMENTPTR I8 buf (I64 13)))
+    (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 buf (I64 14)) (STRING " at 0x") (I64 6))
+    (BR digits))
+  (BLOCK digits
+    (LET ((at (PHI I64 (two (I64 21)) (units (I64 20)))))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (digits (I64 0)) (loop2 i2)))
+          (nib (AND (LSHR addr (SUB (I64 60) (SHL i (I64 2)))) (I64 15)))
+          (ch (SELECT (ICMP ULT nib (I64 10)) (ADD nib (I64 48)) (ADD nib (I64 87)))))
+      (STORE (TRUNC I8 ch) (GETELEMENTPTR I8 buf (ADD at i)))
+      (BR loop2)))
+  (BLOCK loop2
+    (LET ((i2 (ADD i (I64 1))))
+      (BR (ICMP ULT i2 (I64 16)) loop done)))
+  (BLOCK done
+    (STORE (I8 10) (GETELEMENTPTR I8 buf (ADD at (I64 16))))
+    (CALL (GLOBAL fib.trace-flush))
+    (CALL (GLOBAL write) (I32 2) buf (ADD at (I64 17)))
+    (RET)))
 
 ;; The handler of SIGSEGV and SIGBUS (sa_sigaction: signal, siginfo_t, ucontext). si_addr is at 16 on Linux and 24 on Darwin.
-(define internal (fib.guard-handler void) ((i32 sig) (ptr info) (ptr uc))
-  (block entry
-    (let ((addr (ptrtoint i64 (load ptr (getelementptr i8 info (i64 16)))))
-          (cur (alloca (align 8) i8 (i32 32)))
-          (_q (call @sigaltstack (ptr null) cur))
-          (sp (load ptr cur)))
-      (br (icmp eq sp (ptr null)) unknown check)))
-  (block check
-    (let ((lo (load i64 (getelementptr i8 sp (i64 -16))))
-          (w (load i64 @fib.guard-window)))
-      (br (icmp ult (sub addr (sub lo w)) (shl w (i64 1))) overflow unknown)))
-  (block overflow
-    (call @fib.trace-flush)
-    (call @write (i32 2) (string "trap: stack overflow\n") (i64 21))
-    (call @abort)
-    (unreachable))
-  (block unknown
-    (call @fib.guard-unknown sig addr)
-    (let ((dfl (alloca (align 8) i8 (i32 160))))
-      (call @memset dfl (i32 0) (i64 160))
-      (call @sigaction sig dfl (ptr null))
-      (ret))))
+(DEFINE INTERNAL (fib.guard-handler VOID) ((I32 sig) (PTR info) (PTR uc))
+  (BLOCK entry
+    (LET ((addr (PTRTOINT I64 (LOAD PTR (GETELEMENTPTR I8 info (I64 16)))))
+          (cur (ALLOCA (ALIGN 8) I8 (I32 32)))
+          (_q (CALL (GLOBAL sigaltstack) (PTR NULL) cur))
+          (sp (LOAD PTR cur)))
+      (BR (ICMP EQ sp (PTR NULL)) unknown check)))
+  (BLOCK check
+    (LET ((lo (LOAD I64 (GETELEMENTPTR I8 sp (I64 -16))))
+          (w (LOAD I64 (GLOBAL fib.guard-window))))
+      (BR (ICMP ULT (SUB addr (SUB lo w)) (SHL w (I64 1))) overflow unknown)))
+  (BLOCK overflow
+    (CALL (GLOBAL fib.trace-flush))
+    (CALL (GLOBAL write) (I32 2) (STRING "trap: stack overflow\n") (I64 21))
+    (CALL (GLOBAL abort))
+    (UNREACHABLE))
+  (BLOCK unknown
+    (CALL (GLOBAL fib.guard-unknown) sig addr)
+    (LET ((dfl (ALLOCA (ALIGN 8) I8 (I32 160))))
+      (CALL (GLOBAL memset) dfl (I32 0) (I64 160))
+      (CALL (GLOBAL sigaction) sig dfl (PTR NULL))
+      (RET))))
 
 ;; The handler for SIGSEGV and SIGBUS. `old` (two 160-byte slots) receives their previous actions, for fib.guard-restore.
 ;; struct sigaction: the handler at 0 and the mask at 8 (128 bytes on Linux), sa_flags at 136 on Linux (SA_SIGINFO 4 | SA_ONSTACK 0x08000000);
 ;; Darwin: the mask is 4 bytes, sa_flags at 12 (SA_SIGINFO 0x40 | SA_ONSTACK 1).
-(define internal (fib.guard-install void) ((ptr old))
-  (block entry
-    (let ((sa (alloca (align 8) i8 (i32 160))))
-      (call @memset sa (i32 0) (i64 160))
-      (store @fib.guard-handler sa)
-      (store (i32 134217732) (getelementptr i8 sa (i64 136)))
-      (call @sigaction (i32 11) sa old)
-      (call @sigaction (load i32 @fib.guard-sigbus) sa (getelementptr i8 old (i64 160)))
-      (ret))))
+(DEFINE INTERNAL (fib.guard-install VOID) ((PTR old))
+  (BLOCK entry
+    (LET ((sa (ALLOCA (ALIGN 8) I8 (I32 160))))
+      (CALL (GLOBAL memset) sa (I32 0) (I64 160))
+      (STORE (GLOBAL fib.guard-handler) sa)
+      (STORE (I32 134217732) (GETELEMENTPTR I8 sa (I64 136)))
+      (CALL (GLOBAL sigaction) (I32 11) sa old)
+      (CALL (GLOBAL sigaction) (LOAD I32 (GLOBAL fib.guard-sigbus)) sa (GETELEMENTPTR I8 old (I64 160)))
+      (RET))))
 
-(define internal (fib.guard-restore void) ((ptr old))
-  (block entry
-    (call @sigaction (i32 11) old (ptr null))
-    (call @sigaction (load i32 @fib.guard-sigbus) (getelementptr i8 old (i64 160)) (ptr null))
-    (ret)))
+(DEFINE INTERNAL (fib.guard-restore VOID) ((PTR old))
+  (BLOCK entry
+    (CALL (GLOBAL sigaction) (I32 11) old (PTR NULL))
+    (CALL (GLOBAL sigaction) (LOAD I32 (GLOBAL fib.guard-sigbus)) (GETELEMENTPTR I8 old (I64 160)) (PTR NULL))
+    (RET)))
 
 ;; The size of the main stack in MiB: FIB_STACK_MB when set (0: the process's own stack), else 256. Anything but a whole number is a fatal error that says so.
-(define internal (fib.main-stack-mb i64) ()
-  (block entry
-    (let ((v (call @getenv (string "FIB_STACK_MB"))))
-      (br (icmp eq v (ptr null)) default parse)))
-  (block default (ret (i64 256)))
-  (block parse
-    (let ((end (alloca ptr))
-          (n (call @strtol v end (i32 10)))
-          (good (and (icmp ne (load i8 v) (i8 0))
-                     (and (icmp eq (load i8 (load ptr end)) (i8 0))
-                          (and (icmp sge n (i64 0)) (icmp sle n (i64 1048576)))))))
-      (br good ok bad)))
-  (block ok (ret n))
-  (block bad
-    (call @fib.fatal-c (string "FIB_STACK_MB is not a whole number of MiB from 0 to 1048576"))
-    (unreachable)))
+(DEFINE INTERNAL (fib.main-stack-mb I64) ()
+  (BLOCK entry
+    (LET ((v (CALL (GLOBAL getenv) (STRING "FIB_STACK_MB"))))
+      (BR (ICMP EQ v (PTR NULL)) default parse)))
+  (BLOCK default (RET (I64 256)))
+  (BLOCK parse
+    (LET ((end (ALLOCA PTR))
+          (n (CALL (GLOBAL strtol) v end (I32 10)))
+          (good (AND (ICMP NE (LOAD I8 v) (I8 0))
+                     (AND (ICMP EQ (LOAD I8 (LOAD PTR end)) (I8 0))
+                          (AND (ICMP SGE n (I64 0)) (ICMP SLE n (I64 1048576)))))))
+      (BR good ok bad)))
+  (BLOCK ok (RET n))
+  (BLOCK bad
+    (CALL (GLOBAL fib.fatal-c) (STRING "FIB_STACK_MB is not a whole number of MiB from 0 to 1048576"))
+    (UNREACHABLE)))
 
 ;; What runs on the main stack: the guard of this thread, then the program (fib.main-fn).
-(define internal (fib.main-tramp ptr) ((ptr arg))
-  (block entry
-    (call @fib.guard-enter (load i64 @fib.main-stack))
-    (indirect-call (load ptr @fib.main-fn) (fn void ()))
-    (call @fib.stk-leave)
-    (ret (ptr null))))
+(DEFINE INTERNAL (fib.main-tramp PTR) ((PTR arg))
+  (BLOCK entry
+    (CALL (GLOBAL fib.guard-enter) (LOAD I64 (GLOBAL fib.main-stack)))
+    (INDIRECT-CALL (LOAD PTR (GLOBAL fib.main-fn)) (FUNCTION VOID ()))
+    (CALL (GLOBAL fib.stk-leave))
+    (RET (PTR NULL))))
 
 ;; Runs `body` (no arguments) on a stack of FIB_STACK_MB MiB (default 256) that the runtime makes: a thread whose stack is mapped, committed as it is
 ;; touched, with a megabyte of guard below it, so that how deep a program may recurse is the same on every system and not what `ulimit -s` says.
@@ -291,42 +291,42 @@
 ;; are then from that limit; unlimited is taken as 1 GiB). The signal handlers the process had are put back when `body` has returned. The first thread of
 ;; the process, which only waits, is named `fib-parked` (Linux: prctl PR_SET_NAME, a comm of /proc) so that fib.os.process does not count it as another thread (a thread keeps the name its creator had when it was made: the name is set after the
 ;; program's thread exists).
-(define internal (fib.run-main void) ((ptr body))
-  (block entry
-    (let ((old (alloca (align 8) i8 (i32 320)))
-          (mb (call @fib.main-stack-mb))
-          (attr (alloca (align 8) i8 (i32 128)))
-          (tid (alloca i64)))
-      (call @fib.guard-install old)
-      (store body @fib.main-fn)
-      (br (icmp eq mb (i64 0)) here spawn)))
-  (block spawn
-    (store (shl mb (i64 20)) @fib.main-stack)
-    (call @pthread_attr_init attr)
-    (call @pthread_attr_setguardsize attr (i64 1048576))
-    (let ((rs (call @pthread_attr_setstacksize attr (shl mb (i64 20)))))
-      (br (icmp eq rs (i32 0)) create refused)))
-  (block refused (call @pthread_attr_destroy attr) (br here))
-  (block create
-    (let ((rc (call @pthread_create tid attr @fib.main-tramp (ptr null))))
-      (call @pthread_attr_destroy attr)
-      (br (icmp eq rc (i32 0)) joined here)))
-  (block joined
-    (call @prctl (i32 15) (string "fib-parked") (i64 0) (i64 0) (i64 0))
-    (call @pthread_join (load i64 tid) (ptr null))
-    (call @prctl (i32 15) (string "fib-main") (i64 0) (i64 0) (i64 0))
-    (call @fib.guard-restore old)
-    (ret))
-  (block here
-    (let ((lim (alloca (align 8) i8 (i32 16)))
-          (_g (call @getrlimit (i32 3) lim))
-          (cur (load i64 lim)))
-      (store (select (icmp ult cur (i64 1073741824)) cur (i64 1073741824)) @fib.main-stack)
-      (call @fib.guard-enter (load i64 @fib.main-stack))
-      (indirect-call (load ptr @fib.main-fn) (fn void ()))
-      (call @fib.guard-leave)
-      (call @fib.guard-restore old)
-      (ret))))
+(DEFINE INTERNAL (fib.run-main VOID) ((PTR body))
+  (BLOCK entry
+    (LET ((old (ALLOCA (ALIGN 8) I8 (I32 320)))
+          (mb (CALL (GLOBAL fib.main-stack-mb)))
+          (attr (ALLOCA (ALIGN 8) I8 (I32 128)))
+          (tid (ALLOCA I64)))
+      (CALL (GLOBAL fib.guard-install) old)
+      (STORE body (GLOBAL fib.main-fn))
+      (BR (ICMP EQ mb (I64 0)) here spawn)))
+  (BLOCK spawn
+    (STORE (SHL mb (I64 20)) (GLOBAL fib.main-stack))
+    (CALL (GLOBAL pthread_attr_init) attr)
+    (CALL (GLOBAL pthread_attr_setguardsize) attr (I64 1048576))
+    (LET ((rs (CALL (GLOBAL pthread_attr_setstacksize) attr (SHL mb (I64 20)))))
+      (BR (ICMP EQ rs (I32 0)) create refused)))
+  (BLOCK refused (CALL (GLOBAL pthread_attr_destroy) attr) (BR here))
+  (BLOCK create
+    (LET ((rc (CALL (GLOBAL pthread_create) tid attr (GLOBAL fib.main-tramp) (PTR NULL))))
+      (CALL (GLOBAL pthread_attr_destroy) attr)
+      (BR (ICMP EQ rc (I32 0)) joined here)))
+  (BLOCK joined
+    (CALL (GLOBAL prctl) (I32 15) (STRING "fib-parked") (I64 0) (I64 0) (I64 0))
+    (CALL (GLOBAL pthread_join) (LOAD I64 tid) (PTR NULL))
+    (CALL (GLOBAL prctl) (I32 15) (STRING "fib-main") (I64 0) (I64 0) (I64 0))
+    (CALL (GLOBAL fib.guard-restore) old)
+    (RET))
+  (BLOCK here
+    (LET ((lim (ALLOCA (ALIGN 8) I8 (I32 16)))
+          (_g (CALL (GLOBAL getrlimit) (I32 3) lim))
+          (cur (LOAD I64 lim)))
+      (STORE (SELECT (ICMP ULT cur (I64 1073741824)) cur (I64 1073741824)) (GLOBAL fib.main-stack))
+      (CALL (GLOBAL fib.guard-enter) (LOAD I64 (GLOBAL fib.main-stack)))
+      (INDIRECT-CALL (LOAD PTR (GLOBAL fib.main-fn)) (FUNCTION VOID ()))
+      (CALL (GLOBAL fib.guard-leave))
+      (CALL (GLOBAL fib.guard-restore) old)
+      (RET))))
 ;; ---- The stack check (docs/design/stack-check.md). The emitted prologue of a function of a program that passes failures on compares `(stack-addr)` with a word of
 ;; `fib.stk` and calls `fib.stack-slow` when the word does not vouch for it. A word is one 64-bit value, `(lo_page << 10) | npages` (4 KiB pages), written only by
 ;; fib.stack-slow and only with a range inside the usable stack of the thread that writes it (above its limit, below its top, inside the 2 MiB block the word is for),
@@ -334,146 +334,146 @@
 ;; by the 2 MiB block (`sp >> 21`) modulo 4096; a collision costs the other thread a slow call, never a wrong pass. The thread's record (lowest address, top, limit, known) is
 ;; kept under `fib.stk-key` and freed, and its words cleared, when the thread ends (a stack address reused by another thread must not inherit a range).
 ;; A thread whose stack the system cannot report has an unknown record: it is never reported as overflowing and registers nothing (the guard page is its backstop).
-(declare pthread_self i64 ())
-(declare pthread_getattr_np i32 (i64 ptr))
-(declare pthread_attr_getstack i32 (ptr ptr ptr))
-(global internal fib.stk-key i32 (i32 0))
-(global internal fib.stk [4096 x i64] (zeroinitializer [4096 x i64]))
+(DECLARE pthread_self I64 ())
+(DECLARE pthread_getattr_np I32 (I64 PTR))
+(DECLARE pthread_attr_getstack I32 (PTR PTR PTR))
+(GLOBAL INTERNAL fib.stk-key I32 (I32 0))
+(GLOBAL INTERNAL fib.stk (ARRAY 4096 I64) (ZEROINITIALIZER (ARRAY 4096 I64)))
 ;; The room left under the limit for what runs unchecked after a check: 256 KiB (docs/design/stack-check.md 4). A stack under 1 MiB keeps a quarter of it.
-(global internal fib.stk-margin i64 (i64 262144))
+(GLOBAL INTERNAL fib.stk-margin I64 (I64 262144))
 
 ;; The key's destructor is `fib.stk-dtor` in a library (compiled code that outlives its threads) and libc's `free` otherwise: the program of `fibc run` is JIT code that is freed
 ;; while the compiler's own threads, which ran it, are still alive, and a destructor pointing into freed code crashed them at their exit (found by the tsan gate stages: the
 ;; compiler built under FIB_LIVE=1). Without the destructor a thread that ends clears its words in fib.guard-leave (fib.stk-leave).
 ;; 0: the key is not made, 1: a thread is making it, 2: made. The first slow call of any thread makes it (a program that never checks never does), the others wait.
-(global internal fib.stk-ready i32 (i32 0))
-(define internal (fib.stk-init void) ()
-  (block entry (br again))
-  (block again
-    (br (icmp eq (atomic-load acquire i32 @fib.stk-ready) (i32 2)) done try))
-  (block try
-    (let ((r (cmpxchg acquire monotonic @fib.stk-ready (i32 0) (i32 1))))
-      (br (extractvalue r 1) make wait)))
-  (block make
-    (call @pthread_key_create @fib.stk-key (select (icmp ne (atomic-load acquire i32 @fib.lib-state) (i32 0)) @fib.stk-dtor @free))
-    (atomic-store release (i32 2) @fib.stk-ready)
-    (br done))
-  (block wait
-    (call @sched_yield)
-    (br again))
-  (block done (ret)))
+(GLOBAL INTERNAL fib.stk-ready I32 (I32 0))
+(DEFINE INTERNAL (fib.stk-init VOID) ()
+  (BLOCK entry (BR again))
+  (BLOCK again
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GLOBAL fib.stk-ready)) (I32 2)) done try))
+  (BLOCK try
+    (LET ((r (CMPXCHG ACQUIRE MONOTONIC (GLOBAL fib.stk-ready) (I32 0) (I32 1))))
+      (BR (EXTRACTVALUE r 1) make wait)))
+  (BLOCK make
+    (CALL (GLOBAL pthread_key_create) (GLOBAL fib.stk-key) (SELECT (ICMP NE (ATOMIC-LOAD ACQUIRE I32 (GLOBAL fib.lib-state)) (I32 0)) (GLOBAL fib.stk-dtor) (GLOBAL free)))
+    (ATOMIC-STORE RELEASE (I32 2) (GLOBAL fib.stk-ready))
+    (BR done))
+  (BLOCK wait
+    (CALL (GLOBAL sched_yield))
+    (BR again))
+  (BLOCK done (RET)))
 
 ;; stk-query-begin
 ;; The lowest address and the top of the calling thread's stack, into out[0] and out[1]; false when the system will not say.
-(define internal (fib.stk-query i1) ((ptr out))
-  (block entry
-    (let ((attr (alloca (align 8) i8 (i32 128)))
-          (addr (alloca ptr))
-          (size (alloca i64))
-          (rc (call @pthread_getattr_np (call @pthread_self) attr)))
-      (br (icmp ne rc (i32 0)) fail got)))
-  (block got
-    (let ((rc2 (call @pthread_attr_getstack attr addr size)))
-      (call @pthread_attr_destroy attr)
-      (br (icmp ne rc2 (i32 0)) fail ok)))
-  (block ok
-    (let ((lo (ptrtoint i64 (load ptr addr))))
-      (store lo out)
-      (store (add lo (load i64 size)) (getelementptr i64 out (i64 1)))
-      (ret (i1 1))))
-  (block fail (ret (i1 0))))
+(DEFINE INTERNAL (fib.stk-query I1) ((PTR out))
+  (BLOCK entry
+    (LET ((attr (ALLOCA (ALIGN 8) I8 (I32 128)))
+          (addr (ALLOCA PTR))
+          (size (ALLOCA I64))
+          (rc (CALL (GLOBAL pthread_getattr_np) (CALL (GLOBAL pthread_self)) attr)))
+      (BR (ICMP NE rc (I32 0)) fail got)))
+  (BLOCK got
+    (LET ((rc2 (CALL (GLOBAL pthread_attr_getstack) attr addr size)))
+      (CALL (GLOBAL pthread_attr_destroy) attr)
+      (BR (ICMP NE rc2 (I32 0)) fail ok)))
+  (BLOCK ok
+    (LET ((lo (PTRTOINT I64 (LOAD PTR addr))))
+      (STORE lo out)
+      (STORE (ADD lo (LOAD I64 size)) (GETELEMENTPTR I64 out (I64 1)))
+      (RET (I1 1))))
+  (BLOCK fail (RET (I1 0))))
 ;; stk-query-end
 
 ;; The calling thread's record, made on the first slow call: 4 words, lowest address, top, limit (the lowest stack pointer a check passes), 1 when known.
 ;; Null when there is no memory for one.
-(define internal (fib.stk-record ptr) ()
-  (block entry
-    (call @fib.stk-init)
-    (let ((r (call @pthread_getspecific (load i32 @fib.stk-key))))
-      (br (icmp eq r (ptr null)) make have)))
-  (block have (ret r))
-  (block make
-    (let ((n (call @calloc (i64 1) (i64 32))))
-      (br (icmp eq n (ptr null)) none fill)))
-  (block none (ret (ptr null)))
-  (block fill
-    (br (call @fib.stk-query n) good set))
-  (block good
-    (let ((lo (load i64 n))
-          (sz (sub (load i64 (getelementptr i64 n (i64 1))) lo))
-          (m (load i64 @fib.stk-margin))
-          (m2 (select (icmp ult sz (shl m (i64 2))) (lshr sz (i64 2)) m)))
-      (store (add lo m2) (getelementptr i64 n (i64 2)))
-      (store (i64 1) (getelementptr i64 n (i64 3)))
-      (br set)))
-  (block set
-    (call @pthread_setspecific (load i32 @fib.stk-key) n)
-    (ret n)))
+(DEFINE INTERNAL (fib.stk-record PTR) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.stk-init))
+    (LET ((r (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.stk-key)))))
+      (BR (ICMP EQ r (PTR NULL)) make have)))
+  (BLOCK have (RET r))
+  (BLOCK make
+    (LET ((n (CALL (GLOBAL calloc) (I64 1) (I64 32))))
+      (BR (ICMP EQ n (PTR NULL)) none fill)))
+  (BLOCK none (RET (PTR NULL)))
+  (BLOCK fill
+    (BR (CALL (GLOBAL fib.stk-query) n) good set))
+  (BLOCK good
+    (LET ((lo (LOAD I64 n))
+          (sz (SUB (LOAD I64 (GETELEMENTPTR I64 n (I64 1))) lo))
+          (m (LOAD I64 (GLOBAL fib.stk-margin)))
+          (m2 (SELECT (ICMP ULT sz (SHL m (I64 2))) (LSHR sz (I64 2)) m)))
+      (STORE (ADD lo m2) (GETELEMENTPTR I64 n (I64 2)))
+      (STORE (I64 1) (GETELEMENTPTR I64 n (I64 3)))
+      (BR set)))
+  (BLOCK set
+    (CALL (GLOBAL pthread_setspecific) (LOAD I32 (GLOBAL fib.stk-key)) n)
+    (RET n)))
 
 ;; The prologue's slow path: true when `sp` is below the thread's limit (the trap `stack overflow`), else false, after registering the word of sp's 2 MiB block.
 ;; Not on a stack the record knows (above its top, or 4 MiB under its lowest address: the host switched stacks): false, nothing registered.
-(define internal noinline preservemost (fib.stack-slow i1) ((i64 sp))
-  (block entry
-    (let ((r (call @fib.stk-record)))
-      (br (icmp eq r (ptr null)) no have)))
-  (block no (ret (i1 0)))
-  (block have
-    (br (icmp eq (load i64 (getelementptr i64 r (i64 3))) (i64 0)) no known))
-  (block known
-    (let ((lo (load i64 r))
-          (hi (load i64 (getelementptr i64 r (i64 1))))
-          (lim (load i64 (getelementptr i64 r (i64 2)))))
-      (br (icmp uge sp hi) no below)))
-  (block below
-    (br (icmp ult sp lim) over reg))
-  (block over
-    (ret (icmp uge sp (sub lo (i64 4194304)))))
-  (block reg
-    (let ((bs (shl (lshr sp (i64 21)) (i64 21)))
-          (be (add bs (i64 2097152)))
-          (a (select (icmp ugt lim bs) lim bs))
-          (z (select (icmp ult hi be) hi be))
-          (lop (lshr (add a (i64 4095)) (i64 12)))
-          (hip (lshr z (i64 12))))
-      (br (icmp ugt hip lop) put no)))
-  (block put
-    (atomic-store monotonic (or (shl lop (i64 10)) (sub hip lop))
-                  (getelementptr i64 @fib.stk (and (lshr sp (i64 21)) (i64 4095))))
-    (ret (i1 0))))
+(DEFINE INTERNAL NOINLINE PRESERVE_MOSTCC (fib.stack-slow I1) ((I64 sp))
+  (BLOCK entry
+    (LET ((r (CALL (GLOBAL fib.stk-record))))
+      (BR (ICMP EQ r (PTR NULL)) no have)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK have
+    (BR (ICMP EQ (LOAD I64 (GETELEMENTPTR I64 r (I64 3))) (I64 0)) no known))
+  (BLOCK known
+    (LET ((lo (LOAD I64 r))
+          (hi (LOAD I64 (GETELEMENTPTR I64 r (I64 1))))
+          (lim (LOAD I64 (GETELEMENTPTR I64 r (I64 2)))))
+      (BR (ICMP UGE sp hi) no below)))
+  (BLOCK below
+    (BR (ICMP ULT sp lim) over reg))
+  (BLOCK over
+    (RET (ICMP UGE sp (SUB lo (I64 4194304)))))
+  (BLOCK reg
+    (LET ((bs (SHL (LSHR sp (I64 21)) (I64 21)))
+          (be (ADD bs (I64 2097152)))
+          (a (SELECT (ICMP UGT lim bs) lim bs))
+          (z (SELECT (ICMP ULT hi be) hi be))
+          (lop (LSHR (ADD a (I64 4095)) (I64 12)))
+          (hip (LSHR z (I64 12))))
+      (BR (ICMP UGT hip lop) put no)))
+  (BLOCK put
+    (ATOMIC-STORE MONOTONIC (OR (SHL lop (I64 10)) (SUB hip lop))
+                  (GETELEMENTPTR I64 (GLOBAL fib.stk) (AND (LSHR sp (I64 21)) (I64 4095))))
+    (RET (I1 0))))
 
 ;; The words of the blocks of the record's stack that still describe it are cleared.
-(define internal (fib.stk-clear void) ((ptr r))
-  (block entry
-    (br (icmp eq (load i64 (getelementptr i64 r (i64 3))) (i64 0)) done clear))
-  (block clear
-    (let ((lo (load i64 r))
-          (hi (load i64 (getelementptr i64 r (i64 1))))
-          (b0 (lshr lo (i64 21))))
-      (br loop)))
-  (block loop
-    (let ((b (phi i64 (clear b0) (next b2)))
-          (slot (getelementptr i64 @fib.stk (and b (i64 4095))))
-          (w (atomic-load monotonic i64 slot))
-          (page (lshr w (i64 10))))
-      (br (and (icmp ne w (i64 0)) (and (icmp uge page (lshr lo (i64 12))) (icmp ult page (lshr hi (i64 12))))) wipe next)))
-  (block wipe
-    (let ((_c (cmpxchg monotonic monotonic slot w (i64 0))))
-      (br next)))
-  (block next
-    (let ((b2 (add b (i64 1))))
-      (br (icmp ule (shl b2 (i64 21)) (sub hi (i64 1))) loop done)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.stk-clear VOID) ((PTR r))
+  (BLOCK entry
+    (BR (ICMP EQ (LOAD I64 (GETELEMENTPTR I64 r (I64 3))) (I64 0)) done clear))
+  (BLOCK clear
+    (LET ((lo (LOAD I64 r))
+          (hi (LOAD I64 (GETELEMENTPTR I64 r (I64 1))))
+          (b0 (LSHR lo (I64 21))))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((b (PHI I64 (clear b0) (next b2)))
+          (slot (GETELEMENTPTR I64 (GLOBAL fib.stk) (AND b (I64 4095))))
+          (w (ATOMIC-LOAD MONOTONIC I64 slot))
+          (page (LSHR w (I64 10))))
+      (BR (AND (ICMP NE w (I64 0)) (AND (ICMP UGE page (LSHR lo (I64 12))) (ICMP ULT page (LSHR hi (I64 12))))) wipe next)))
+  (BLOCK wipe
+    (LET ((_c (CMPXCHG MONOTONIC MONOTONIC slot w (I64 0))))
+      (BR next)))
+  (BLOCK next
+    (LET ((b2 (ADD b (I64 1))))
+      (BR (ICMP ULE (SHL b2 (I64 21)) (SUB hi (I64 1))) loop done)))
+  (BLOCK done (RET)))
 
 ;; A thread of the runtime ends its work (fib.guard-leave): its words are cleared at once, in code that is certainly still there.
-(define internal (fib.stk-leave void) ()
-  (block entry (br (icmp eq (atomic-load acquire i32 @fib.stk-ready) (i32 2)) look done))
-  (block look
-    (let ((r (call @pthread_getspecific (load i32 @fib.stk-key))))
-      (br (icmp eq r (ptr null)) done go)))
-  (block go (call @fib.stk-clear r) (ret))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.stk-leave VOID) ()
+  (BLOCK entry (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GLOBAL fib.stk-ready)) (I32 2)) look done))
+  (BLOCK look
+    (LET ((r (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.stk-key)))))
+      (BR (ICMP EQ r (PTR NULL)) done go)))
+  (BLOCK go (CALL (GLOBAL fib.stk-clear) r) (RET))
+  (BLOCK done (RET)))
 
 ;; A thread the runtime did not start ends (the key's destructor, a library only: see fib.stk-init): its words are cleared and the record freed.
-(define internal (fib.stk-dtor void) ((ptr r))
-  (block entry (call @fib.stk-clear r) (call @free r) (ret)))
+(DEFINE INTERNAL (fib.stk-dtor VOID) ((PTR r))
+  (BLOCK entry (CALL (GLOBAL fib.stk-clear) r) (CALL (GLOBAL free) r) (RET)))
 ;; guard-end

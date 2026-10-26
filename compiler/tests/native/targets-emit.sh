@@ -44,7 +44,7 @@ for t in $triples x86_64-unknown-linux-gnu aarch64-apple-darwin aarch64-unknown-
   [ -n "$(col "$t" triple)" ] || no "the table has no row $t"
 done
 [ $bad -eq 0 ] && ok "the table has a row for each of the $(($(wc -l < "$T/table") - 1)) targets"
-rt_decls() { grep -ho '^(declare [^ ]*' rt/*.lir | awk '{print $2}' | sort -u; }
+rt_decls() { grep -ho '^(DECLARE [^ ]*' rt/*.lir | awk '{print $2}' | sort -u; }
 table_fns() { sed -n '/(defun runtime-c-functions/,/^$/p' compiler/lir/targets.fib | grep -o '"[^"]*"' | tr -d '"' | sort -u; }
 if diff <(rt_decls) <(table_fns) > "$T/d"; then ok "runtime-c-functions is exactly the $(rt_decls | wc -l) declares of rt/*.lir"; else no "runtime-c-functions and rt/*.lir differ: $(tr '\n' ' ' < "$T/d")"; fi
 

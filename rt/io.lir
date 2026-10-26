@@ -1,62 +1,62 @@
 ;; fib.rt, the program's surroundings (syntax §4.3, M5): the command
 ;; line main received, and whole files as strings through the C
 ;; library's stdio; the interpreter's eval/io.rs gives the same results.
-(declare fopen ptr (ptr ptr))
-(declare fclose i32 (ptr))
-(declare fread i64 (ptr i64 i64 ptr))
-(declare fwrite i64 (ptr i64 i64 ptr))
-(declare ferror i32 (ptr))
-(declare realloc ptr (ptr i64))
-(global internal fib.argc i32 (i32 0))
-(global internal fib.argv ptr (ptr null))
+(DECLARE fopen PTR (PTR PTR))
+(DECLARE fclose I32 (PTR))
+(DECLARE fread I64 (PTR I64 I64 PTR))
+(DECLARE fwrite I64 (PTR I64 I64 PTR))
+(DECLARE ferror I32 (PTR))
+(DECLARE realloc PTR (PTR I64))
+(GLOBAL INTERNAL fib.argc I32 (I32 0))
+(GLOBAL INTERNAL fib.argv PTR (PTR NULL))
 
 ;; From main: the command line, whose arguments after the program are
 ;; (args).
-(define internal (fib.set-args void) ((i32 argc) (ptr argv))
-  (block entry
-    (store argc @fib.argc)
-    (store argv @fib.argv)
-    (ret)))
+(DEFINE INTERNAL (fib.set-args VOID) ((I32 argc) (PTR argv))
+  (BLOCK entry
+    (STORE argc (GLOBAL fib.argc))
+    (STORE argv (GLOBAL fib.argv))
+    (RET)))
 
-(define internal (fib.args-count i64) ()
-  (block entry
-    (let ((n (sext i64 (load i32 @fib.argc))))
-      (ret (select (icmp slt n (i64 1)) (i64 0) (sub n (i64 1)))))))
+(DEFINE INTERNAL (fib.args-count I64) ()
+  (BLOCK entry
+    (LET ((n (SEXT I64 (LOAD I32 (GLOBAL fib.argc)))))
+      (RET (SELECT (ICMP SLT n (I64 1)) (I64 0) (SUB n (I64 1)))))))
 
 ;; Fills buf with a fresh str (count 1) per argument after the program.
 ;; An argument need not be UTF-8: each invalid sequence in it becomes
 ;; U+FFFD (syntax §4.3), as the interpreter's command line makes it.
-(define internal (fib.args-fill void) ((ptr buf))
-  (block entry
-    (let ((n (call @fib.args-count)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (next i2))))
-      (br (icmp slt i n) one done)))
-  (block one
-    (let ((c (load ptr (getelementptr ptr (load ptr @fib.argv) (add i (i64 1)))))
-          (s (call @fib.str-from-lossy c (call @strlen c))))
-      (store s (getelementptr ptr buf i))
-      (br next)))
-  (block next (let ((i2 (add i (i64 1)))) (br loop)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.args-fill VOID) ((PTR buf))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.args-count))))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (next i2))))
+      (BR (ICMP SLT i n) one done)))
+  (BLOCK one
+    (LET ((c (LOAD PTR (GETELEMENTPTR PTR (LOAD PTR (GLOBAL fib.argv)) (ADD i (I64 1)))))
+          (s (CALL (GLOBAL fib.str-from-lossy) c (CALL (GLOBAL strlen) c))))
+      (STORE s (GETELEMENTPTR PTR buf i))
+      (BR next)))
+  (BLOCK next (LET ((i2 (ADD i (I64 1)))) (BR loop)))
+  (BLOCK done (RET)))
 
 ;; Releases the strs the builder copied out of buf (its own counts).
-(define internal (fib.args-release void) ((ptr buf) (i64 n))
-  (block entry (br loop))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (next i2))))
-      (br (icmp slt i n) one done)))
-  (block one (call @fib.release (load ptr (getelementptr ptr buf i))) (br next))
-  (block next (let ((i2 (add i (i64 1)))) (br loop)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.args-release VOID) ((PTR buf) (I64 n))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (next i2))))
+      (BR (ICMP SLT i n) one done)))
+  (BLOCK one (CALL (GLOBAL fib.release) (LOAD PTR (GETELEMENTPTR PTR buf i))) (BR next))
+  (BLOCK next (LET ((i2 (ADD i (I64 1)))) (BR loop)))
+  (BLOCK done (RET)))
 
 ;; Whether path names a file at all: fopen reads its name as a C string,
 ;; so a NUL inside the str would silently name the file before it. The
 ;; interpreter's std::fs refuses such a name.
-(define internal (fib.path-ok i1) ((ptr path))
-  (block entry
-    (ret (icmp eq (call @strlen (call @fib.str-bytes-ptr path)) (call @fib.str-len path)))))
+(DEFINE INTERNAL (fib.path-ok I1) ((PTR path))
+  (BLOCK entry
+    (RET (ICMP EQ (CALL (GLOBAL strlen) (CALL (GLOBAL fib.str-bytes-ptr) path)) (CALL (GLOBAL fib.str-len) path)))))
 
 ;; (read-file path): the whole file as a str, or null when the path
 ;; cannot be opened, cannot be read to its end, or is not UTF-8. A
@@ -65,49 +65,49 @@
 ;; the file only when ferror says it was not an error. (A size from
 ;; fseek and ftell is no help: lseek says LONG_MAX for a directory on
 ;; ext4 and fails on a /proc file, whose text the interpreter does read.)
-(define internal (fib.read-file ptr) ((ptr path))
-  (block entry (br (call @fib.path-ok path) open none))
-  (block none (ret (ptr null)))
-  (block open
-    (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "rb"))))
-      (br (icmp eq f (ptr null)) none opened)))
-  (block opened
-    (let ((b0 (call @malloc (i64 4096))))
-      (br (icmp eq b0 (ptr null)) nomem loop)))
-  (block nomem (call @fclose f) (ret (ptr null)))
-  (block loop
-    (let ((buf (phi ptr (opened b0) (grown b1)))
-          (len (phi i64 (opened (i64 0)) (grown len2)))
-          (cap (phi i64 (opened (i64 4096)) (grown cap2)))
-          (room (sub cap len))
-          (got (call @fread (getelementptr i8 buf len) (i64 1) room f))
-          (len2 (add len got)))
-      (br (icmp eq got room) grow done)))
-  (block grow
-    (let ((cap2 (mul cap (i64 2)))
-          (b1 (call @realloc buf cap2)))
-      (br (icmp eq b1 (ptr null)) nomem2 grown)))
-  (block nomem2 (call @free buf) (call @fclose f) (ret (ptr null)))
-  (block grown (br loop))
-  (block done
-    (let ((bad (call @ferror f)))
-      (call @fclose f)
-      (br (and (icmp eq bad (i32 0)) (call @fib.utf8-valid buf len2)) ok fail)))
-  (block ok
-    (let ((s (call @fib.str-from-bytes buf len2)))
-      (call @free buf)
-      (ret s)))
-  (block fail (call @free buf) (ret (ptr null))))
+(DEFINE INTERNAL (fib.read-file PTR) ((PTR path))
+  (BLOCK entry (BR (CALL (GLOBAL fib.path-ok) path) open none))
+  (BLOCK none (RET (PTR NULL)))
+  (BLOCK open
+    (LET ((f (CALL (GLOBAL fopen) (CALL (GLOBAL fib.str-bytes-ptr) path) (STRING "rb"))))
+      (BR (ICMP EQ f (PTR NULL)) none opened)))
+  (BLOCK opened
+    (LET ((b0 (CALL (GLOBAL malloc) (I64 4096))))
+      (BR (ICMP EQ b0 (PTR NULL)) nomem loop)))
+  (BLOCK nomem (CALL (GLOBAL fclose) f) (RET (PTR NULL)))
+  (BLOCK loop
+    (LET ((buf (PHI PTR (opened b0) (grown b1)))
+          (len (PHI I64 (opened (I64 0)) (grown len2)))
+          (cap (PHI I64 (opened (I64 4096)) (grown cap2)))
+          (room (SUB cap len))
+          (got (CALL (GLOBAL fread) (GETELEMENTPTR I8 buf len) (I64 1) room f))
+          (len2 (ADD len got)))
+      (BR (ICMP EQ got room) grow done)))
+  (BLOCK grow
+    (LET ((cap2 (MUL cap (I64 2)))
+          (b1 (CALL (GLOBAL realloc) buf cap2)))
+      (BR (ICMP EQ b1 (PTR NULL)) nomem2 grown)))
+  (BLOCK nomem2 (CALL (GLOBAL free) buf) (CALL (GLOBAL fclose) f) (RET (PTR NULL)))
+  (BLOCK grown (BR loop))
+  (BLOCK done
+    (LET ((bad (CALL (GLOBAL ferror) f)))
+      (CALL (GLOBAL fclose) f)
+      (BR (AND (ICMP EQ bad (I32 0)) (CALL (GLOBAL fib.utf8-valid) buf len2)) ok fail)))
+  (BLOCK ok
+    (LET ((s (CALL (GLOBAL fib.str-from-bytes) buf len2)))
+      (CALL (GLOBAL free) buf)
+      (RET s)))
+  (BLOCK fail (CALL (GLOBAL free) buf) (RET (PTR NULL))))
 
 ;; (write-file path text): whether the whole text was written.
-(define internal (fib.write-file i1) ((ptr path) (ptr text))
-  (block entry (br (call @fib.path-ok path) open no))
-  (block open
-    (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "wb"))))
-      (br (icmp eq f (ptr null)) no opened)))
-  (block no (ret (i1 0)))
-  (block opened
-    (let ((n (call @fib.str-len text))
-          (w (call @fwrite (call @fib.str-bytes-ptr text) (i64 1) n f))
-          (c (call @fclose f)))
-      (ret (and (icmp eq w n) (icmp eq c (i32 0)))))))
+(DEFINE INTERNAL (fib.write-file I1) ((PTR path) (PTR text))
+  (BLOCK entry (BR (CALL (GLOBAL fib.path-ok) path) open no))
+  (BLOCK open
+    (LET ((f (CALL (GLOBAL fopen) (CALL (GLOBAL fib.str-bytes-ptr) path) (STRING "wb"))))
+      (BR (ICMP EQ f (PTR NULL)) no opened)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK opened
+    (LET ((n (CALL (GLOBAL fib.str-len) text))
+          (w (CALL (GLOBAL fwrite) (CALL (GLOBAL fib.str-bytes-ptr) text) (I64 1) n f))
+          (c (CALL (GLOBAL fclose) f)))
+      (RET (AND (ICMP EQ w n) (ICMP EQ c (I32 0)))))))

@@ -43,8 +43,8 @@ runtime and the design in agreement.
     ((some t) (if (some? (str-find t needle 0)) [(Finding path 0 (str "names " needle ": the case is listed among those that do not pass"))] []))))
 
 (rule "the runtime's default decay is one second, in the initial value and in the environment's default"
-  (into (must-contain repo "rt/alloc.lir" "(global internal fib.lc-decay i64 (i64 1000000000))")
-        (into (must-contain repo "rt/alloc.lir" "(call @fib.lc-env-int (string \"FIB_ALLOC_DECAY_MS\") (i64 1000))")
+  (into (must-contain repo "rt/alloc.lir" "(GLOBAL INTERNAL fib.lc-decay I64 (I64 1000000000))")
+        (into (must-contain repo "rt/alloc.lir" "(CALL (GLOBAL fib.lc-env-int) (STRING \"FIB_ALLOC_DECAY_MS\") (I64 1000))")
               (must-contain repo "docs/design/allocator.md" "(default **1000**)")))
   (plant-file "rt/alloc.lir" ";; empty\n"))
 
