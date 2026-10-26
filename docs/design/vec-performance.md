@@ -88,7 +88,7 @@ Suspect (b), `nth`/`assoc` on a unique scalar Vec: **true, and it is not copying
 |---|---|---|
 | (A) updates that are not in place (copies) | `assoc` 0 allocations; background phase allocates 27k objects for 422k pixels; no array-slice in the path | **~0** for `assoc`. `conj`'s leaf push allocates a shell and a new tail per 32 elements and the path nodes it cannot reuse (9.3 objects per leaf at 100 000, +1 per decade): about 0.29 objects per `conj` against 0 for `array-push!` |
 | (B) trie walk and ownership protocol per `nth`/`assoc`/`conj` even when unique | `nth` 3.4 ns (5 levels at 4.2 M, each a dependent load pair, no retain/release in `vnode-get`) against 0.4 to 1 ns; `assoc` 20 ns = about 4 ns a level in the optimised build, 70 ns in the partitioned build; `conj` 11.5 ns against 2.6 | **nth ~42%** (~64 `nth` a pixel over the three phases x 2.4 ns excess), **conj/assoc/mapv builders ~30%** |
-| (C) boxed or heap-object scalars | `(Array i64)` is a `%struct.fib.array.i64`, `Vec i8` is a packed byte array; RSS is +30% (205 against 157 MB), the shells and tails | **0** |
+| (C) boxed or heap-object scalars | `(Array i64)` is a `(STRUCT fib.array.i64)`, `Vec i8` is a packed byte array; RSS is +30% (205 against 157 MB), the shells and tails | **0** |
 | (D) unfused small sequences | closures and recipes: ~2 allocations a pixel in the blur (82k + 324k objects on 422k pixels) | ~15%, in the cutter only the closure per `sum`/`around?` call |
 | (E) other | float math, `rem`/`quot`, the loop | rest |
 

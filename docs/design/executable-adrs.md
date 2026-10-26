@@ -462,7 +462,7 @@ with the private runner; `fibc test` adds a child process and the JSON `files` a
 ### 9.3 Each pilot made to fail by a real change, then not (`compiler/tests/adr/run.sh`, check 3)
 
 A scratch copy of the tree (never the tree) with one change for each ADR: `cargo build --release` appended to `scripts/gate.sh` (0002), a
-`(call @fib.fail-task t b n)` line in `rt/str.lir` (0001), a new `compiler/emit/zz.fib` defining `splat` (0003), a function using `native-lanes` and
+`(CALL (GLOBAL fib.fail-task) t b n)` line in `rt/str.lir` (0001), a new `compiler/emit/zz.fib` defining `splat` (0003), a function using `native-lanes` and
 `simd/fma` in `lib/fib/tensor/linalg.fib` (0004), an empty `scripts/compare-interp.sh` (0005), a 601-line `compiler/emit/zz2.fib` (0006), a
 newer record `rmw-window/array 2.5` (0007):
 
@@ -477,7 +477,7 @@ ADR   status              blocks  pass  fail  title
 0007  violated            2       6     1     Windows run within 1.3x of the array loop
 
 0001 violated:
-  b0001-02: fail: fib.fail-task is called by the trap path in rt/core.lir and by nothing else -> no violations: ... got rt/str.lir:608: (call @fib.fail-task t b n)
+  b0001-02: fail: fib.fail-task is called by the trap path in rt/core.lir and by nothing else -> no violations: ... got rt/str.lir:608: (CALL (GLOBAL fib.fail-task) t b n)
 0002 violated:
   b0002-01: fail: the gate does not call cargo or name crates/ -> no violations: ... got scripts/gate.sh:120: cargo build --release
 0003 violated:

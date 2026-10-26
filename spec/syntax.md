@@ -1249,14 +1249,14 @@ time through a preloaded library (`crates/fibref/tests/run_io.rs`,
 (unsafe .. (lir [name: type ..] -> type "body") ..)
 ```
 
-A function whose body is lIR text, defined where it is written and called there with the variables of the operand names. `(lir [p: ptr v: i64] -> unit "(block entry (atomic-store release v p) (ret))")`
+A function whose body is lIR text, defined where it is written and called there with the variables of the operand names. `(lir [p: ptr v: i64] -> unit "(BLOCK entry (ATOMIC-STORE RELEASE v p) (RET))")`
 is a call of a function of two parameters `p` and `v` (their types as written, the variables of those names read in the surrounding scope), whose body is the blocks of the string, as the blocks
 of a `define` (spec/lir.md §4, §5), and whose result is the type after `->`.
 
 * **A hoop on purpose.** Like an `extern`'s, the operands and the result are scalars (`bool`, the integer and float types, `char`), `ptr` or `unit` (`extern positions are scalars, ptr or
   unit`), so no object, and no count, crosses into the lIR; and the form is allowed only lexically inside `unsafe` (`lir may only be used inside unsafe`). To ownership it is a call of an extern:
   scalar in, scalar out, never elided or reordered. What the lIR does is its author's, and `fibc explain unsafe` lists every such site of a program.
-* **Checked at once.** The body is parsed and checked as lIR when the form is lowered, in a function `(define inline internal (NAME R) ((T p) ..) BODY)` with the operands as parameters: a
+* **Checked at once.** The body is parsed and checked as lIR when the form is lowered, in a function `(DEFINE ALWAYSINLINE INTERNAL (NAME R) ((T p) ..) BODY)` with the operands as parameters: a
   fault is a type error at the form with the checker's text and the line and column inside the string (`lir body, line 1 column 19: atomic-load cannot have ordering release`). A body may not call
   a function (the module has none but its own parameters to name).
 * **Inlined.** The function is `inline` (spec/lir.md §4.3), so a call of it is code in its caller, also when the build is partitioned into units (the partitioner copies an `inline` function into

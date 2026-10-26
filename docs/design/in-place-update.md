@@ -85,7 +85,7 @@ x is a pattern variable bound to field f of owning scrutinee o, consumed at its 
 ```
 
 `o` stays alive until its scope exit and is released there (`fib.release` and every `drop.N` already tolerate a null
-child: `fib.release` starts `(br (icmp eq p (ptr null)) done check)`). Other variables derived of `o` stay valid because the
+child: `fib.release` starts `(BR (ICMP EQ p (PTR NULL)) done check)`). Other variables derived of `o` stay valid because the
 shell is not freed early. If `o` is shared, behaviour is exactly today's. If `o` is unique but the field has count 2
 (another version shares the tail), `t` has count 2 and the next update copies it: still persistent. Cost in the shared
 case: one flag/count test. **Static side condition (the only soundness obligation of the whole design):** after the steal

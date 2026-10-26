@@ -36,8 +36,8 @@ where the rule cannot see it. The platform layer provides the call (`fib.os.time
 (rule "in the library, the lir form is written only in lib/fib/atomic.fib"
   (allowing (lir-uses repo ["lib/**.fib" "scripts/**.fib" "editors/**.fib"])
             ["lib/fib/atomic.fib:lir"])
-  (plant "lib/fib/json/buffer.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(block entry (ret (atomic-load acquire i64 p)))\")))\n")
-  (plant "lib/fib/tensor/storage.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(block entry (ret (atomic-load acquire i64 p)))\")))\n"))
+  (plant "lib/fib/json/buffer.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))\")))\n")
+  (plant "lib/fib/tensor/storage.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))\")))\n"))
 
 (rule "the form is in the spec and a case checks each part of it"
   (into (must-contain repo "spec/syntax.md" "### 3.15a `lir`")

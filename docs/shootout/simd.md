@@ -124,7 +124,7 @@ evidence per kernel.
    vector. The SoA formulation of the design (ten pairs in three vectors, `vsqrtpd`, `vdivpd`) is not expressible, and that
    formulation is where n-body would get close to 4x. A left-to-right (ordered) `hsum` variant, or `lane` shuffles, would also
    avoid the extract.
-5. **Masks: no mask-to-bits and a poor register form.** mandelbrot's mask is an `<8 x i1>`; per iteration LLVM turns the two `ymm`
+5. **Masks: no mask-to-bits and a poor register form.** mandelbrot's mask is an `(VECTOR 8 I1)`; per iteration LLVM turns the two `ymm`
    compare results (`vcmplepd`) into one i1 vector with `vpackssdw`, `vextracti128`, `vpackssdw`, `vpshufd`, then `vpand` with the
    live mask, then `vpsllw`, `vpacksswb`, `vpmovmskb` and a test for `simd/any`: 9 instructions beside about 20 floating-point
    ones of the iteration. With the mask kept in 64-bit-lane form, `any` would be one `vtestpd`/`vmovmskpd`. The output byte
@@ -138,7 +138,7 @@ evidence per kernel.
    would remove it; this is not SIMD-specific.
 7. **Boxed records.** The scalar n-body builds a `Six` per pair (one of the differences to the SIMD one, which
    returns nothing and writes both velocities in place; not isolated by an experiment). The SIMD program avoids it by structure; any kernel that returns
-   several vectors from a helper would build a record (a vector in a record field is an `[k x i64]` object field, spec 1.9). The
+   several vectors from a helper would build a record (a vector in a record field is an `(ARRAY k I64)` object field, spec 1.9). The
    `Pair f64x4 f64x4` return of an early draft of the matmul micro-kernel was dropped for this reason (it would allocate).
 8. **`:native` lane counts could not be used.** There is no lane-index vector (`iota`) and no `native-lanes`, so every program fixes
    `f64x4` or `f64x8`. `f64x8` on AVX2 is two `ymm` (mandelbrot gets its ILP that way) and on `x86-64` four `xmm`; a

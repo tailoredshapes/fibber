@@ -45,17 +45,17 @@ An `extern` to a library of one's own is also not what `docs/adr/0011` allows ou
 
 ```
 (defun load-acquire-i64 (p: ptr) -> i64
-  (unsafe (lir [p] -> i64 "(block entry (ret (atomic-load acquire i64 p)))")))
+  (unsafe (lir [p] -> i64 "(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))")))
 
 (defun wait-for (p: ptr want: i64 spins: i64) -> i64            ; a loop is blocks and a phi, as in any lIR
   (unsafe (lir [p want spins] -> i64
-    "(block entry (br look))
-     (block look
-       (let ((s (phi i64 (entry spins) (again s2)))
-             (v (atomic-load acquire i64 p)))
-         (br (icmp sge v want) got again)))
-     (block again (let ((s2 (sub s (i64 1)))) (spin-hint) (br (icmp sle s2 (i64 0)) got look)))
-     (block got (ret v))")))
+    "(BLOCK entry (BR look))
+     (BLOCK look
+       (LET ((s (PHI I64 (entry spins) (again s2)))
+             (v (ATOMIC-LOAD ACQUIRE I64 p)))
+         (BR (ICMP SGE v want) got again)))
+     (BLOCK again (LET ((s2 (SUB s (I64 1)))) (SPIN-HINT) (BR (ICMP SLE s2 (I64 0)) got look)))
+     (BLOCK got (RET v))")))
 ```
 
 ### 3.1 How it is lowered
@@ -81,8 +81,8 @@ Two, both per target, both in lIR (so the form needs no special case):
 
 | form | meaning |
 |---|---|
-| `(spin-hint)` | `void`: x86-64 `pause`, AArch64 `yield` (`hint #1`), RISC-V `pause` (Zihintpause), nothing where the target has none. Emitted as the target's intrinsic, which the reserved `llvm.` names keep out of user lIR |
-| `(cache-line)` | `i64` constant: the **destructive interference size** of the target, the distance two threads' writes must be apart not to share a line. It is not necessarily the cache line the OS reports (the folklore is that Intel's adjacent-line prefetcher doubles it; the first measurement, docs/shootout/cache-line, found **64 enough** between this i7-14700KF's cores for a store-and-load test, and did not test the read-polling case that folklore is about) |
+| `(SPIN-HINT)` | `void`: x86-64 `pause`, AArch64 `yield` (`hint #1`), RISC-V `pause` (Zihintpause), nothing where the target has none. Emitted as the target's intrinsic, which the reserved `llvm.` names keep out of user lIR |
+| `(CACHE-LINE)` | `i64` constant: the **destructive interference size** of the target, the distance two threads' writes must be apart not to share a line. It is not necessarily the cache line the OS reports (the folklore is that Intel's adjacent-line prefetcher doubles it; the first measurement, docs/shootout/cache-line, found **64 enough** between this i7-14700KF's cores for a store-and-load test, and did not test the read-polling case that folklore is about) |
 
 `(cache-line)` is also a fibber builtin of the same name beside `(has-fma)` (types 1.9, `compiler/lir/target.fib`'s `Target` record gets a field), so a macro or a
 `defstruct` padding can use it. The value per target is **measured, not copied**: a false-sharing sweep (two threads, each incrementing its own word, at strides 8 to 256) on
@@ -117,7 +117,7 @@ the report.
 
 | case | verdict |
 |---|---|
-| `(unsafe (lir [p] -> i64 "(block entry (ret (atomic-load acquire i64 p)))"))` | accepted; x86-64 emits a plain load (`compiler/tests/emit`, objdump check); AArch64 `ldar` |
+| `(unsafe (lir [p] -> i64 "(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))"))` | accepted; x86-64 emits a plain load (`compiler/tests/emit`, objdump check); AArch64 `ldar` |
 | `lir` outside `unsafe` | `lir may only be used inside unsafe` |
 | an object operand `(lir [v] ..)` with `v : (Vec i64)` | `lir cannot take an object: v has type (Vec i64)` |
 | a result type that is not a scalar, `ptr` or `unit` | rejected, names the type |
@@ -125,8 +125,8 @@ the report.
 | a body of several blocks and a phi | accepted, runs (the `wait-for` above) |
 | the same site in a generic function at two types | two functions, both run |
 | a loop around a `lir` load does not hoist it | the loop sees a value another thread stores (two-thread case) |
-| `(spin-hint)` on each target | emits `pause` / `yield`; `lair` on a target without one emits nothing and checks |
-| `(cache-line)` | a constant equal to the target's table row; differs across `--target` |
+| `(SPIN-HINT)` on each target | emits `pause` / `yield`; `lair` on a target without one emits nothing and checks |
+| `(CACHE-LINE)` | a constant equal to the target's table row; differs across `--target` |
 | `fibc explain unsafe` | lists every site of a program that has an `extern`, an `unsafe` and a `lir` |
 | a live swap of a `lir` body | the running program takes the new body (`fibc run --live`, then `eval`/`load`) |
 | the acceptance case | `fib-disruptor` with no `.so`, no `build.sh` and no `LD_PRELOAD`: its 23 specs pass under a plain `fibc test`, and `bench/bench.fib` at batch 1024 recovers the inline-arithmetic rate (660 M events/s here, within noise) |
@@ -144,7 +144,7 @@ the report.
 ## 10. Order of work
 
 1. This document accepted (or changed) by the owner.
-2. lIR: `inline` modifier, `(spin-hint)`, `(cache-line)` and the `Target` field with the measured table: spec/lir.md, the checker, lair, cases in `cases/lir`.
+2. lIR: `inline` modifier, `(SPIN-HINT)`, `(CACHE-LINE)` and the `Target` field with the measured table: spec/lir.md, the checker, lair, cases in `cases/lir`.
 3. The `lir` form: syntax.md 3.15, types.md, the parser entry (`lir.parse` from a string with a position offset), `own` (a scalar with effects), `emit` (the site function and the call), cases.
 4. `fib.atomic` and its cases; `fibc explain unsafe`.
 5. fib-disruptor moves onto it; the acceptance case.
@@ -161,7 +161,7 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **A body may not call a function** (there is no way to declare one in it yet): sleeping a thread, `sched_yield` and so on stay in the platform layer.
 * **The partitioner** (compiler/native/liro/partition.fib) copies every `inline` function into every unit that calls it, always (before, copying small functions across units was an opt-in knob,
   `FIB_LIRO_IMPORT`); without it `alwaysinline` cannot inline a call into another unit, which is where the default build splits the program.
-* **`(cache-line)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (lir.targets `cache-line-of-arch`), not per CPU.
+* **`(CACHE-LINE)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (lir.targets `cache-line-of-arch`), not per CPU.
 * **Measured** (fib-disruptor, one producer and one consumer, an i7-14700KF, two runs each): the ring written in fibber over `fib.atomic` runs 550 to 560 M events a second at batch 64 and 1024 and 40 M
   at batch 1; the extern version ranged 25 to 32 M at batch 1 and 270 to 660 M above. Its 24 specs and 13 mutants run under a plain `fibc test`: no shared library, no build script, no `LD_PRELOAD`.
 * **`fibc explain unsafe FILE`** (compiler/types/unsafe.fib) lists every `unsafe` block, `extern` call and `lir` form of the program and its libraries, sorted by place, with the atomics and orderings each `lir` form uses; checked in compiler/tests/driver/cli.sh.
@@ -171,5 +171,5 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **Weak memory, checked on AArch64** (an Apple M1 Ultra, 2026-10-21; details in fib-disruptor's README): the compiled ring has `stlr`/`ldar`; its 26 specs pass there; weakening `publish` to a relaxed store is
   caught 5 runs in 5 on the M1 and 0 in 3 on x86-64; weakening the consumer's `advance` or the producer's read of the consumers' cursors was not caught by anything in 5 runs: those two orderings are shown by the
   memory model and not by a test.
-* **fibber's own cases on AArch64** (the same M1 Ultra, the compiler and `lairf` cross-built for it): `cases/stdlib` 8800 to 8806 and 8810 (8 of 8) and `cases/lir/inline` (8 of 8, `(spin-hint)` becoming `yield` and `(cache-line)` 128) pass.
+* **fibber's own cases on AArch64** (the same M1 Ultra, the compiler and `lairf` cross-built for it): `cases/stdlib` 8800 to 8806 and 8810 (8 of 8) and `cases/lir/inline` (8 of 8, `(SPIN-HINT)` becoming `yield` and `(CACHE-LINE)` 128) pass.
 * **Not built**: a way for a body to declare what it calls (not wanted, above).

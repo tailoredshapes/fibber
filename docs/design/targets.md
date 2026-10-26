@@ -151,7 +151,7 @@ starts at 24 on every target.
 1. **Pointer size computed by hand.** `compiler/emit/layout.fib:111-112` `size-align` says `ptr` and `raw` are 8 bytes and `dyn` is 16. That
    size becomes the runtime's element size (`esize`), and the runtime indexes arrays and vectors by `i*esize`. The sites are:
    * `rt/array.lir:38-40,54-57`;
-   * `rt/vec.lir:42,100,123,133` (`(i64 8)` literal);
+   * `rt/vec.lir:42,100,123,133` (`(I64 8)` literal);
    * `rt/vecbuild.lir:56,78,86`;
    * `rt/core.lir:359,362` (worklist `cap*8`);
    * `compiler/emit/lower/builtins.fib:165,338,429,431`;
@@ -159,7 +159,7 @@ starts at 24 on every target.
    * `compiler/emit/lower/quote.fib:112,117`;
    * `compiler/emit/objects.fib:56-98,138,154`, where obj-size and obj-offsets are summed from `size-align`.
 
-   The compiler's own element access uses a GEP on `[0 x ptr]`, whose stride is 4 on wasm32. **An Array or Vec of objects or `dyn`s is
+   The compiler's own element access uses a GEP on `(ARRAY 0 PTR)`, whose stride is 4 on wasm32. **An Array or Vec of objects or `dyn`s is
    therefore read at two different strides.** The vector trie's child arrays are among them. Most fibber programs touch one.
 2. **`size_t` and `long` declared as `i64`.** These include:
    * `malloc`, `calloc`, `memcpy`, `memcmp`, `write`, `strlen` and `snprintf` in `rt/core.lir:7-17`;
@@ -223,7 +223,7 @@ warn and ignore the CPU. lairf should refuse a module whose CPU belongs to anoth
 * **Both, with C or fastcc and `musttail`.** The verifier rejected 8 of the 10 quick programs: `cannot guarantee tail call due to mismatched
   parameter counts` (or `types`).
 
-The 64-bit assumptions in the list above make no lowering error, because LLVM accepts an `i64` `malloc` argument and an `(i64 8)` element
+The 64-bit assumptions in the list above make no lowering error, because LLVM accepts an `i64` `malloc` argument and an `(I64 8)` element
 size. They are run-time faults and need run-time tests (section 5).
 
 **Small, safe fixes made here.** These are row values instead of constants:
@@ -265,7 +265,7 @@ Results of `targets-emit.sh`, section 7:
 
 | | lIR cases (simd, instr, mapping) | fibber programs | object | data layout, pointer width | instructions |
 |---|---|---|---|---|---|
-| wasm32-wasip1 | 51 of 51 | 103 of 103 | wasm, `\0asm`, node validates | row's, 32 | f64x2.mul/add, f32x4.mul/add; one f64x2.mul per `<2 x double>`; return_call |
+| wasm32-wasip1 | 51 of 51 | 103 of 103 | wasm, `\0asm`, node validates | row's, 32 | f64x2.mul/add, f32x4.mul/add; one f64x2.mul per `(VECTOR 2 DOUBLE)`; return_call |
 | wasm32-unknown-unknown | 51 of 51 | 103 of 103 | wasm, node validates | row's, 32 | (as wasip1) |
 | riscv64-unknown-linux-gnu | 49 of 51 (2 expected: x86 CPU in the module, 3.1) | 103 of 103 | ELF 64-bit RISC-V, RVC, double-float ABI | row's, 64 | fmadd.d, rv64imafdc attribute; with `FIB_TARGET_CPU=spacemit-x60`: vfmul.vv, vfadd.vv, vfmacc |
 
@@ -304,7 +304,7 @@ The plan as it was written:
 | package | what | size |
 |---|---|---|
 | **W1** | Tools (5.6). Link the hello world with wasm-ld and wasi-libc, run it under wasmtime and under node's `node:wasi`, then check `libc-lacks` against wasi-libc's `libc.a` (`llvm-nm`) | S |
-| **W2** | Pointer size from the row. `size-align` takes the pointer width (`LirPtr`/`LirRaw` = pointer-bits/8, `LirDyn` = 2x). Every caller in compiler/emit gets the module's row through `Globals` (where `Target` already lives). `defs/jit.fib` keeps the host row. rt's `(i64 8)` literals become a `fib.ptr-size` constant that emit.rt substitutes per row. Check: `layout-dump` for wasm32 and a case of a Vec of objects run under wasmtime | M |
+| **W2** | Pointer size from the row. `size-align` takes the pointer width (`LirPtr`/`LirRaw` = pointer-bits/8, `LirDyn` = 2x). Every caller in compiler/emit gets the module's row through `Globals` (where `Target` already lives). `defs/jit.fib` keeps the host row. rt's `(I64 8)` literals become a `fib.ptr-size` constant that emit.rt substitutes per row. Check: `layout-dump` for wasm32 and a case of a Vec of objects run under wasmtime | M |
 | **W3** | `size_t` per row. The runtime's `declare`s use a `size` type that emit.rt substitutes per row (`i64` or `i32`), with `trunc` and `zext` at the call sites in rt. The library's `extern`s get the same through a `usize` alias in `fib.os.abi` | M |
 | **W4** | A WASI runtime adaptation in `emit/os.fib` and a `lib/platform/wasi` backend: `AT_FDCWD -2`, the clock through `clock_time_get` or the `_CLOCK_MONOTONIC` address, WASI errno numbers, `madvise` dropped, no `pipe` or `dup` (refused with an error value), executable-path refused | M |
 | **W5** | Single-threaded runtime: `threads = none` makes `spawn` run inline at `deref` (or be refused with a type error the checker gives from the row; the owner chooses), the pool is one worker, `pmap` is `map`, and a task trap is not isolated (exceptions.md mechanism (b), the hidden result, needs no `pthread_exit` and no unwind tables) | M |

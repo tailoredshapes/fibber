@@ -172,10 +172,10 @@ Live-mode emission, for every function `f` of a program module (library bodies s
 most of the code):
 
 ```
-(global live.f.main.handle ptr @f.main.handle.g0)                       ; the slot, generation 0
-(define (f.main.handle R) ((A1 p1) .. (An pn))                           ; the stub: what every caller, vtable and closure constant names
-  (block entry (tailcall (atomic-load acquire ptr @live.f.main.handle) p1 .. pn)))      ; an indirect-tailcall through the loaded address
-(define internal (f.main.handle.g0 R) ((A1 p1) .. (An pn)) ..)           ; the body as the emitter makes it today, renamed
+(GLOBAL live.f.main.handle PTR (GLOBAL f.main.handle.g0))                       ; the slot, generation 0
+(DEFINE (f.main.handle R) ((A1 p1) .. (An pn))                           ; the stub: what every caller, vtable and closure constant names
+  (BLOCK entry (TAILCALL (ATOMIC-LOAD ACQUIRE PTR (GLOBAL live.f.main.handle)) p1 .. pn)))      ; an indirect-tailcall through the loaded address
+(DEFINE INTERNAL (f.main.handle.g0 R) ((A1 p1) .. (An pn)) ..)           ; the body as the emitter makes it today, renamed
 ```
 
 The same for `f.owned` (the all-owned body a closure value jumps into), every specialisation `f.main.handle.$T_` the program instantiated,

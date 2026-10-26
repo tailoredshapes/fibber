@@ -7,36 +7,36 @@ def sub(old, new, count=1):
     global s
     assert s.count(old) >= 1, old
     s = s.replace(old, new, count)
-sub('(global internal fib.tracing i32 (i32 0))',
-    '(global internal fib.tracing i32 (i32 0))\n(global internal fib.task-key i32 (i32 0))\n'
-    '(declare pthread_key_create i32 (ptr ptr))\n(declare pthread_setspecific i32 (i32 ptr))\n'
-    '(declare pthread_getspecific ptr (i32))\n(declare pthread_exit void (ptr))')
-sub('    (call @fib.rq-init)', '    (call @fib.rq-init)\n    (call @pthread_key_create @fib.task-key (ptr null))')
+sub('(GLOBAL INTERNAL fib.tracing I32 (I32 0))',
+    '(GLOBAL INTERNAL fib.tracing I32 (I32 0))\n(GLOBAL INTERNAL fib.task-key I32 (I32 0))\n'
+    '(DECLARE pthread_key_create I32 (PTR PTR))\n(DECLARE pthread_setspecific I32 (I32 PTR))\n'
+    '(DECLARE pthread_getspecific PTR (I32))\n(DECLARE pthread_exit VOID (PTR))')
+sub('    (CALL (GLOBAL fib.rq-init))', '    (CALL (GLOBAL fib.rq-init))\n    (CALL (GLOBAL pthread_key_create) (GLOBAL fib.task-key) (PTR NULL))')
 # every thread entry: remember the task
 import re
-s = re.sub(r'(\(define internal \(fib\.thread\.[^ ]+ ptr\) \(\(ptr task\)\)\n  \(block entry\n)',
-           r'\1    (call @pthread_setspecific (load i32 @fib.task-key) task)\n', s)
-sub('''  (block entry
-    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked plain))
-  (block hooked
-    (call @fib.trap-hooked (ptr null) bytes n)
-    (unreachable))
-  (block plain''', '''  (block entry
-    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked check))
-  (block hooked
-    (call @fib.trap-hooked (ptr null) bytes n)
-    (unreachable))
-  (block check
-    (let ((tk (call @pthread_getspecific (load i32 @fib.task-key))))
-      (br (icmp ne tk (ptr null)) in-task plain)))
-  (block in-task
-    (let ((tk2 (call @pthread_getspecific (load i32 @fib.task-key))))
-      (call @write (i32 2) (string "trap in task: ") (i64 14))
-      (call @write (i32 2) bytes n)
-      (call @write (i32 2) (string "\\n") (i64 1))
-      (call @fib.task-complete tk2)
-      (call @fib.release tk2)
-      (call @pthread_exit (ptr null))
-      (unreachable)))
-  (block plain''')
+s = re.sub(r'(\(DEFINE INTERNAL \(fib\.thread\.[^ ]+ PTR\) \(\(PTR task\)\)\n  \(BLOCK entry\n)',
+           r'\1    (CALL (GLOBAL pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key)) task)\n', s)
+sub('''  (BLOCK entry
+    (BR (ICMP NE (LOAD PTR (GLOBAL fibm.trap-hook)) (PTR NULL)) hooked plain))
+  (BLOCK hooked
+    (CALL (GLOBAL fib.trap-hooked) (PTR NULL) bytes n)
+    (UNREACHABLE))
+  (BLOCK plain''', '''  (BLOCK entry
+    (BR (ICMP NE (LOAD PTR (GLOBAL fibm.trap-hook)) (PTR NULL)) hooked check))
+  (BLOCK hooked
+    (CALL (GLOBAL fib.trap-hooked) (PTR NULL) bytes n)
+    (UNREACHABLE))
+  (BLOCK check
+    (LET ((tk (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.task-key)))))
+      (BR (ICMP NE tk (PTR NULL)) in-task plain)))
+  (BLOCK in-task
+    (LET ((tk2 (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.task-key)))))
+      (CALL (GLOBAL write) (I32 2) (STRING "trap in task: ") (I64 14))
+      (CALL (GLOBAL write) (I32 2) bytes n)
+      (CALL (GLOBAL write) (I32 2) (STRING "\\n") (I64 1))
+      (CALL (GLOBAL fib.task-complete) tk2)
+      (CALL (GLOBAL fib.release) tk2)
+      (CALL (GLOBAL pthread_exit) (PTR NULL))
+      (UNREACHABLE)))
+  (BLOCK plain''')
 open(sys.argv[2], 'w').write(s)

@@ -162,7 +162,7 @@ mangling, where `PROTO` is the protocol's name behind its module's prefix
 protocols `Eq`, `Ord`, `Hash`, `Show`), so that two modules' protocols of
 one name have different symbols (**Proposed**, stdlib design §7 B3); a
 closure body `l.` + the body's name + the literal's
-expression id; an object struct `%struct.o.` + the mangled type; a
+expression id; an object struct `o.` + the mangled type (`(STRUCT o.NAME)` in lIR); a
 string literal `str.N`; the type table `fib.types`; a vtable
 `vt.PROTO.` + head (the same `PROTO`); a runtime function `fib.NAME` as §8 names it.
 

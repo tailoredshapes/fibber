@@ -1250,14 +1250,14 @@ it printed before the parts had names).
 | Section | The part | Source |
 |---|---|---|
 | `runtime` | the ten files `rt/*.lir`, each followed by a line break, in the order core str array vec vecbuild atom thread task weak io | `compile.rs` `RUNTIME` |
-| `externs` | one `(declare ..)` per `extern` the bodies reached, in first-use order, but those the runtime declares itself | `Program::render_externs` |
+| `externs` | one `(DECLARE ..)` per `extern` the bodies reached, in first-use order, but those the runtime declares itself | `Program::render_externs` |
 | `types` | every object struct, the `drop`, `trace` and `share` walkers of every type id, and the type and class tables | `Objects::render` |
-| `statics` | the strings `@str.N` in first-use order, the C strings `@cstr.N` (a trap's message, one constant per text, in first-use order), the immortal closures of named functions and the vtables | `Statics::render` |
+| `statics` | the strings `(GLOBAL str.N)` in first-use order, the C strings `(GLOBAL cstr.N)` (a trap's message, one constant per text, in first-use order), the immortal closures of named functions and the vtables | `Statics::render` |
 | `keywords` | `kw.show`, `kw.hash` and `kw.rank`, only when a body used `show` or `hash` on a keyword | `Program::render_keyword_helpers` |
-| `defs` | the constants `@def.N` of the values of the `def`s, evaluated through the JIT | `defs::emit_defs` |
-| `quotes` | the constants `@q.N` of the quoted forms | `Program::quote_text` |
+| `defs` | the constants `(GLOBAL def.N)` of the values of the `def`s, evaluated through the JIT | `defs::emit_defs` |
+| `quotes` | the constants `(GLOBAL q.N)` of the quoted forms | `Program::quote_text` |
 | `fns` | every function, in the order its body was **finished**, not requested | `Program::funcs` |
-| `main` | the fixed end: `(declare printf ..)` and lIR's `main` | `compile::main_text` |
+| `main` | the fixed end: `(DECLARE printf ..)` and lIR's `main` | `compile::main_text` |
 
 A section may be empty: its header line is there and nothing follows. `keywords`
 is computed before `statics` is rendered because it interns strings, so a port
@@ -1271,7 +1271,7 @@ that renders the statics first prints other numbers.
   body is finished; `str` is type id 0 and `fib.array.i8`, `fib.weakbox` and
   `fib.task` are 1 to 3, interned first; strings and keywords are numbered by
   first use; fresh names are per function. A port that computes a type earlier
-  interns an object earlier and shifts every later `tid` and `@str.N`.
+  interns an object earlier and shifts every later `tid` and `(GLOBAL str.N)`.
 - No position and no address is printed. Nothing iterates a hash table in the
   text: every `HashMap` of the emitter is an index looked up one key at a time.
   A unit test runs a program twice in one process (a hash table gets a new seed
@@ -1308,7 +1308,7 @@ function type is `(fn :local (A..) R)`. `M` is `names::mangle`. `L` is the lIR
 type: `i1 i8 i16 i32 i64 float double`, `ptr` for a counted object pointer,
 `raw` for a program's raw `ptr`, `dyn`, and `void` for `unit`. `C` is the class
 of `mono::class_of`: `scalar`, `ptr`, `opt` (a nullable pointer), `boxed` (an
-`Option` held as a heap enum), `dyn` or `unit`; stage 2's `L` for an `(Option scalar)` is the pair `{ i1 t }` and its `C` is `scalar`; `R` is the mangled name of the
+`Option` held as a heap enum), `dyn` or `unit`; stage 2's `L` for an `(Option scalar)` is the pair `(LITERAL-STRUCT I1 t)` and its `C` is `scalar`; `R` is the mangled name of the
 class's representative type (`mono::representative`). `O` is `-` for a type that
 is no object (a scalar, a `dyn`, `unit`, a null-represented `Option`, a
 function), else `SNAME tid N size S offsets OFFSETS`: the struct name, the type
@@ -1344,50 +1344,50 @@ file with no such macro prints `error NoMacro 0:0 0..0: no macro NAME` and statu
 ```
 == t.fib
 ;; == section statics
-(constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })
-(constant private cstr.0 [29 x i8] ([29 x i8] (i8 105) (i8 110) (i8 116) (i8 101) (i8 103) (i8 101) (i8 114) (i8 32) (i8 111) (i8 118) (i8 101) (i8 114) (i8 102) (i8 108) (i8 111) (i8 119) (i8 32) (i8 105) (i8 110) (i8 32) (i8 43) (i8 32) (i8 97) (i8 116) (i8 32) (i8 105) (i8 54) (i8 52) (i8 0)))
+(CONSTANT INTERNAL str.0 (LITERAL-STRUCT I64 I32 I32 I64 (ARRAY 3 I8)) (LITERAL-STRUCT (I64 0) (I32 0) (I32 8) (I64 2) ((ARRAY 3 I8) (I8 97) (I8 98) (I8 0))))
+(CONSTANT PRIVATE cstr.0 (ARRAY 29 I8) ((ARRAY 29 I8) (I8 105) (I8 110) (I8 116) (I8 101) (I8 103) (I8 101) (I8 114) (I8 32) (I8 111) (I8 118) (I8 101) (I8 114) (I8 102) (I8 108) (I8 111) (I8 119) (I8 32) (I8 105) (I8 110) (I8 32) (I8 43) (I8 32) (I8 97) (I8 116) (I8 32) (I8 105) (I8 54) (I8 52) (I8 0)))
 ;; == section fns
-(define internal tailcc (f.main i64) ()
-  (block entry
-    (let ((t1 (alloca %struct.o.P)))
-      (call @fib.stack-init t1 (i32 4)))
-    (let ((t2 (getelementptr %struct.o.P t1 (i32 0) (i32 3))))
-      (store (i64 4) t2))
-    (let ((t3 (getelementptr %struct.o.P t1 (i32 0) (i32 4))))
-      (store @str.0 t3))
-    (br bound5)
+(DEFINE INTERNAL TAILCC (f.main I64) ()
+  (BLOCK entry
+    (LET ((t1 (ALLOCA (STRUCT o.P))))
+      (CALL (GLOBAL fib.stack-init) t1 (I32 4)))
+    (LET ((t2 (GETELEMENTPTR (STRUCT o.P) t1 (I32 0) (I32 3))))
+      (STORE (I64 4) t2))
+    (LET ((t3 (GETELEMENTPTR (STRUCT o.P) t1 (I32 0) (I32 4))))
+      (STORE (GLOBAL str.0) t3))
+    (BR bound5)
   )
-  (block bound5
-    (let ((t6 (getelementptr %struct.o.P t1 (i32 0) (i32 3)))
-          (t7 (load i64 t6))
-          (t8 (getelementptr %struct.o.P t1 (i32 0) (i32 4)))
-          (t9 (load ptr t8))
-          (t10 (call @fib.str-len t9)))
-      (call @fib.stack-end t1))
-    (call @fib.drop-fields t1)
-    (let ((t11 (sadd-overflow t7 t10))
-          (t12 (extractvalue t11 1)))
-      (br t12 trap13 ok14))
+  (BLOCK bound5
+    (LET ((t6 (GETELEMENTPTR (STRUCT o.P) t1 (I32 0) (I32 3)))
+          (t7 (LOAD I64 t6))
+          (t8 (GETELEMENTPTR (STRUCT o.P) t1 (I32 0) (I32 4)))
+          (t9 (LOAD PTR t8))
+          (t10 (CALL (GLOBAL fib.str-len) t9)))
+      (CALL (GLOBAL fib.stack-end) t1))
+    (CALL (GLOBAL fib.drop-fields) t1)
+    (LET ((t11 (SADD-OVERFLOW t7 t10))
+          (t12 (EXTRACTVALUE t11 1)))
+      (BR t12 trap13 ok14))
   )
-  (block trap13
-    (call @fib.trap-c @cstr.0)
-    (unreachable)
+  (BLOCK trap13
+    (CALL (GLOBAL fib.trap-c) (GLOBAL cstr.0))
+    (UNREACHABLE)
   )
-  (block ok14
-    (let ((t15 (extractvalue t11 0)))
-      (ret t15))
+  (BLOCK ok14
+    (LET ((t15 (EXTRACTVALUE t11 0)))
+      (RET t15))
   ))
 ;; == section main
-(declare printf i32 (ptr ...))
-(define (main i32) ((i32 argc) (ptr argv))
-  (block entry
-    (call @fib.init)
-    (call @fib.set-args argc argv)
-    (let ((r (call @f.main)))
-      (call @fib.join-all)
-      (call @fib.pool-quiesce)
-      (call @printf (string "%lld\n") r)
-      (ret (i32 0)))))
+(DECLARE printf I32 (PTR ...))
+(DEFINE (main I32) ((I32 argc) (PTR argv))
+  (BLOCK entry
+    (CALL (GLOBAL fib.init))
+    (CALL (GLOBAL fib.set-args) argc argv)
+    (LET ((r (CALL (GLOBAL f.main))))
+      (CALL (GLOBAL fib.join-all))
+      (CALL (GLOBAL fib.pool-quiesce))
+      (CALL (GLOBAL printf) (STRING "%lld\n") r)
+      (RET (I32 0)))))
 ```
 
 `fibc emit-dump --layout t.fib` prints about three hundred lines (every type

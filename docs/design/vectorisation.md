@@ -261,7 +261,7 @@ run the loop with plain adds, else the checked loop) is exact and cheap.
 
 Each line: change, files, measured payoff, risk.
 
-1. **Opt-in FP reassociation.** An lIR fast-math flag on `fadd fsub fmul` (`(fadd reassoc a b)`) and a surface form;
+1. **Opt-in FP reassociation.** An lIR fast-math flag on `fadd fsub fmul` (`(FADD REASSOC a b)`) and a surface form;
    files: spec/lir.md 6.1, `compiler/lir/{ast,parse,check}.fib`, `compiler/native/lower/arith.fib` (needs an extern
    for `LLVMSetFastMathFlags` in `compiler/llvm/core.fib`), `crates/lair` and `crates/lir` for the Rust side while it
    exists, `compiler/emit/lower/arith.fib` and the checker/expander for the surface, `lib/fib/seq/consumers.fib` for

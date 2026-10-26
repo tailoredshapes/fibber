@@ -41,7 +41,7 @@ Live (`fib-solid-wt-live/scripts/live-bench.py`'s `Session`, the bolt model, RAN
 
 - Unmodified, 6 of 6 sessions die at the first or second `(summary)` after the attach (`fatal signal 11`).
 - gdb following the fork into the session: thread 2, the attach thread, faults in JITted code at `mov (%rdi),%rdx` with `rdi` = `0x7fff94666d7000`, in the
-  pop of `fib.alloc` (`store (load ptr head) slot`): the head of a free list is garbage. The "fatal signal 11 at 0x1" of the notes is the same pop one step
+  pop of `fib.alloc` (`(STORE (LOAD PTR head) slot)`): the head of a free list is garbage. The "fatal signal 11 at 0x1" of the notes is the same pop one step
   later (a link of 1 is a reference count read as a link).
 - The same sessions with `main` first doing `(join (spawn (fn () 1)))`, which only sets `fib.mt`: **6 of 6 good**, 4 requests each.
 - With `main` blocked in one long sleep instead of its allocating loop (so the program's thread does not allocate during the input): 4 of 4 good. So the

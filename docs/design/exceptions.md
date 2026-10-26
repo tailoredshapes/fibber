@@ -41,9 +41,9 @@ the worktree); copy them there to rerun.
 - types section 2.11 (**Decided**, owner, 2026-09-28): a trap aborts the program, on whichever thread; nothing runs after it; objects live at the abort
   are not leaks; "a trap is not an exception: there is no handler". A case may expect it (`expect: trap`, method.md rule 3).
 - Compiled: `fib.trap-bytes` (`rt/core.lir`) writes `trap: MSG` to fd 2 and calls `abort` (SIGABRT, exit 134). In a macro module it calls a hook instead
-  (`@fibm.trap-hook`, `compiler/macros/runner.fib` `trap-shim`), a second, existing and leaking recovery path that is not general (it fails the expansion
+  (`(GLOBAL fibm.trap-hook)`, `compiler/macros/runner.fib` `trap-shim`), a second, existing and leaking recovery path that is not general (it fails the expansion
   and never returns into compiled code).
-- lIR `(trap)` is `llvm.trap` "without unwinding" (spec/lir.md line 638).
+- lIR `(TRAP)` is `llvm.trap` "without unwinding" (spec/lir.md line 638).
 - A trap on a spawned task ends the process. Ran, with the scratch `F`:
 
 ```
@@ -71,7 +71,7 @@ is emitted by the compiler (`lcx-trap-if`, `lcx-trap-c` in `compiler/emit/lower/
 | stack overflow | **no: not a trap** | it is SIGSEGV on the guard page; there is no code to run, so it can never unwind. Since LANG-2 a `sigaltstack` handler prints `trap: stack overflow` and aborts (status 134, every thread, `try` or not; docs/design/stack.md, cases 8350-8354) |
 | `spawn: cannot start a thread`, `async: cannot start a worker thread` | no: fatal | resource failures of the runtime |
 | memory corruption, use after free, a negative count | no | none of them is detected as a trap; the audit stops the *interpreter* run (`HpErr`), compiled code does not detect them. A catch must never be able to hide an audit error |
-| hardware faults (SIGSEGV, SIGFPE, SIGILL from `(trap)`) | no | lIR `(trap)` stays `llvm.trap`: the path for faults without a message is fatal by definition |
+| hardware faults (SIGSEGV, SIGFPE, SIGILL from `(TRAP)`) | no | lIR `(TRAP)` stays `llvm.trap`: the path for faults without a message is fatal by definition |
 | `unsafe` code that violates its own obligation | no | outside the model |
 
 So the runtime gets two entries: `fib.trap` (recoverable, takes a kind) and `fib.fatal` (today's behaviour). Reclassifying `rt/*.lir` is 5 call sites.
@@ -163,7 +163,7 @@ Frames are unwindable by DWARF today; what is missing is the personality and the
 
 ### 3.1 (a) Landing pads: `invoke` / `landingpad`
 
-**Expressible in lIR today? No.** `grep -n -i 'invoke\|landingpad\|personality\|unwind\|resume' spec/lir.md` finds only the sentence on `(trap)`;
+**Expressible in lIR today? No.** `grep -n -i 'invoke\|landingpad\|personality\|unwind\|resume' spec/lir.md` finds only the sentence on `(TRAP)`;
 `compiler/native` and `compiler/llvm` have no binding of the EH instructions (`grep -rln` over `compiler docs` finds `invoke` only in the call shim comment and in
 `docs/design/lair-in-fibber.md`/`relational-search.md`, unrelated). What lIR lacks: an `invoke` terminator with a normal and an unwind destination, a `landingpad`
 (cleanup/catch clauses), `resume`, a per-function personality, `unwind_table`/`uwtable`, and the checker rules for them (the landing pad's block must
@@ -449,7 +449,7 @@ analysis), the share-marking of the closure's captures walks the reachable docum
 
 1. **Join type (4.1): J1** (`try-join` returns a `Result`; `join` and `@t` rethrow as a trap in the joiner; case 911's program changes to `try-join`) against J2.
 2. **Mechanism: (b)**, with (a) held in reserve if the measured hot-path cost on `quick.sh` is worse than the micro. Reversal of types section 2.11 (the signature of U0) after the library is viable, as stdlib Q35 already says.
-3. **Fatal list** (1.2): OOM, stack overflow, thread-start failures, `(trap)` stay uncatchable.
+3. **Fatal list** (1.2): OOM, stack overflow, thread-start failures, `(TRAP)` stay uncatchable.
 4. **The `&` write-back on unwind** (basic guarantee) as the language rule, and **poisoning** for `cell-update!`.
 5. **Trap in `finally` while unwinding is fatal** in v1.
 6. Do F1 (detach finished threads) now: it is a defect with or without exceptions.
