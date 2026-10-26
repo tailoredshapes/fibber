@@ -514,7 +514,10 @@ program nor exported, and a library may hold it beside `define-macro`.
 **module-macro.** `(MODULE-MACRO NAME)`, Racket's `#%module-begin` as one direction: `NAME` is a macro defined before it with a `...`
 parameter (`module-macro: NAME is not a macro`, `module-macro: NAME takes no ... parameter`); from the form after the direction to the end
 of the module's text the reader collects the top-level forms, read under the readtable and not expanded, directions included (an `import`,
-`define-macro` or `module-macro` written there is data the macro sees); at the end of the text `NAME` is applied to them as its `...`
+`define-macro` or `module-macro` written there is data the macro sees), except `include`, the one direction that acts in the collected
+region: the file is read there under the readtable and its forms are collected in the include's place, each object naming the file it
+was read from, a nested include acting the same way, under include's once and cycle rules (below; `module-include.lir`,
+`module-include-rearm.lir`, `reject-module-include-cycle.lir`); at the end of the text `NAME` is applied to them as its `...`
 argument and its result is one top-level form, expanded as any is, a `begin` splice usually, whose spliced directions then take effect in
 order (`cases/lir/macros/module-count.lir`, `module-splice.lir`); a result that is no top-level form is the parser's error at the direction
 (`reject-module-result.lir`). A library may hold the direction, so a `require-macros` arms it and the text after is the macro's
@@ -527,6 +530,9 @@ Each module of a program (§4.7) has its own.
 top-level form of the module (a direction, a macro use, an item), the objects a macro gets naming `FILE` as their file; once per module
 by canonical path, in the set `require-macros` uses, a file that includes itself being `include: FILE includes itself`; an error in it is
 `include: FILE:L:C: error: ..` at the include (`cases/lir/macros/include.lir`, `reject-include-self.lir`, `reject-include-error.lir`).
+While a module macro is armed, written or spliced, the forms are collected for it rather than taken as top-level forms (module-macro,
+above), so a whole program's files reach one macro: a wrapper that arms the macro and includes them is the program. A diagnostic in the
+macro's result is reported in the module's file, at the line and column the form carries.
 
 A macro that returns null without `fail` is `macro NAME returned no form`; one that returns an object that is not one of the kinds, or a
 list deeper than 512, is `macro NAME returned ..`. The objects live until the module is parsed and are never freed before that; a

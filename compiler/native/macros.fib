@@ -36,13 +36,16 @@
         ((some s) (do (jit/session-free (. s jit))
                       (when (timing/enabled?) (eprintln (str "time lir.macros " (quot @(. env ns) 1000000) " ms"))))))))
 
-;; One top-level form: collected for the module macro once one is armed (spec/lir.md 4.6: read, not expanded, directions included); else a
+;; One top-level form: collected for the module macro once one is armed (spec/lir.md 4.6: read, not expanded, directions included, as an
+;; object naming the file it was read from), except an include, which acts there: the file's forms are collected in its place; else a
 ;; direction (a macro's definition, a library of them, an import, a macro-import, the module macro, an include), a splice, or a form expanded
 ;; and parsed. A macro use is applied first (`top-result`, the children untouched), so that a result that is a splice is seen before
 ;; anything in it is expanded.
 (defun top-form :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
   (match @(. env hook)
-    ((some _) (do (set! (. env collected) (conj @(. env collected) form)) nil))
+    ((some _) (if (= (head-of form) "include")
+                  (include env items importer form)
+                  (do (set! (. env collected) (conj @(. env collected) (obj/to-object form (. env cfile)))) nil)))
     (nil (top-direction env items importer form))))
 
 (defun top-direction :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
@@ -133,10 +136,14 @@
 
 ;; The use `its` (the macro's name first, at `pos`) replaced by what the macro returns.
 (defun apply-macro :private (env: Env m: Macro its: (Vec Sexp) pos: i64) -> (Result Sexp Diagnostic)
-  (let ((n (- (count its) 1)) (t0 (sys-clock-now)))
+  (apply-objects env m (mapv (fn (f: Sexp) (obj/to-object f (. env cfile))) (names/vec-from its 1)) pos))
+
+;; The macro applied to the arguments `objs`, objects already (each naming its own file), at `pos`.
+(defun apply-objects :private (env: Env m: Macro objs: (Vec i64) pos: i64) -> (Result Sexp Diagnostic)
+  (let ((n (count objs)) (t0 (sys-clock-now)))
     (if (or (< n (. m fixed)) (and (not (. m rest)) (> n (. m fixed))))
         (err pos (str "macro " (. m name) " expects " (arity-text m) ", found " n))
-        (let ((r (run-entry env m (argument-objects env m its pos) pos)))
+        (let ((r (run-entry env m (object-arguments m objs pos (. env cfile)) pos)))
           (do (set! (. env ns) (+ @(. env ns) (- (sys-clock-now) t0)))
               (match r
                 ((Err d) (Err d))
@@ -409,7 +416,7 @@
          (do (set! (. env hook) nil)
              (set! (. env collected) [])
              (cond (>= steps max-steps) (some (Diagnostic pos (str "module-macro: " max-steps " module macros in a row")))
-                   :else (match (apply-macro env m (into [(SxAtom (. m name) pos)] forms) pos)
+                   :else (match (apply-objects env m forms pos)
                            ((Err d) (some d))
                            ((Ok r) (match (top-form env items importer r)
                                      ((some d) (some d))
@@ -418,7 +425,7 @@
 ;; ---------------------------------------------------------------- include (spec/lir.md 4.6)
 
 ;; `(include "FILE")`: the file's text read in place under the module's readtable, its forms as if written here (positions name FILE),
-;; once per module by canonical path; a file that includes itself is a cycle.
+;; once per module by canonical path; a file that includes itself is a cycle. With a module macro armed, its forms are collected (`top-form`).
 (defun include :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
   (match form
     ((SxList its pos)
