@@ -15,25 +15,25 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parents[4]
 STATS = re.compile(r"liro: hits=(\d+) misses=(\d+) compiled=(\d+)")
-BASE = """(global g i64 (i64 7))
-(define internal (left i64) () (block entry (ret (add (load i64 @g) (i64 1)))))
-(define internal (right i64) () (block entry (ret (call @left))))
-(define (main i32) () (block entry (ret (trunc i32 (call @right)))))
+BASE = """(GLOBAL g I64 (I64 7))
+(DEFINE INTERNAL (left I64) () (BLOCK entry (RET (ADD (LOAD I64 (GLOBAL g)) (I64 1)))))
+(DEFINE INTERNAL (right I64) () (BLOCK entry (RET (CALL (GLOBAL left)))))
+(DEFINE (main I32) () (BLOCK entry (RET (TRUNC I32 (CALL (GLOBAL right))))))
 """
-INITIALIZERS = """(global shared.value i64 (i64 0))
-(define internal (first void) () (block entry (store (i64 1) @shared.value) (ret)))
-(define internal (second void) () (block entry (store (add (mul (load i64 @shared.value) (i64 10)) (i64 2)) @shared.value) (ret)))
-(define (main i32) () (block entry (call @first) (call @second) (ret (trunc i32 (load i64 @shared.value)))))
+INITIALIZERS = """(GLOBAL shared.value I64 (I64 0))
+(DEFINE INTERNAL (first VOID) () (BLOCK entry (STORE (I64 1) (GLOBAL shared.value)) (RET)))
+(DEFINE INTERNAL (second VOID) () (BLOCK entry (STORE (ADD (MUL (LOAD I64 (GLOBAL shared.value)) (I64 10)) (I64 2)) (GLOBAL shared.value)) (RET)))
+(DEFINE (main I32) () (BLOCK entry (CALL (GLOBAL first)) (CALL (GLOBAL second)) (RET (TRUNC I32 (LOAD I64 (GLOBAL shared.value))))))
 """
-RECURSION = """(define internal (even i64) ((i64 n))
-  (block entry (br (icmp eq n (i64 0)) done recur))
-  (block done (ret (i64 8)))
-  (block recur (ret (call @odd (sub n (i64 1))))))
-(define internal (odd i64) ((i64 n))
-  (block entry (br (icmp eq n (i64 0)) done recur))
-  (block done (ret (i64 9)))
-  (block recur (ret (call @even (sub n (i64 1))))))
-(define (main i32) () (block entry (ret (trunc i32 (call @even (i64 4))))))
+RECURSION = """(DEFINE INTERNAL (even I64) ((I64 n))
+  (BLOCK entry (BR (ICMP EQ n (I64 0)) done recur))
+  (BLOCK done (RET (I64 8)))
+  (BLOCK recur (RET (CALL (GLOBAL odd) (SUB n (I64 1))))))
+(DEFINE INTERNAL (odd I64) ((I64 n))
+  (BLOCK entry (BR (ICMP EQ n (I64 0)) done recur))
+  (BLOCK done (RET (I64 9)))
+  (BLOCK recur (RET (CALL (GLOBAL even) (SUB n (I64 1))))))
+(DEFINE (main I32) () (BLOCK entry (RET (TRUNC I32 (CALL (GLOBAL even) (I64 4))))))
 """
 
 
@@ -104,14 +104,14 @@ def cache_checks(probe, scratch, env):
     warm = run([probe, "build", 2, src, out], env)
     assert counts(warm) == (n, 0, 0), warm.stderr
     assert "time llvm." not in warm.stderr, warm.stderr
-    write(src, BASE.replace("(i64 1)", "(i64 2)"))
+    write(src, BASE.replace("(I64 1)", "(I64 2)"))
     edit = run([probe, "build", 2, src, out], env)
     h, _, compiled = counts(edit)
     assert h > 0 and 0 < compiled < n, edit.stderr
     status(out, env, 9)
-    abi = BASE.replace("(i64 1)", "(i64 2)").replace("(left i64)", "(left i32)")
-    abi = abi.replace("(ret (add (load i64 @g) (i64 2)))", "(ret (trunc i32 (add (load i64 @g) (i64 2))))")
-    abi = abi.replace("(ret (call @left))", "(ret (zext i64 (call @left)))")
+    abi = BASE.replace("(I64 1)", "(I64 2)").replace("(left I64)", "(left I32)")
+    abi = abi.replace("(RET (ADD (LOAD I64 (GLOBAL g)) (I64 2)))", "(RET (TRUNC I32 (ADD (LOAD I64 (GLOBAL g)) (I64 2))))")
+    abi = abi.replace("(RET (CALL (GLOBAL left)))", "(RET (ZEXT I64 (CALL (GLOBAL left))))")
     write(src, abi)
     changed = run([probe, "build", 2, src, out], env)
     assert 0 < counts(changed)[2] < n and counts(changed)[0] > 0, changed.stderr
@@ -122,9 +122,9 @@ def cache_checks(probe, scratch, env):
     warm = run([probe, "build", 2, src, out], env)
     assert counts(warm)[2] == 0, warm.stderr
     status(out, env, 12)
-    for calls, expected in [("(call @second) (call @first)", 1),
-                            ("(call @first) (call @second) (call @second)", 122)]:
-        write(src, INITIALIZERS.replace("(call @first) (call @second)", calls))
+    for calls, expected in [("(CALL (GLOBAL second)) (CALL (GLOBAL first))", 1),
+                            ("(CALL (GLOBAL first)) (CALL (GLOBAL second)) (CALL (GLOBAL second))", 122)]:
+        write(src, INITIALIZERS.replace("(CALL (GLOBAL first)) (CALL (GLOBAL second))", calls))
         changed = run([probe, "build", 2, src, out], env)
         assert counts(changed)[2] > 0, changed.stderr
         status(out, env, expected)
@@ -132,7 +132,7 @@ def cache_checks(probe, scratch, env):
     run([probe, "build", 2, src, out], env)
     status(out, env, 8)
     assert counts(run([probe, "build", 2, src, out], env))[2] == 0
-    write(src, BASE.replace("(i64 1)", "(i64 2)"))
+    write(src, BASE.replace("(I64 1)", "(I64 2)"))
     for field, value in [("FIB_CATCH", "1"), ("FIB_TARGET_CPU", "generic")]:
         changed = run([probe, "build", 2, src, out], dict(env, **{field: value}))
         assert counts(changed)[0] == 0, (field, changed.stderr)
@@ -170,8 +170,8 @@ def artifact_checks(probe, scratch, env):
     copied.write_bytes(b"damaged")
     damaged = run([probe, "link", 2, out, copied], env, ok=False)
     assert damaged.returncode and "corrupted liro object" in damaged.stderr, damaged.stderr
-    helper = write(scratch / "helper.lir", "(define (helper i64) () (block entry (ret (i64 9))))")
-    main = write(scratch / "client.lir", "(declare helper i32 ())\n(define (main i32) () (block entry (ret (call @helper))))")
+    helper = write(scratch / "helper.lir", "(DEFINE (helper I64) () (BLOCK entry (RET (I64 9))))")
+    main = write(scratch / "client.lir", "(DECLARE helper I32 ())\n(DEFINE (main I32) () (BLOCK entry (RET (CALL (GLOBAL helper)))))")
     a, b = scratch / "helper.liro", scratch / "client.liro"
     run([probe, "emit", 2, helper, a], env)
     run([probe, "emit", 2, main, b], env)
@@ -179,14 +179,14 @@ def artifact_checks(probe, scratch, env):
     assert missing.returncode, "linking without helper's owner succeeded"
     incompatible = run([probe, "link", 2, out, a, b], env, ok=False)
     assert incompatible.returncode and "incompatible liro ABI" in incompatible.stderr, incompatible.stderr
-    write(main, main.read_text().replace("helper i32", "helper i64").replace("(ret (call @helper))", "(ret (trunc i32 (call @helper)))"))
+    write(main, main.read_text().replace("helper I32", "helper I64").replace("(RET (CALL (GLOBAL helper)))", "(RET (TRUNC I32 (CALL (GLOBAL helper))))"))
     run([probe, "emit", 2, main, b], env)
     run([probe, "link", 2, out, a, b], env)
     status(out, env, 9)
     native_src = write(scratch / "native.c", "int liro_native_value(void) { return 12; }\n")
     library = scratch / ("libliro_native.dylib" if sys.platform == "darwin" else "libliro_native.so")
     run(["cc", "-dynamiclib" if sys.platform == "darwin" else "-shared", "-fPIC", native_src, "-o", library], env)
-    text = "(dependent-library \"liro_native\")\n(declare liro_native_value i32 ())\n(define (main i32) () (block entry (ret (call @liro_native_value))))"
+    text = "(DEPENDENT-LIBRARY \"liro_native\")\n(DECLARE liro_native_value I32 ())\n(DEFINE (main I32) () (BLOCK entry (RET (CALL (GLOBAL liro_native_value)))))"
     write(src, text)
     run([probe, "emit", 2, src, obj], env)
     metadata = json.loads(Path(str(obj) + ".meta").read_text())
@@ -317,7 +317,7 @@ def parallel_checks(probe, scratch, env):
     assert outs[0] == outs[1] == outs[2], "unit order, not completion order, decides the link"
     other = scratch / "par-other"
     other.mkdir()
-    run([probe, "build", 2, write(scratch / "par-other.lir", BASE.replace("(i64 7)", "(i64 9)")), other / "par"], dict(opted, FIB_LIRO_JOBS="4"))
+    run([probe, "build", 2, write(scratch / "par-other.lir", BASE.replace("(I64 7)", "(I64 9)")), other / "par"], dict(opted, FIB_LIRO_JOBS="4"))
     assert (other / "par").read_bytes() != outs[0], "the comparison must see a different program"
     plain = unit_defs(p)
     for extra in [{"FIB_LIRO_UNITS": "3"}, {"FIB_LIRO_SPLIT": "ns2"}, {"FIB_LIRO_UNITS": "64", "FIB_LIRO_SPLIT": "ns3"}]:

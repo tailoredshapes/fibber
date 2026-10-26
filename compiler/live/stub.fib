@@ -4,10 +4,10 @@
 ;; caller through the stub `NAME`, which has the function's own type and convention: the callers compiled earlier call `NAME` by name,
 ;; as they would the function, so none of them is touched by a swap. The stub:
 ;;
-;;   (global NAME.slot ptr)          the current version's address: ONE aligned pointer, written with a seq_cst atomic store by the swap
+;;   (GLOBAL NAME.slot PTR)          the current version's address: ONE aligned pointer, written with a seq_cst atomic store by the swap
 ;;                                   and read with a seq_cst atomic load by every call, so a call sees entirely one version
-;;   (global NAME.epoch i64)         the swap's generation: bumped after the slot is written
-;;   (global NAME.inflight [16 x i64]) two counters 64 bytes apart (words 0 and 8), one for each parity of the epoch: a call adds 1 to
+;;   (GLOBAL NAME.epoch I64)         the swap's generation: bumped after the slot is written
+;;   (GLOBAL NAME.inflight (ARRAY 16 I64)) two counters 64 bytes apart (words 0 and 8), one for each parity of the epoch: a call adds 1 to
 ;;                                   the counter of the epoch it read before loading the slot and subtracts 1 after the callee returned
 ;;
 ;; The swap (live.swap) stores the new address, bumps the epoch and waits until the counter of the OLD parity is 0: every call that
@@ -16,7 +16,8 @@
 ;; the old epoch after the bump increments the old counter too and only delays the swap; it loads the slot after its increment, so it
 ;; sees the new address. Two atomic read-modify-writes per call is the price (measured in live.load: the cost table of FINDINGS.md).
 (ns live.stub
-  (:use lir.types))
+  (:use lir.types)
+  (:require [lir.print :as print]))
 
 ;; The names of the stub's three globals.
 (defun slot-name (name: str) -> str (str name ".slot"))
@@ -27,20 +28,20 @@
 (defun version-name (name: str n: i64) -> str (str name ".v" n))
 
 (defun params-text :private (ty: LFnType) -> str
-  (str-join-with " " (vec (map (fn (i: i64) -> str (str "(" (type-str (nth (. ty params) i)) " a" i ")")) (range (count (. ty params)))))))
+  (str-join-with " " (vec (map (fn (i: i64) -> str (str "(" (print/type-text (nth (. ty params) i)) " a" i ")")) (range (count (. ty params)))))))
 
 (defun args-text :private (ty: LFnType) -> str
   (str-join-with " " (vec (map (fn (i: i64) -> str (str "a" i)) (range (count (. ty params)))))))
 
 (defun cc-word :private (ty: LFnType) -> str
-  (match (. ty cc) ((CcTail) "tailcc ") (_ "")))
+  (match (. ty cc) ((CcTail) "TAILCC ") (_ "")))
 
-;; The call through the slot: `(indirect-call p (fn CC RET (T..)) a..)`, then the return of its value.
+;; The call through the slot: `(INDIRECT-CALL p (FUNCTION CC RET (T..)) a..)`, then the return of its value.
 (defun call-and-return :private (ty: LFnType) -> str
-  (let ((call (str "(indirect-call p " (fn-type-str ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
+  (let ((call (str "(INDIRECT-CALL p " (print/fn-type-text ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
     (match (. ty ret)
-      ((some _) (str "(let ((r " call ")) (atomicrmw sub seq_cst c (i64 1)) (ret r))"))
-      (nil (str call " (atomicrmw sub seq_cst c (i64 1)) (ret)")))))
+      ((some _) (str "(LET ((r " call ")) (ATOMICRMW SUB SEQ_CST c (I64 1)) (RET r))"))
+      (nil (str call " (ATOMICRMW SUB SEQ_CST c (I64 1)) (RET)")))))
 
 ;; The in-flight counters are sharded by thread: `shards` shards (a power of two) of two parities, each counter on a cache line of its
 ;; own (8 words), a thread's shard the top bits of its pthread_self times the golden ratio. One shared counter costs 300 ns a call with
@@ -55,29 +56,29 @@
 ;; The stub module for NAME : TY. With `counted` false the in-flight counters are not kept (the planted fault `no-count`: a swap then
 ;; waits for nothing and frees code a call may be inside).
 (defun stub-source (name: str ty: LFnType counted: bool) -> str
-  (let ((inc (if counted "(atomicrmw add seq_cst c (i64 1))" ""))
+  (let ((inc (if counted "(ATOMICRMW ADD SEQ_CST c (I64 1))" ""))
         (body (if counted (call-and-return ty) (uncounted-call ty))))
-    (str "(declare pthread_self ptr ())\n"
-         "(global " (slot-name name) " ptr (ptr null))\n"
-         "(global " (epoch-name name) " i64 (i64 0))\n"
-         "(global " (inflight-name name) " [" (inflight-words) " x i64] (zeroinitializer [" (inflight-words) " x i64]))\n"
-         "(define " (cc-word ty) "(" name " " (ret-str (. ty ret)) ") (" (params-text ty) ")\n"
-         "  (block entry\n"
-         "    (let ((e (atomic-load seq_cst i64 @" (epoch-name name) "))\n"
-         "          (shard (lshr (mul (ptrtoint i64 (call @pthread_self)) (i64 -7046029254386353131)) (i64 " (- 64 (shard-bits)) ")))\n"
-         "          (c (getelementptr i64 @" (inflight-name name) " (add (shl shard (i64 4)) (shl (and e (i64 1)) (i64 3))))))\n"
+    (str "(DECLARE pthread_self PTR ())\n"
+         "(GLOBAL " (slot-name name) " PTR (PTR NULL))\n"
+         "(GLOBAL " (epoch-name name) " I64 (I64 0))\n"
+         "(GLOBAL " (inflight-name name) " (ARRAY " (inflight-words) " I64) (ZEROINITIALIZER (ARRAY " (inflight-words) " I64)))\n"
+         "(DEFINE " (cc-word ty) "(" name " " (print/ret-text (. ty ret)) ") (" (params-text ty) ")\n"
+         "  (BLOCK entry\n"
+         "    (LET ((e (ATOMIC-LOAD SEQ_CST I64 (GLOBAL " (epoch-name name) ")))\n"
+         "          (shard (LSHR (MUL (PTRTOINT I64 (CALL (GLOBAL pthread_self))) (I64 -7046029254386353131)) (I64 " (- 64 (shard-bits)) ")))\n"
+         "          (c (GETELEMENTPTR I64 (GLOBAL " (inflight-name name) ") (ADD (SHL shard (I64 4)) (SHL (AND e (I64 1)) (I64 3))))))\n"
          "      " inc "\n"
-         "      (let ((p (atomic-load seq_cst ptr @" (slot-name name) ")))\n"
+         "      (LET ((p (ATOMIC-LOAD SEQ_CST PTR (GLOBAL " (slot-name name) "))))\n"
          "        " body "))))\n")))
 
 (defun shard-bits :private () -> i64
   (loop ((b 0)) (if (>= (shl 1 b) shards) b (recur (+ b 1)))))
 
 (defun uncounted-call :private (ty: LFnType) -> str
-  (let ((call (str "(indirect-call p " (fn-type-str ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
+  (let ((call (str "(INDIRECT-CALL p " (print/fn-type-text ty) (if (empty? (. ty params)) "" " ") (args-text ty) ")")))
     (match (. ty ret)
-      ((some _) (str "(ret " call ")"))
-      (nil (str call " (ret)")))))
+      ((some _) (str "(RET " call ")"))
+      (nil (str call " (RET)")))))
 
 ;; The helpers the swap calls through native.call (fibber cannot make an atomic store to an address of its own): all `ccc`.
 ;;   live.rt.store SLOT V         seq_cst store of V as a pointer
@@ -88,10 +89,10 @@
 ;;   live.rt.load P               seq_cst load
 ;;   live.rt.yield                sched_yield, for the wait loop
 (defun helpers-source () -> str
-  "(declare sched_yield i32 ())
-(define (live.rt.store void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
-(define (live.rt.store-two-step void) ((ptr slot) (i64 v)) (block entry (atomic-store seq_cst (ptr null) slot) (call @sched_yield) (atomic-store seq_cst (inttoptr ptr v) slot) (ret)))
-(define (live.rt.fetch-add i64) ((ptr p) (i64 d)) (block entry (ret (atomicrmw add seq_cst p d))))
-(define (live.rt.load i64) ((ptr p)) (block entry (ret (atomic-load seq_cst i64 p))))
-(define (live.rt.yield void) () (block entry (call @sched_yield) (ret)))
+  "(DECLARE sched_yield I32 ())
+(DEFINE (live.rt.store VOID) ((PTR slot) (I64 v)) (BLOCK entry (ATOMIC-STORE SEQ_CST (INTTOPTR PTR v) slot) (RET)))
+(DEFINE (live.rt.store-two-step VOID) ((PTR slot) (I64 v)) (BLOCK entry (ATOMIC-STORE SEQ_CST (PTR NULL) slot) (CALL (GLOBAL sched_yield)) (ATOMIC-STORE SEQ_CST (INTTOPTR PTR v) slot) (RET)))
+(DEFINE (live.rt.fetch-add I64) ((PTR p) (I64 d)) (BLOCK entry (RET (ATOMICRMW ADD SEQ_CST p d))))
+(DEFINE (live.rt.load I64) ((PTR p)) (BLOCK entry (RET (ATOMIC-LOAD SEQ_CST I64 p))))
+(DEFINE (live.rt.yield VOID) () (BLOCK entry (CALL (GLOBAL sched_yield)) (RET)))
 ")

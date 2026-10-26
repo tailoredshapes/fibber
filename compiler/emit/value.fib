@@ -21,11 +21,12 @@
 ;; `(Option T)` whose payload is of the scalar lIR type `t`, `{ i1 t }` by value: the tag
 ;; (1 for `some`), then the payload, zero for `nil` (types §8.1, docs/design/unboxed-option.md). `(LirVec e n)` is a lane vector `<n x e>`
 ;; (types §1.9; `e` an integer type, `float`, `double`, or `i1` for a mask): a scalar-class value, in a register or an lIR value, and in
-;; an object it is `lir-mem-text` (see there).
+;; an object it is `lir-mem-type` (see there).
 (defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn (LirOpt of: LirTy) (LirVec of: LirTy lanes: i64))
 (derive Eq LirTy) (derive Hash LirTy)
 
-;; Rust: value.rs:29 text
+;; Rust: value.rs:29 text. The type's canonical (lower-case) name, for messages and symbol names; the lIR text of a type is
+;; lir.print `type-text` of `lir-type` (spec/lir.md 2).
 (defun lir-ty-text (t: LirTy) -> str
   (match t
     ((LirI1) "i1") ((LirI8) "i8") ((LirI16) "i16") ((LirI32) "i32") ((LirI64) "i64")
@@ -37,18 +38,6 @@
 ;; The bytes a lane vector takes in memory: its bits rounded up to bytes, then to the 8 of a word (a mask `<n x i1>` takes n bits).
 (defun vec-mem-bytes (t: LirTy) -> i64
   (* 8 (quot (+ (quot (+ (lir-ty-bits t) 7) 8) 7) 8)))
-
-;; The type an object's field or an array's element of the lIR type `t` is declared as. A vector is `[k x i64]` there: the heap
-;; gives an object 8 bytes of alignment (16 from malloc), and a field of `<8 x float>` would be laid out at 32, which neither the
-;; allocation nor `size-align` knows. The access itself is a `load`/`store` of the vector with `lir-align-text`.
-(defun lir-mem-text (t: LirTy) -> str
-  (match t
-    ((LirVec _ _) (str-join ["[" (str (quot (vec-mem-bytes t) 8)) " x i64]"]))
-    (_ (lir-ty-text t))))
-
-;; The alignment words of a load or store of `t` through a pointer into an object: a vector may be 8-aligned only.
-(defun lir-align-text (t: LirTy) -> str
-  (match t ((LirVec _ _) "(align 8) ") (_ "")))
 
 ;; Rust: value.rs:43 is_int
 (defun lir-ty-is-int (t: LirTy) -> bool
@@ -63,18 +52,6 @@
     ((LirDouble) 64) ((LirPtr) 64) ((LirRaw) 64) ((LirFloat) 32) ((LirDyn) 128)
     ((LirOpt t) (+ 64 (lir-ty-bits t)))
     ((LirVec e n) (* n (lir-ty-bits e)))))
-
-;; The zero of an lIR type as a value: the payload of a `nil` of `(LirOpt t)`, and the initial value of a slot.
-(defun lir-zero (t: LirTy) -> str
-  (match t
-    ((LirPtr) "(ptr null)")
-    ((LirRaw) "(ptr null)")
-    ((LirFloat) "(float 0.0)")
-    ((LirDouble) "(double 0.0)")
-    ((LirDyn) "(zeroinitializer { ptr ptr })")
-    ((LirOpt _) (str-join ["(zeroinitializer " (lir-ty-text t) ")"]))
-    ((LirVec _ _) (str-join ["(zeroinitializer " (lir-ty-text t) ")"]))
-    (_ (str-join ["(" (lir-ty-text t) " 0)"]))))
 
 ;; A value: an SSA name, a global address or a literal, with its type; `VUnit`
 ;; is no value (`unit`).
@@ -120,11 +97,15 @@
     ((LirOpt of) (TAnon [ty-i1 (lir-type of)]))
     ((LirVec of lanes) (TVector lanes (lir-type of)))))
 
+;; The type an object's field or an array's element of the lIR type `t` is declared as. A vector is `(ARRAY k I64)` there: the heap
+;; gives an object 8 bytes of alignment (16 from malloc), and a field of `(VECTOR 8 FLOAT)` would be laid out at 32, which neither the
+;; allocation nor `size-align` knows. The access itself is a `load`/`store` of the vector with the alignment of `lir-align`.
 (defun lir-mem-type (t: LirTy) -> LType
   (match t
     ((LirVec _ _) (TArray (quot (vec-mem-bytes t) 8) ty-i64))
     (_ (lir-type t))))
 
+;; The alignment of a load or store of `t` through a pointer into an object: a vector may be 8-aligned only.
 (defun lir-align (t: LirTy) -> (Option i64)
   (match t ((LirVec _ _) (some 8)) (_ nil)))
 

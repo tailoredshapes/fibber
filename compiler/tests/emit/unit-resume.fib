@@ -16,7 +16,7 @@
 (ns tests.emit.unit-resume (:require [native.api :as jit] [fib.string :as s])
   (:use fib.test.unit emit.value emit.ir emit.objects emit.resume)
   (:require [fib.test.run :as test-runner])
-  (:require [emit.node :as nx] [lir.ast :as la] [lir.types :as lt] [lir.rewrite :as rewrite]))
+  (:require [emit.node :as nx] [lir.ast :as la] [lir.types :as lt] [lir.rewrite :as rewrite] [lir.print :as print]))
 
 (defstruct Case (name: str f: FnBuilder prologue: i64 points: (Vec str) value: bool))
 
@@ -172,12 +172,12 @@
 (defun check-module (r: Ran) -> str
   (match (. r frame)
     ((Ok frame)
-     (str-join ["(defstruct task.t (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr i64 "
+     (str-join ["(DEFSTRUCT task.t (I64 I32 I32 I32 I32 I32 PTR PTR PTR PTR I64 "
                 (s/join " " (mapv (fn (x: FrameSlot)
-                                      (match x ((FrVal t) (lir-ty-text t)) ((FrBytes n) (str-join ["[" (str n) " x i8]"]))))
+                                      (match x ((FrVal t) (print/type-text (lir-type t))) ((FrBytes n) (str-join ["(ARRAY " (str n) " I8)"]))))
                                     frame))
-                "))\n(declare fib.await-or-park i1 (ptr ptr))\n(declare fib.complete.t void ("
-                (if (. r value) "ptr i64" "ptr") "))\n" (. r text)]))
+                "))\n(DECLARE fib.await-or-park I1 (PTR PTR))\n(DECLARE fib.complete.t VOID ("
+                (if (. r value) "PTR I64" "PTR") "))\n" (. r text)]))
     ((Err _) "")))
 
 ;; ---- the checks
@@ -224,7 +224,7 @@
                           (s/includes? (. (nth rs 3) text) "(STORE t10 s13)")
                           (s/includes? (. (nth rs 3) text) "(STORE t11 s14)")) "order: the names a point adds go in creation order (t9 t10 t11: slots s12 s13 s14, not the text order)")
               (is cs (= (frame-of (nth rs 7)) ["val:i32" "val:i64" "val:i64" "val:i64" "val:i64"]) "edges frame: four values")
-              (is cs (let ((a-block (nth (s/split (nth (s/split (. (nth rs 7) text) "  (block a\n" -1) 1) "  (block b\n" -1) 0)))
+              (is cs (let ((a-block (nth (s/split (nth (s/split (. (nth rs 7) text) "  (BLOCK a\n" -1) 1) "  (BLOCK b\n" -1) 0)))
                        (< (unwrap (s/index-of a-block "(LOAD I64 s13)")) (unwrap (s/index-of a-block "(LOAD I64 s12)")))) "edges: the loads before the terminator of a go in the order the phis met them (t10 = s13 first, then t9 = s12)")
               (is cs (= (error-of (nth rs 5)) "no continuation block nope") "a missing continuation block")
               (is cs (= (error-of (nth rs 6)) "live value t99 of unknown type") "a live value that nothing binds")

@@ -25,7 +25,7 @@ layout_of() { case $1 in aarch64-unknown-linux-gnu) echo 'e-m:e-p270:32:32-p271:
 file_says() { case $1 in aarch64-unknown-linux-gnu) echo 'ELF 64-bit LSB relocatable, ARM aarch64' ;; *) echo 'Mach-O 64-bit arm64 object' ;; esac; }
 
 # a module with no target form: its data layout is the triple's
-printf '(define (main i32) () (block entry (ret (i32 0))))\n' > "$T/main.lir"
+printf '(DEFINE (main I32) () (BLOCK entry (RET (I32 0))))\n' > "$T/main.lir"
 
 # 1. lowering succeeds
 if [ -n "$quick" ]; then fibs="cases/ownership/01-return-part-of-argument.fib cases/ownership/02-structural-sharing.fib cases/ownership/41-top-level-macro-splices-forms.fib cases/stdlib/6201-f64-lanewise-arithmetic-agrees-with-the-scalar-operation.fib cases/stdlib/6200-f32-lanewise-arithmetic-agrees-with-the-scalar-operation.fib cases/stdlib/6216-splat-and-the-literal-operand-make-every-lane-the-scalar.fib cases/stdlib/6255-float-functions-agree-with-the-scalar-references.fib compiler/tests/native/a64/kernel.fib"
@@ -62,8 +62,8 @@ for t in $triples; do
     miss=$(neon_check "$T/k-$t.s") && ok "$t: kernel assembly has fmla and fadd on .2d and .4s" || no "$t: kernel assembly: $miss"
   else no "$t: the kernel did not compile"; fi
 done
-printf '(target (cpu "apple-m1") (features "+neon,+fp-armv8"))\n(define (f <2 x double>) ((ptr p))\n  (block entry (ret (fmuladd (load (align 8) <2 x double> p) (load (align 8) <2 x double> (getelementptr double p (i64 2))) (load (align 8) <2 x double> (getelementptr double p (i64 4)))))))\n(define (main i32) () (block entry (ret (i32 0))))\n' > "$T/w2.lir"
-sed 's/<2 x double>/<4 x double>/g; s/(i64 2)/(i64 4)/; s/(i64 4)))))))$/(i64 8)))))))/' "$T/w2.lir" > "$T/w4.lir"
+printf '(TARGET (CPU "apple-m1") (FEATURES "+neon,+fp-armv8"))\n(DEFINE (f (VECTOR 2 DOUBLE)) ((PTR p))\n  (BLOCK entry (RET (FMULADD (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) p) (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) (GETELEMENTPTR DOUBLE p (I64 2))) (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) (GETELEMENTPTR DOUBLE p (I64 4)))))))\n(DEFINE (main I32) () (BLOCK entry (RET (I32 0))))\n' > "$T/w2.lir"
+sed 's/(VECTOR 2 DOUBLE)/(VECTOR 4 DOUBLE)/g; s/(I64 2)/(I64 4)/; s/(I64 4)))))))$/(I64 8)))))))/' "$T/w2.lir" > "$T/w4.lir"
 fmla_count() { "$L" build "$1" --target "${2:-arm64-apple-darwin}" -o "$T/c.s" -O 2 --emit asm 2>/dev/null && grep -cE 'fmla' "$T/c.s"; }
 c2=$(fmla_count "$T/w2.lir"); [ "$c2" = 1 ] && ok "a 2 x double fma with +neon,+fp-armv8 is one fmla" || no "<2 x double> fmuladd gives [$c2] fmla, want 1"
 

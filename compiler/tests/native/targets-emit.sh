@@ -101,8 +101,8 @@ tails=cases/ownership/02-structural-sharing.fib
 "$F" build --target wasm32-wasip1 -I compiler -I lib $tails -o "$T/t.s" --emit asm 2>/dev/null
 c=$(grep -c 'return_call' "$T/t.s"); [ "$c" -gt 0 ] && ok "wasm32-wasip1: $tails makes its tail calls return_call ($c), the tail-call feature of the row" || no "wasm32-wasip1: no return_call in $tails"
 FIB_TARGET_CPU=spacemit-x60 asm_of riscv64-unknown-linux-gnu "$T/rv.s" && { miss=$(rvv_check "$T/rv.s") && ok "riscv64 with V (spacemit-x60): kernel assembly has vfmul.vv, vfadd.vv and a vector fma" || no "riscv64 V kernel: $miss"; } || no "riscv64 V: the kernel did not compile"
-printf '(define (f <2 x double>) ((ptr p))\n  (block entry (ret (fmuladd (load (align 8) <2 x double> p) (load (align 8) <2 x double> (getelementptr double p (i64 2))) (load (align 8) <2 x double> (getelementptr double p (i64 4)))))))\n(define (main i32) () (block entry (ret (i32 0))))\n' > "$T/w2.lir"
-sed 's/<2 x double>/<4 x double>/g; s/(i64 2)/(i64 4)/; s/(i64 4)))))))$/(i64 8)))))))/' "$T/w2.lir" > "$T/w4.lir"
+printf '(DEFINE (f (VECTOR 2 DOUBLE)) ((PTR p))\n  (BLOCK entry (RET (FMULADD (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) p) (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) (GETELEMENTPTR DOUBLE p (I64 2))) (LOAD (ALIGN 8) (VECTOR 2 DOUBLE) (GETELEMENTPTR DOUBLE p (I64 4)))))))\n(DEFINE (main I32) () (BLOCK entry (RET (I32 0))))\n' > "$T/w2.lir"
+sed 's/(VECTOR 2 DOUBLE)/(VECTOR 4 DOUBLE)/g; s/(I64 2)/(I64 4)/; s/(I64 4)))))))$/(I64 8)))))))/' "$T/w2.lir" > "$T/w4.lir"
 mul_count() { "$L" build "$1" --target wasm32-wasip1 -o "$T/c.s" -O 2 --emit asm 2>/dev/null && grep -cE 'f64x2\.mul' "$T/c.s"; }
 c2=$(mul_count "$T/w2.lir"); [ "$c2" = 1 ] && ok "wasm32: a 2 x double fmuladd is one f64x2.mul (one SIMD128 register)" || no "<2 x double> fmuladd gives [$c2] f64x2.mul, want 1"
 
