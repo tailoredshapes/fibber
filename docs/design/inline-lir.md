@@ -156,7 +156,7 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **The operands are typed at the site**: `(lir [p: ptr v: i64] -> unit "body")`, not `[p v]`. The type checker lowers a form to an extern it makes on the spot (an `ExternDef` with a `lir` body and
   parameter names) and a call of it, so scalars-and-`ptr`-only, `unsafe`-only and opaque-to-ownership are the extern's own rules, and nothing in the ownership checker changed. The types had to be
   written because the lowering happens before inference.
-* **The body is checked at type-check time**, not when the code is emitted: a refusal is a type error at the form, which is also what the case harness needs to count it as a rejection. `lir.site` makes
+* **The body is checked at type-check time**, not when the code is emitted: a refusal is a type error at the form, which is also what the case harness needs to count it as a rejection. `types.lirsite` makes
   the function's text and checks it; the emitter makes it again to put it in the module.
 * **A body may not call a function** (there is no way to declare one in it yet): sleeping a thread, `sched_yield` and so on stay in the platform layer.
 * **The partitioner** (compiler/native/liro/partition.fib) copies every `inline` function into every unit that calls it, always (before, copying small functions across units was an opt-in knob,

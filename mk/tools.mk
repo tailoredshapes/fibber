@@ -64,7 +64,7 @@ tool_sh-live-mt := $(T)/live/mt.sh $(F_ABS) | $(T)/live/mt.sh $(T)/live/mt.py $(
 # thread calls the swapped function; the design's transcripts 1, 4 and 5 through the terminal client (about 2 minutes)
 tool_sh-live-swap := $(T)/live/swap.sh $(F_ABS) | $(T)/live/swap.sh $(T)/live/swap.py $(T)/live/unit-livediff.fib $(T)/live/swap-app.fib $(wildcard $(T)/live/swapalt/*.fib) $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/emit/live.fib compiler/serve/incr.fib
 # docs/design/inline-lir.md: a body swap of a function that holds a `lir` form re-emits the site (lir.sh: the running program takes the new body)
-tool_sh-live-lir := $(T)/live/lir.sh $(F_ABS) | $(T)/live/lir.sh $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/types/lower/expr.fib compiler/lir/site.fib
+tool_sh-live-lir := $(T)/live/lir.sh $(F_ABS) | $(T)/live/lir.sh $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) compiler/types/lower/expr.fib compiler/types/lirsite.fib
 # LE1 (docs/design/live-incremental.md 2.2, 4): the constant defs' values kept in the session's Tables (emit.defs.cache): defcache-app.fib's defs read
 # through three generations and by expressions, a required module edited on disk read anew, FIB_LIVE_EMIT=off and =verify agreeing with the cache
 # on, the emit of a swap under a third of the cache-off one (about two minutes)
