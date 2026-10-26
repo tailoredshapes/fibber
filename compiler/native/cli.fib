@@ -24,7 +24,8 @@
   lair emit-llvm FILE.lir
   lair dump-ast FILE.lir
   lair expand FILE.lir            ; the module with its macros expanded, as lIR text (for a backend with no compile-time runtime)
-  lair respell FILE.lir [--in-place|--check]   ; the text in the new spelling (spec/lir.md 2), comments and layout kept; --check: exit 1 and the differing lines when it is not already
+  lair respell FILE.lir [--in-place|--check] [--macro-args keep|respell]   ; the text in the new spelling (spec/lir.md 2, 12), comments and layout kept; --check: exit 1 and the differing lines when it is not already;
+                                 ; --macro-args: the arguments of a macro use are kept as written (the default) or respelled
   lair words                      ; the words of lIR: TEXT and canonical name, one per line (lir.words)
   lair cases DIR.. [-j N]
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
@@ -71,20 +72,33 @@
           ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
           ((Ok p) (do (print-raw (lprint/print-module (. p module))) (Ok 0)))))))
 
-;; `respell FILE [--in-place|--check]` (spec/lir.md 2): the text rewritten in the new spelling at the token level (lir.respell), both
-;; spellings read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that differ and
-;; exit 1 when it is not already in the new spelling).
+;; `respell FILE [--in-place|--check] [--macro-args keep|respell]` (spec/lir.md 2, 12): the text rewritten in the new spelling at the token
+;; level (lir.respell), both spellings read whatever the mode; printed, written back, or compared with the file (`--check`: the lines that
+;; differ and exit 1 when it is not already in the new spelling). The notes (a form the tool cannot lex and left as written, a macro library
+;; it cannot read) go to stderr and do not change the status.
+(defstruct RespellArgs (files: (Vec str) in-place: bool check: bool keep: bool))
+
+;; The arguments of `respell`, or nil for a usage error.
+(defun respell-args :private (rest: (Vec str)) -> (Option RespellArgs)
+  (loop ((i 0) (files []) (in-place false) (check false) (keep true))
+    (cond (>= i (count rest)) (if (and (= (count files) 1) (not (and in-place check))) (some (RespellArgs files in-place check keep)) nil)
+          (= (nth rest i) "--in-place") (recur (+ i 1) files true check keep)
+          (= (nth rest i) "--check") (recur (+ i 1) files in-place true keep)
+          (and (= (nth rest i) "--macro-args") (< (+ i 1) (count rest)) (includes? (nth rest (+ i 1)) ["keep" "respell"]))
+          (recur (+ i 2) files in-place check (= (nth rest (+ i 1)) "keep"))
+          (starts-with? (nth rest i) "--") nil
+          :else (recur (+ i 1) (conj files (nth rest i)) in-place check keep))))
+
 (defun respell-cmd :private (rest: (Vec str)) -> (Result i64 str)
-  (let ((files (vec (filter (fn (a: str) (not (starts-with? a "--"))) rest)))
-        (in-place (some? (first (filter (fn (a: str) (= a "--in-place")) rest))))
-        (check (some? (first (filter (fn (a: str) (= a "--check")) rest)))))
-    (if (or (not (= (count files) 1)) (and in-place check) (not (= (+ (count files) (if in-place 1 0) (if check 1 0)) (count rest))))
-        (Err usage)
-        (try-let [src (read-src (nth files 0))
-                  out (match (respell/respell-text src) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d (nth files 0)))))]
-          (cond check (if (= out src) (Ok 0) (do (print-raw (respell/respell-diff src out)) (Ok 1)))
-                in-place (if (write-file (nth files 0) out) (Ok 0) (Err (str (nth files 0) ": cannot write")))
-                :else (do (print-raw out) (Ok 0)))))))
+  (match (respell-args rest)
+    (nil (Err usage))
+    ((some a) (let ((file (nth (. a files) 0)))
+                (try-let [src (read-src file)
+                          r (match (respell/respell-text src file (. a keep)) ((Ok t) (Ok t)) ((Err d) (Err (diag/diag-in-file d file))))]
+                  (do (doseq [n (. r notes)] (eprintln n))
+                      (cond (. a check) (if (= (. r text) src) (Ok 0) (do (print-raw (respell/respell-diff src (. r text))) (Ok 1)))
+                            (. a in-place) (if (write-file file (. r text)) (Ok 0) (Err (str file ": cannot write")))
+                            :else (do (print-raw (. r text)) (Ok 0)))))))))
 
 ;; `words`: the table of lir.words, `TEXT name` per line.
 (defun words-cmd :private (rest: (Vec str)) -> (Result i64 str)

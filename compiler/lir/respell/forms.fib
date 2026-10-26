@@ -1,7 +1,8 @@
 ;; compiler/lir/respell/forms.fib: the items, blocks and expressions of the respelling walk (lir.respell.walk has the types and the words):
 ;; each form by the shape lir.parse gives it (spec/lir.md 4 to 6), so that only word positions are respelled and every name stays. A form
 ;; the grammar does not know, a macro use, is walked generically (`generic!`): a form inside it whose head the grammar knows (an item, a
-;; block, an instruction) is walked by its shape, and in anything else every word is respelled.
+;; block, an instruction) is walked by its shape, and in anything else every word is respelled. That is `--macro-args respell`: by default
+;; (`keep`, spec/lir.md 12) a macro use is left as written, since the tool cannot know a macro's grammar (`macro-use?`).
 (ns lir.respell.forms
   (:use lir.respell.tree lir.respell.walk lir.intrin)
   (:require [lir.words :as words]))
@@ -79,16 +80,23 @@
             (cc-word? w) (do (kw! wk (nth items i)) (+ i 1))
             :else i))))
 
-;; A top-level form: an item of spec/lir.md 4, a macro's definition, a splice, or (any other head) a macro use walked generically. A bare
-;; atom or a string at the top level is left as it is (the goldens hold `#### FILE` and `status N` lines beside the lIR).
+;; A top-level form: an item of spec/lir.md 4, a macro's definition, a splice, or (any other head) a macro use: left as written, or walked
+;; generically under `--macro-args respell`. A bare atom or a string at the top level is left as it is (the goldens hold `#### FILE` and
+;; `status N` lines beside the lIR), and so is a list a reader macro of the module makes of `[..]` or `{..}` when macro arguments are kept.
 (defun item! (wk: Walk f: RForm) -> unit
   (match f
     ((RList kind _ items _)
-     (let ((h (if (or (not (= kind 0)) (= (count items) 0)) "" (word-of wk (nth items 0)))))
-       (if (item-head? h)
-           (do (kw! wk (nth items 0)) (item-rest! wk h items))
-           (generic! wk f))))
+     (let ((head (if (and (= kind 0) (> (count items) 0)) (nth items 0) (RList 0 0 [] 0))))
+       (cond (and (. wk keep) (not (= kind 0))) ()
+             (macro-use? wk head) ()
+             (item-head? (word-of wk head)) (do (kw! wk (nth items 0)) (item-rest! wk (word-of wk head) items))
+             :else (generic! wk f))))
     (_ ())))
+
+;; The head word of a form that was skipped (lir.respell.read), when it is an item's: respelled, and nothing else of the form.
+(defun skipped-head! (wk: Walk i: i64) -> unit
+  (let ((head (RAtom i)))
+    (if (and (item-head? (word-of wk head)) (not (macro-use? wk head))) (kw! wk head) ())))
 
 (defun item-rest! :private (wk: Walk h: str items: (Vec RForm)) -> unit
   (cond (= h "defstruct") (defstruct! wk items)
@@ -139,7 +147,7 @@
   (let ((xs (items-of f)))
     (if (= (word-of wk (nth-or-empty xs 0)) "block")
         (do (kw! wk (nth xs 0)) (each-from wk xs 2 expr!))
-        (generic! wk f))))
+        (if (. wk keep) () (generic! wk f)))))
 
 ;; ---------------------------------------------------------------- expressions
 
@@ -171,9 +179,9 @@
 ;; A form headed by an atom: the head respelled when it is a word, its operands by the head's shape; an unknown head is a macro use.
 (defun headed! :private (wk: Walk items: (Vec RForm)) -> unit
   (let ((h (word-of wk (nth items 0))) (head (nth items 0)) (args (vec (drop 1 items))))
-    (cond (= h "") (if (starts-with? (atom-text wk head) "%struct.")
-                       (do (ref! wk head) (each-from wk args 0 expr!))
-                       (each-from wk items 0 generic!))
+    (cond (and (= h "") (starts-with? (atom-text wk head) "%struct.")) (do (ref! wk head) (each-from wk args 0 expr!))
+          (macro-use? wk head) ()
+          (= h "") (each-from wk items 0 generic!)
           :else (do (kw! wk head) (operands! wk h args)))))
 
 (defun operands! :private (wk: Walk h: str args: (Vec RForm)) -> unit

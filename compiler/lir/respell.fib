@@ -1,18 +1,30 @@
-;; compiler/lir/respell.fib: `lairf respell` (spec/lir.md 2; the audit's step 3): an lIR text rewritten in the new spelling at the token
-;; level. The tokens and their spans are lir.respell.tree's, the grammar-shaped walk lir.respell.walk's and lir.respell.forms', and the
-;; output copies every byte the walk did not name, so comments, case headers and layout survive; the result is idempotent and parses to
-;; the same tree as the input (compiler/tests/lir/respell.sh holds both over cases/lir). It reads both spellings whatever the mode
-;; (lir.sexp.lexer `lexer-old`, lir.words `keyword-of-any`): the tool must read what it converts.
+;; compiler/lir/respell.fib: `lairf respell` (spec/lir.md 2, 12; the audit's step 3): an lIR text rewritten in the new spelling at the token
+;; level. The tokens and their spans are lir.respell.tree's, the reading of a text that may hold what lIR's lexer refuses lir.respell.read's,
+;; the macros the module can use lir.respell.macros', the grammar-shaped walk lir.respell.walk's and lir.respell.forms', and the output
+;; copies every byte the walk did not name, so comments, case headers and layout survive; the result is idempotent and parses to the same
+;; tree as the input (compiler/tests/lir/respell.sh holds both over cases/lir). It reads both spellings whatever the mode (lir.sexp.lexer
+;; `lexer-old`, lir.words `keyword-of-any`): the tool must read what it converts.
+;;
+;; The tool cannot know the grammar of a macro, so the arguments of a macro use are left as written (`keep`, the default; `respell` walks them
+;; generically, as the tool did before). A top-level form it cannot lex is left as written too, its head word apart, and said in the notes.
 (ns lir.respell
-  (:use lir.diag lir.respell.tree lir.respell.walk lir.respell.forms))
+  (:use lir.diag lir.respell.tree lir.respell.read lir.respell.macros lir.respell.walk lir.respell.forms))
 
-;; `src` in the new spelling, or the lexical error that stops the read.
-(defun respell-text (src: str) -> (Result str Diagnostic)
-  (try-let ((toks (tokenise src))
-            (forms (forms-of toks)))
-    (let ((wk (Walk src toks (edits-new))))
-      (do (doseq [f forms] (item! wk f))
-          (Ok (assemble src toks (. wk ed)))))))
+;; The text in the new spelling, and the notes the tool owes its user (a form skipped, a macro library it could not read), one per line.
+(defstruct Respelled (text: str notes: (Vec str)))
+
+;; `src`, the text of `file` ("" for none: libraries are then looked up from the working directory), in the new spelling; `keep`: the
+;; arguments of macro uses are left as written. An error only when the forms the reader kept do not nest, which it does not give.
+(defun respell-text (src: str file: str keep: bool) -> (Result Respelled Diagnostic)
+  (let ((rd (read-tokens src)))
+    (try-let ((forms (forms-of (. rd toks))))
+      (let ((nm (if keep (macro-names src (. rd toks) forms file) (Names (cell {}) (cell {}) (cell []))))
+            (skips (. rd skips)))
+        (let ((wk (Walk src (. rd toks) (edits-new) @(. nm set) keep)))
+          (do (doseq [f forms] (item! wk f))
+              (doseq [s skips] (if (>= (. s head) 0) (skipped-head! wk (. s head)) ()))
+              (Ok (Respelled (assemble src (. rd toks) (. wk ed))
+                             (vec (concat @(. nm notes) (map (fn (s: Skip) (str file ":" (pos-str (. s pos)) ": respell: " (. s message))) skips)))))))))))
 
 ;; The lines on which `a` and `b` differ, for `--check`.
 (defun respell-diff (a: str b: str) -> str

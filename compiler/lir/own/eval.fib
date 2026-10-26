@@ -253,24 +253,31 @@
 (defun callee-text (callee: LCallee) -> str
   (match callee ((CalDirect n) (str "call to @" n)) ((CalIndirect _ _) "indirect-call")))
 
+;; The arguments are evaluated in order, then the owned positions consume and only then the others borrow (rule 2: within one instruction
+;; the consuming positions take effect first). A tail call's result is the function's result, handed to the caller as `ret`'s operand
+;; is: it is not a value of this frame, so nothing here consumes it (rule 1).
 (defun eval-call (cx: LoCx callee: LCallee args: (Vec LExpr) tail: bool pos: i64) -> LoV
   (let ((ty (callee-type cx callee)) (what (callee-text callee)))
     (do (indirect-check cx callee pos)
         (let ((vals (loop ((i 0) (acc: (Vec LoV) []))
-                      (if (>= i (count args)) acc (recur (+ i 1) (conj acc (eval-arg cx ty what i (nth args i))))))))
-          (do (when tail (tail-check cx vals pos))
-              (if (managed-result? cx callee) (LoV kd-owned -1 [] -1 "") val-scalar))))))
+                      (if (>= i (count args)) acc (recur (+ i 1) (conj acc (eval cx (nth args i))))))))
+          (do (dotimes (i (count args))
+                (when (owned-at? ty i)
+                  (consume cx (nth vals i) (. (nth args i) pos) 3 (str "passed at owned position " (+ i 1) " of " what))))
+              (dotimes (i (count args))
+                (when (not (owned-at? ty i)) (borrow-arg cx (nth vals i) (. (nth args i) pos) what)))
+              (when tail (tail-check cx vals pos))
+              (if (and (not tail) (managed-result? cx callee)) (LoV kd-owned -1 [] -1 "") val-scalar))))))
 
-;; One argument: consumed at an owned position, borrowed elsewhere (and its evidence lost: the callee may copy it).
-(defun eval-arg (cx: LoCx ty: (Option LFnType) what: str i: i64 a: LExpr) -> LoV
-  (let ((v (eval cx a))
-        (pt (match ty ((some t) (if (< i (count (. t params))) (some (nth (. t params) i)) nil)) (nil nil))))
-    (do (if (= pt (some ty-owned))
-            (consume cx v (. a pos) 3 (str "passed at owned position " (+ i 1) " of " what))
-            (do (use-val cx v (. a pos))
-                (when (= (. v kind) kd-interior) (violation cx 9 (. a pos) (str "interior address " (val-name cx v) " passed to " what)))
-                (evidence-loss cx v)))
-        v)))
+;; Whether parameter `i` of the callee's type is owned.
+(defun owned-at? (ty: (Option LFnType) i: i64) -> bool
+  (match ty ((some t) (and (< i (count (. t params))) (= (nth (. t params) i) ty-owned))) (nil false)))
+
+;; An argument at a position that is not owned: borrowed (and its evidence lost: the callee may copy it).
+(defun borrow-arg (cx: LoCx v: LoV pos: i64 what: str) -> unit
+  (do (use-val cx v pos)
+      (when (= (. v kind) kd-interior) (violation cx 9 pos (str "interior address " (val-name cx v) " passed to " what)))
+      (evidence-loss cx v)))
 
 ;; Rule 7: nothing owned or stack is live at the tail call; a guaranteed argument depends only on guaranteed parameters.
 (defun tail-check (cx: LoCx vals: (Vec LoV) pos: i64) -> unit

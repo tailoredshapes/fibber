@@ -4,12 +4,14 @@
 ;; modifier, a type, a flag, an ordering, a literal word) and for every sigil and bracket type: `@f` to `(GLOBAL f)`, `%struct.s` to
 ;; `(STRUCT s)`, `(ptr 1)` to `(PTR (ADDRSPACE 1))`, `(fn ..)` to `(FUNCTION ..)`, `<N x T>` to `(VECTOR N T)`, `[N x T]` to `(ARRAY N T)`,
 ;; `{ .. }` to `(LITERAL-STRUCT ..)`. A name in a name position (a local, a label, a global's or struct's name) is never touched, so a local
-;; named `add` survives. A form the grammar does not know (a macro use) is walked generically: every word in it is respelled.
+;; named `add` survives. A macro use is kept as written (`macro-use?`), or with `--macro-args respell` walked generically: every word in it is respelled.
 (ns lir.respell.walk
   (:use lir.respell.tree lir.intrin)
   (:require [lir.words :as words]))
 
-(defstruct Walk (src: str toks: (Vec RTok) ed: Edits))
+;; The text, its tokens, the edits so far, the names of the macros the module can use (lir.respell.macros) and whether the arguments of a
+;; macro use are kept as written (`--macro-args keep`, the default) or respelled (`respell`).
+(defstruct Walk (src: str toks: (Vec RTok) ed: Edits macros: (Map str bool) keep: bool))
 
 ;; ---------------------------------------------------------------- atoms and words
 
@@ -27,6 +29,19 @@
 
 (defun put! :private (wk: Walk f: RForm text: str) -> unit
   (match f ((RAtom i) (set-text! (. wk ed) i text)) (_ ())))
+
+;; Whether `head`, the head of a form, makes the form a MACRO USE whose text is to be kept as written: the walk is in `keep` mode, and the head
+;; names a macro of the module or is no word of lIR (a macro that the tool could not read, or a form that is none of lIR's). The tool cannot know
+;; a macro's grammar, so `let`, `and` and `{..}` among its arguments may be the language's own, not lIR's (spec/lir.md 12).
+;; The head of a vector literal `(<4 x i32> ..)` and of a struct value `(%struct.s ..)` are lIR's own (old spelling) and no macro's.
+(defun macro-use? (wk: Walk head: RForm) -> bool
+  (and (. wk keep) (not (lir-shaped? wk head))
+       (or (= (word-of wk head) "") (some? (get (. wk macros) (atom-text wk head))))))
+
+(defun lir-shaped? :private (wk: Walk f: RForm) -> bool
+  (match (tok-of wk f)
+    ((some t) (or (= (. t kind) tk-vec) (starts-with? (. t text) "%struct.")))
+    (nil false)))
 
 ;; The atom respelled when it is a word: `add` to `ADD`.
 (defun kw! (wk: Walk f: RForm) -> unit

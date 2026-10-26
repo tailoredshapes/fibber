@@ -66,13 +66,14 @@
       (_ (when (managed-expr? cx v)
            (do (own-add cx (LoVal name kd-unresolved [] blk (. b pos) (some v) -1 "" false false)) ()))))))
 
-;; Every binding inside `e`, in evaluation order.
+;; Every binding inside `e`, in evaluation order. A function is verified when it has an ownership form or any expression of type `(ptr
+;; 1)`, a call's result among them: a function whose only managed value is what a call returns can leak it too (rule 1).
 (defun collect-expr (cx: LoCx e: LExpr blk: i64) -> unit
   (match (. e kind)
     ((KLet binds body)
      (do (doseq [b binds] (do (collect-expr cx (. b value) blk) (collect-binding cx b blk)))
          (doseq [x body] (collect-expr cx x blk))))
-    (_ (do (when (own-form? e) (set! (. cx uses) true))
+    (_ (do (when (or (own-form? e) (managed-expr? cx e)) (set! (. cx uses) true))
            (doseq [c (children e)] (collect-expr cx c blk))))))
 
 ;; The whole function: parameters, then the reachable blocks in reverse postorder, each block's forms as written (a top-level `let` with

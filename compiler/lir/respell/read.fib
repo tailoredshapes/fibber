@@ -1,0 +1,79 @@
+;; compiler/lir/respell/read.fib: the tokens of an lIR text for `lairf respell`, read leniently (spec/lir.md 12). The tool's lexer is lIR's own,
+;; and a text written for a language built on lIR may hold what lIR's lexer refuses: a string with an escape lIR does not know (`#"\d+"`), a
+;; `<` that begins no vector type, an unclosed `[` that a reader macro of the module is to close, a stray closing bracket. The tool cannot
+;; run the module's reader macros, so such a top-level form is SKIPPED: its tokens are dropped (the bytes stay in the gaps and are copied as
+;; they are), the reason is recorded, and the reading goes on at the next line that starts with `(`. Only the head word of a skipped form
+;; is kept (`Skip.head`, the index of its token), so that the walk can respell an item's head (`DEFINE`) and leave the rest.
+(ns lir.respell.read
+  (:use lir.diag lir.sexp.lexer lir.respell.tree))
+
+;; A skipped form: where it starts (or where the stray token is), why, and the index in the token vector of its head atom, -1 for none.
+(defstruct Skip (pos: i64 message: str head: i64))
+
+;; The tokens of the text that are in forms the tool can read (balanced, so `forms-of` cannot fail on them) and the forms skipped.
+(defstruct Read (toks: (Vec RTok) skips: (Vec Skip)))
+
+;; The reader's state: the lexer, the tokens so far, the kinds of the brackets open now (innermost last), the index in `out` of the opening
+;; bracket of the top-level form being read, and the skips.
+(defstruct Rd (lx: Lexer out: (Cell (Vec RTok)) kinds: (Cell (Vec i64)) start: (Cell i64) skips: (Cell (Vec Skip))))
+
+(defun read-tokens (src: str) -> Read
+  (let ((rd (Rd (lexer-old src) (cell []) (cell []) (cell 0) (cell []))))
+    (do (loop ()
+          (let ((b (lex-peek (. rd lx))) (from (lex-offset (. rd lx))))
+            (cond (< b 0) (if (empty? @(. rd kinds)) () (fail-form! rd (open-pos rd) "unexpected end of input: unclosed list"))
+                  :else (do (step! rd from) (recur)))))
+        (Read @(. rd out) @(. rd skips)))))
+
+;; The next token, kept, or the form it is in skipped.
+(defun step! :private (rd: Rd from: i64) -> unit
+  (let ((pos (lex-pos (. rd lx))))
+    (match (lex-next (. rd lx))
+      ((Err d) (fail-form! rd (. d pos) (. d message)))
+      ((Ok nil) ())
+      ((Ok (some t)) (keep! rd (rtok t from (lex-offset (. rd lx))) pos)))))
+
+;; The token `t` (at `pos`) into the open forms: an opener pushes its kind, a closer must match the innermost.
+(defun keep! :private (rd: Rd t: RTok pos: i64) -> unit
+  (let ((ok (opener-kind (. t kind))) (ck (closer-kind (. t kind))) (kinds @(. rd kinds)))
+    (cond (>= ok 0) (do (if (empty? kinds) (set! (. rd start) (count @(. rd out))) ())
+                        (set! (. rd kinds) (conj kinds ok))
+                        (set! (. rd out) (conj @(. rd out) t)))
+          (and (>= ck 0) (empty? kinds)) (note! rd pos "unexpected closing bracket" -1)
+          (and (>= ck 0) (not (= ck (nth kinds (- (count kinds) 1))))) (fail-form! rd pos "mismatched closing bracket")
+          (>= ck 0) (do (set! (. rd kinds) (vec (take (- (count kinds) 1) kinds)))
+                        (set! (. rd out) (conj @(. rd out) t)))
+          :else (set! (. rd out) (conj @(. rd out) t)))))
+
+(defun note! :private (rd: Rd pos: i64 what: str head: i64) -> unit
+  (set! (. rd skips) (conj @(. rd skips) (Skip pos (str "skipped, left as written: " what) head))))
+
+;; The position of the opening bracket of the top-level form being read.
+(defun open-pos :private (rd: Rd) -> i64
+  (. (nth @(. rd out) @(. rd start)) pos))
+
+;; The form being read cannot be read (`why`, met at `at`): its tokens are dropped but for its head atom, and the lexer moves to the next
+;; line that starts with `(`. A token met outside any form is skipped alone.
+(defun fail-form! :private (rd: Rd at: i64 why: str) -> unit
+  (let ((inside (not (empty? @(. rd kinds)))))
+    (do (if inside
+            (let ((s @(. rd start)) (out @(. rd out)))
+              (do (note! rd (open-pos rd) (str why " at " (pos-str at)) (if (head-kept? out s) s -1))
+                  (set! (. rd out) (if (head-kept? out s) (conj (vec (take s out)) (nth out (+ s 1))) (vec (take s out))))
+                  (set! (. rd kinds) [])))
+            (note! rd at why -1))
+        (resync! (. rd lx)))))
+
+;; Whether the form opened at token `s` has an atom right after its `(`.
+(defun head-kept? :private (out: (Vec RTok) s: i64) -> bool
+  (and (< (+ s 1) (count out)) (= (. (nth out s) kind) tk-open) (= (. (nth out (+ s 1)) kind) tk-atom)))
+
+;; The lexer moved on to the start of the next line that begins with `(` (or the end of the text). It always moves: the cursor of a failed
+;; read is at the start of the token that failed or after it, and that is no newline.
+(defun resync! :private (lx: Lexer) -> unit
+  (let ((src (lex-src lx)) (n (str-len (lex-src lx))))
+    (loop ()
+      (let ((o (lex-offset lx)))
+        (cond (>= o n) ()
+              (and (= (zext i64 (str-byte-at src o)) 10) (< (+ o 1) n) (= (zext i64 (str-byte-at src (+ o 1))) 40)) (bump lx)
+              :else (do (bump lx) (recur)))))))

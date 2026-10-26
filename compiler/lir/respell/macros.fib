@@ -1,0 +1,93 @@
+;; compiler/lir/respell/macros.fib: the macros a module can use, for `lairf respell` (spec/lir.md 12): the names of its own `define-macro`s
+;; (a splice `(begin ..)` included), of the macros of each library it `require-macros` (the libraries that library requires too, spec/lir.md
+;; 4.6) and of the own macros of each module it `import`s (not those the module took in turn, spec/lir.md 4.7). The tool has the text of
+;; the module and reads the others from the paths as the compiler resolves them (as written when absolute, else beside the requiring file).
+;; A file it cannot read is a note and its macros are unknown: the walk then treats any head that is no word of lIR as a macro anyway.
+(ns lir.respell.macros
+  (:use lir.diag lir.respell.tree lir.respell.read)
+  (:require [lir.words :as words]))
+
+;; The names found, the libraries and modules already read (by the path they resolve to), and the notes.
+(defstruct Names (set: (Cell (Map str bool)) seen: (Cell (Map str bool)) notes: (Cell (Vec str))))
+
+;; What follows from a form: in the module, a `require-macros` and an `import`; in a library, a `require-macros`; in an imported module, nothing.
+(def from-module: i64 2)
+(def from-library: i64 1)
+(def from-import: i64 0)
+
+(def max-depth: i64 16)
+
+(defun macro-names (src: str toks: (Vec RTok) forms: (Vec RForm) file: str) -> Names
+  (let ((nm (Names (cell {}) (cell {}) (cell []))))
+    (do (collect! nm src toks forms file from-module 0) nm)))
+
+(defun atom-at :private (toks: (Vec RTok) f: RForm) -> str
+  (match f ((RAtom i) (if (= (. (nth toks i) kind) tk-atom) (. (nth toks i) text) "")) (_ "")))
+
+(defun word-at :private (toks: (Vec RTok) f: RForm) -> str
+  (match (words/keyword-of-any (atom-at toks f)) ((some k) k) (nil "")))
+
+(defun collect! :private (nm: Names src: str toks: (Vec RTok) forms: (Vec RForm) file: str mode: i64 depth: i64) -> unit
+  (doseq [f forms]
+    (match f
+      ((RList 0 _ items _) (if (> (count items) 0) (collect-form! nm src toks items file mode depth) ()))
+      (_ ()))))
+
+(defun collect-form! :private (nm: Names src: str toks: (Vec RTok) items: (Vec RForm) file: str mode: i64 depth: i64) -> unit
+  (let ((w (word-at toks (nth items 0))))
+    (cond (= w "define-macro") (if (> (count items) 1) (add-name! nm (atom-at toks (nth items 1))) ())
+          (= w "begin") (collect! nm src toks (vec (drop 1 items)) file mode depth)
+          (and (= w "require-macros") (>= mode from-library)) (load! nm src toks items file from-library depth)
+          (and (= w "import") (>= mode from-module)) (load! nm src toks items file from-import depth)
+          :else ())))
+
+(defun add-name! :private (nm: Names name: str) -> unit
+  (if (= name "") () (set! (. nm set) (assoc @(. nm set) name true))))
+
+(defun note! :private (nm: Names file: str toks: (Vec RTok) f: RForm text: str) -> unit
+  (let ((pos (match f ((RAtom i) (. (nth toks i) pos)) (_ 0))))
+    (set! (. nm notes) (conj @(. nm notes) (str file ":" (pos-str pos) ": respell: " text)))))
+
+;; The text of the string literal `f` (no escapes), "" when it is none.
+(defun string-at :private (src: str toks: (Vec RTok) f: RForm) -> str
+  (match f
+    ((RAtom i) (let ((t (nth toks i)))
+                 (if (and (= (. t kind) tk-str) (not (s-has-backslash? (str-slice src (. t from) (. t to)))))
+                     (str-slice src (+ (. t from) 1) (- (. t to) 1))
+                     "")))
+    (_ "")))
+
+(defun s-has-backslash? :private (s: str) -> bool
+  (loop ((i 0)) (cond (>= i (str-len s)) false (= (str-byte-at s i) 92i8) true :else (recur (+ i 1)))))
+
+;; Where `FILE` of a `require-macros` or an `import` is: as written when absolute or when the module has no file, else beside the module's file.
+(defun resolve-path (file: str p: str) -> str
+  (if (or (starts-with? p "/") (= file "")) p (str (dir-of file) p)))
+
+;; The directory of `path` with its last `/` ("" when there is none).
+(defun dir-of :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at path i) 47i8) (str-slice path 0 (+ i 1))
+          :else (recur (- i 1)))))
+
+;; The macros of the file the form `(require-macros "FILE")` or `(import "FILE")` names, collected under `mode`.
+(defun load! :private (nm: Names src: str toks: (Vec RTok) items: (Vec RForm) file: str mode: i64 depth: i64) -> unit
+  (let ((arg (if (> (count items) 1) (nth items 1) (nth items 0)))
+        (what (if (= mode from-import) "module" "macro library")))
+    (let ((p (string-at src toks arg)))
+      (cond (= p "") (note! nm file toks arg (str "the " what " is not a plain string: its macros are unknown"))
+            (>= depth max-depth) (note! nm file toks arg (str "the " what " " p " is nested too deep: its macros are unknown"))
+            :else (let ((path (resolve-path file p)))
+                    (if (some? (get @(. nm seen) path))
+                        ()
+                        (do (set! (. nm seen) (assoc @(. nm seen) path true))
+                            (match (read-file path)
+                              (nil (note! nm file toks arg (str "cannot read the " what " " path ": its macros are unknown")))
+                              ((some text) (collect-text! nm text path mode depth))))))))))
+
+(defun collect-text! :private (nm: Names text: str path: str mode: i64 depth: i64) -> unit
+  (let ((rd (read-tokens text)))
+    (match (forms-of (. rd toks))
+      ((Ok forms) (collect! nm text (. rd toks) forms path mode (+ depth 1)))
+      ((Err _) ()))))

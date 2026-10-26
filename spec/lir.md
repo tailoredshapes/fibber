@@ -1552,11 +1552,16 @@ section 3, rule 3). It is one forward dataflow per function over the
 CFG `lir.check` built, keeping for each owned and stack value whether it
 is live or consumed at each point, and for each fresh value whether its
 uniqueness evidence holds. A function with no `(PTR (ADDRSPACE 1))` value and no
-ownership form costs one walk. The rules, each with its diagnostic
+ownership form costs one walk; a call whose result is `(PTR (ADDRSPACE 1))`
+defines such a value, so a function whose only managed value is a call's
+result is verified. The rules, each with its diagnostic
 (`FILE:LINE:COL: error: ownership rule N: ..` at the form at fault):
 
 1. **Linearity.** An owned value is consumed exactly once on every path
-   from its definition to a `ret` or a tail call. The consuming uses are
+   from its definition to a `ret` or a tail call. A tail call's result is
+   the function's result, handed to the caller as `ret`'s operand is: it is
+   not a value of the frame, and nothing in the frame consumes it. The
+   consuming uses are
    `destroy-value`, an `owned` argument position of a call, `ret`, `store
    init` and `store assign`, and being the incoming value of a `phi` (the
    edge consumes it). A second consume on one path is `ownership rule 1:
@@ -2006,16 +2011,36 @@ lair expand FILE.lir             ; print the module with its macros expanded, as
 lair cases DIR.. [-j N]          ; run a case suite (§13), N cases at a time (default FIB_LAIR_WORKERS or 4)
 lair words                       ; the words of lIR (§2): each word's text and its canonical name, one per line
 lair --old-spelling ..           ; admit the old spelling beside the new (§2, transitional); --new-spelling refuses it, the default
-lair respell FILE.lir [--in-place|--check]   ; the text in the new spelling (§2), comments and layout kept; --check: exit 1 unless it is already
+lair respell FILE.lir [--in-place|--check] [--macro-args keep|respell]   ; the text in the new spelling (§2), comments and layout kept; --check: exit 1 unless it is already
 ```
 
 `lair respell` rewrites a text into the new spelling token by token: it reads the old spelling whatever the mode, walks the forms with
 the shape of the grammar, and replaces only the words in a word position (a head, a modifier, a type, a flag, an ordering, a literal
 word), the sigils and the bracket types; every other byte is copied, so comments, case headers and layout stay, a name stays as it was
 written (a local `add`, a label `entry`), and an `;; error:` header that quotes `@f`, `%struct.s` or `(ptr 1)` is respelled with the
-text. A form the grammar does not know, a macro use, is walked generically: every word in it is respelled. The result parses to the same
+text. The result parses to the same
 tree as the input and is its own respelling (`compiler/tests/lir/respell.sh` holds both over every lIR file of the tree); what a macro
 builds at macro time (`(lir.sexp.symbol "add")`) is no text and is not seen.
+
+**Macro uses.** The tool cannot know the grammar of a macro, so the arguments of a macro use may be the words of a language built on lIR
+(`let`, `and`, `or`, `fn`, `{..}`, `@x`), which §2 leaves in lower case, and respelling them would make them lIR's `LET`, `AND`, `FUNCTION`,
+`LITERAL-STRUCT` and `GLOBAL`. By default (`--macro-args keep`) a form that is a macro use is therefore left exactly as written, whole, at
+the top level and inside a function or a macro's body alike; the lIR around it is respelled. A form is a macro use when its head names a
+macro of the module, or is no word of lIR (so is no item, instruction, type or literal). The macros of the module are the names of its own
+`define-macro`s (a splice `(begin ..)` included, §4.6), of the macros of each library it `require-macros` (and of the libraries that library
+requires), and of the own macros of each module it `import`s (not those that module took in turn, §4.7); the tool reads the files from the
+paths as the compiler does (as written when absolute, else beside the file). A file it cannot read is a note on stderr, and its macros are
+unknown: a head that is no word of lIR is still a macro use, but one the library names like a word of lIR (a `let`, in the new spelling) is
+taken for lIR's own and respelled. `--macro-args respell` is the tool's former behaviour: every word in a macro use is respelled, which is
+right only where the macros take lIR. The bodies of `define-macro`, `define-reader-macro`, `define-dispatch-macro` and `define-token-reader`
+are lIR and are respelled as any function's; the names in their parameter lists are names and stay (`compiler/tests/lir/respell/`).
+
+**Text the tool cannot lex.** A module that binds reader macros (§4.8) may hold what lIR's own lexer refuses: a string with an escape lIR
+does not know (`#"\d+"`), a `<` that begins no vector type, a `[` that its reader macro closes, a stray bracket. The tool cannot run the
+reader macros, so it does not fail: a top-level form that it cannot read is skipped, that is copied as written but for its head word when
+that is an item's (`DEFINE`), and the tool says so on stderr, `FILE:L:C: respell: skipped, left as written: REASON at L:C`, and goes on at
+the next line that begins with `(`. The exit status is that of the rest of the work. A form left so is respelled by `--macro-args respell`
+no more than by default; it is the module's reader that reads it.
 
 `FIB_TARGET_CPU` names the CPU code is generated for when the module has
 no `target` form (§4.5): unset, empty or `host` mean the host's CPU and
