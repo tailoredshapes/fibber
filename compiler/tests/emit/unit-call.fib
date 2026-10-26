@@ -18,7 +18,7 @@
 (defun has (cx: LowerCx word: str) -> bool (s/includes? (text-of cx) word))
 ;; Whether the function names the program's C string of `text` (emit.statics `statics-cstring`: a trap's message is one constant per text).
 (defun has-cstr (cx: LowerCx text: str) -> bool
-  (match (get @(. (. (. cx p) statics) cstr-index) text) ((some name) (has cx (str name ")"))) (nil false)))
+  (match (get @(. (. (. cx p) statics) cstr-index) text) ((some name) (has cx (str "(GLOBAL " (str-slice name 1 (str-len name)) ")"))) (nil false)))
 (defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
 (defun starts-err (r: (Result a str) word: str) -> bool (match r ((Err m) (s/starts-with? m word)) (_ false)))
 
@@ -42,33 +42,33 @@
 
 (defun int-checks (cs: Checks) -> unit
   (do (table-checks cs "i64" a64 b64 t64
-                    [(Pair "bit-and" (Pair "(and a b)" LirI64)) (Pair "bit-or" (Pair "(or a b)" LirI64)) (Pair "bit-xor" (Pair "(xor a b)" LirI64))
-                     (Pair "=" (Pair "(icmp eq a b)" LirI1)) (Pair "!=" (Pair "(icmp ne a b)" LirI1)) (Pair "<" (Pair "(icmp slt a b)" LirI1))
-                     (Pair "<=" (Pair "(icmp sle a b)" LirI1)) (Pair ">" (Pair "(icmp sgt a b)" LirI1)) (Pair ">=" (Pair "(icmp sge a b)" LirI1))
-                     (Pair "+" (Pair "(sadd-overflow a b)" LirI64)) (Pair "-" (Pair "(ssub-overflow a b)" LirI64))
-                     (Pair "*" (Pair "(smul-overflow a b)" LirI64)) (Pair "rem" (Pair "(srem a b)" LirI64))
-                     (Pair "quot" (Pair "(sdiv a b)" LirI64)) (Pair "shl" (Pair "(shl a " LirI64)) (Pair "shr" (Pair "(lshr a " LirI64))
-                     (Pair "sar" (Pair "(ashr a " LirI64))])
+                    [(Pair "bit-and" (Pair "(AND a b)" LirI64)) (Pair "bit-or" (Pair "(OR a b)" LirI64)) (Pair "bit-xor" (Pair "(XOR a b)" LirI64))
+                     (Pair "=" (Pair "(ICMP EQ a b)" LirI1)) (Pair "!=" (Pair "(ICMP NE a b)" LirI1)) (Pair "<" (Pair "(ICMP SLT a b)" LirI1))
+                     (Pair "<=" (Pair "(ICMP SLE a b)" LirI1)) (Pair ">" (Pair "(ICMP SGT a b)" LirI1)) (Pair ">=" (Pair "(ICMP SGE a b)" LirI1))
+                     (Pair "+" (Pair "(SADD-OVERFLOW a b)" LirI64)) (Pair "-" (Pair "(SSUB-OVERFLOW a b)" LirI64))
+                     (Pair "*" (Pair "(SMUL-OVERFLOW a b)" LirI64)) (Pair "rem" (Pair "(SREM a b)" LirI64))
+                     (Pair "quot" (Pair "(SDIV a b)" LirI64)) (Pair "shl" (Pair "(SHL a " LirI64)) (Pair "shr" (Pair "(LSHR a " LirI64))
+                     (Pair "sar" (Pair "(ASHR a " LirI64))])
       (table-checks cs "i1" (VVal (nx/local "p") LirI1) (VVal (nx/local "q") LirI1) (ty-scalar SBool)
-                    [(Pair "<" (Pair "(icmp ult p q)" LirI1)) (Pair ">=" (Pair "(icmp uge p q)" LirI1)) (Pair "=" (Pair "(icmp eq p q)" LirI1))])
+                    [(Pair "<" (Pair "(ICMP ULT p q)" LirI1)) (Pair ">=" (Pair "(ICMP UGE p q)" LirI1)) (Pair "=" (Pair "(ICMP EQ p q)" LirI1))])
       (check cs "an overflow check traps on the flag with the width in the message"
              (let ((r (ran "+" a64 b64 t64)))
-               (and (has (. r cx) "(extractvalue ") (has-cstr (. r cx) "integer overflow in + at i64") (has (. r cx) "(unreachable)"))))
+               (and (has (. r cx) "(EXTRACTVALUE ") (has-cstr (. r cx) "integer overflow in + at i64") (has (. r cx) "(UNREACHABLE)"))))
       (check cs "a shift masks its count to the width: i32 by 31"
              (let ((cx (plain)) (r (lcx-native-method cx "Bits" "shl" [(VVal (nx/local "a") LirI32) (VVal (nx/local "b") LirI32)] [(ty-scalar SI32) (ty-scalar SI32)] (ty-scalar SI32))))
-               (and (has cx "(and b (i32 31))") (has cx "(shl a "))))
+               (and (has cx "(AND b (I32 31))") (has cx "(SHL a "))))
       (check cs "a native method without a receiver is an error naming the method" (starts-err (lcx-native-method (plain) "Num" "+" [] [] t64) "+ without"))
       (check cs "an unknown comparison method is an error" (starts-err (. (ran "nope" a64 b64 t64) r) "native method nope"))))
 
 (defun division-checks (cs: Checks) -> unit
   (do (check cs "quot is the division `/`: the zero check, the minimum check, sdiv, the messages name `/`"
              (let ((r (ran "quot" a64 b64 t64)))
-               (and (has (. r cx) "(icmp eq b (i64 0))") (has (. r cx) "(icmp eq a (i64 -9223372036854775808))") (has (. r cx) "(icmp eq b (i64 -1))")
-                    (has-cstr (. r cx) "integer / by zero") (has-cstr (. r cx) "integer overflow in / at i64") (has (. r cx) "(sdiv a b)"))))
+               (and (has (. r cx) "(ICMP EQ b (I64 0))") (has (. r cx) "(ICMP EQ a (I64 -9223372036854775808))") (has (. r cx) "(ICMP EQ b (I64 -1))")
+                    (has-cstr (. r cx) "integer / by zero") (has-cstr (. r cx) "integer overflow in / at i64") (has (. r cx) "(SDIV a b)"))))
       (check cs "rem names rem and uses srem"
-             (let ((r (ran "rem" a64 b64 t64))) (and (has-cstr (. r cx) "integer rem by zero") (has (. r cx) "(srem a b)"))))
+             (let ((r (ran "rem" a64 b64 t64))) (and (has-cstr (. r cx) "integer rem by zero") (has (. r cx) "(SREM a b)"))))
       (check cs "at i8 the minimum is -128"
-             (let ((r (ran "quot" (VVal (nx/local "a") LirI8) (VVal (nx/local "b") LirI8) (ty-scalar SI8)))) (and (has (. r cx) "(icmp eq a (i8 -128))") (has-cstr (. r cx) "integer overflow in / at i8"))))
+             (let ((r (ran "quot" (VVal (nx/local "a") LirI8) (VVal (nx/local "b") LirI8) (ty-scalar SI8)))) (and (has (. r cx) "(ICMP EQ a (I8 -128))") (has-cstr (. r cx) "integer overflow in / at i8"))))
       (check cs "a literal zero divisor is the trap alone: no value, no division"
              (let ((r (ran "quot" a64 (v-int LirI64 0) t64)))
                (and (= (. r r) (Ok nil)) (has-cstr (. r cx) "integer / by zero") (not (has (. r cx) "sdiv")) (not (has (. r cx) "icmp eq")))))
@@ -78,40 +78,40 @@
   (let ((one (fn (method: str x: V t: Ty) (let ((cx (plain))) (Pair cx (lcx-native-method cx "Num" method [x] [t] t))))))
     (do (check cs "neg traps on the minimum and subtracts from zero"
                (let ((r (one "neg" a64 t64)))
-                 (and (has (. r fst) "(icmp eq a (i64 -9223372036854775808))") (has-cstr (. r fst) "integer overflow in neg at i64") (has (. r fst) "(sub (i64 0) a)"))))
+                 (and (has (. r fst) "(ICMP EQ a (I64 -9223372036854775808))") (has-cstr (. r fst) "integer overflow in neg at i64") (has (. r fst) "(SUB (I64 0) a)"))))
         (check cs "bit-not xors with -1, popcount is ctpop"
-               (and (has (. (one "bit-not" a64 t64) fst) "(xor a (i64 -1))") (has (. (one "popcount" a64 t64) fst) "(ctpop a)")))
+               (and (has (. (one "bit-not" a64 t64) fst) "(XOR a (I64 -1))") (has (. (one "popcount" a64 t64) fst) "(CTPOP a)")))
         (check cs "an unknown unary method is an error" (starts-err (. (one "nope" a64 t64) snd) "unary nope"))
         (check cs "a float negates with fneg, at its own width"
                (let ((r (one "neg" (VVal (nx/local "x") LirFloat) (ty-scalar SF32))))
-                 (and (has (. r fst) "(fneg x)") (match (. r snd) ((Ok (some (VVal _ (LirFloat)))) true) (_ false))))))))
+                 (and (has (. r fst) "(FNEG x)") (match (. r snd) ((Ok (some (VVal _ (LirFloat)))) true) (_ false))))))))
 
 (defun float-checks (cs: Checks) -> unit
   (let ((x (VVal (nx/local "x") LirDouble)) (y (VVal (nx/local "y") LirDouble)) (t (ty-scalar SF64)))
     (do (table-checks cs "f64" x y t
-                      [(Pair "+" (Pair "(fadd x y)" LirDouble)) (Pair "-" (Pair "(fsub x y)" LirDouble)) (Pair "*" (Pair "(fmul x y)" LirDouble))
-                       (Pair "fdiv" (Pair "(fdiv x y)" LirDouble)) (Pair "rem" (Pair "(frem x y)" LirDouble))
-                       (Pair "quot" (Pair "(call @trunc " LirDouble)) (Pair "=" (Pair "(fcmp oeq x y)" LirI1)) (Pair "!=" (Pair "(fcmp une x y)" LirI1))
-                       (Pair "<" (Pair "(fcmp olt x y)" LirI1)) (Pair "<=" (Pair "(fcmp ole x y)" LirI1)) (Pair ">" (Pair "(fcmp ogt x y)" LirI1))
-                       (Pair ">=" (Pair "(fcmp oge x y)" LirI1))])
+                      [(Pair "+" (Pair "(FADD x y)" LirDouble)) (Pair "-" (Pair "(FSUB x y)" LirDouble)) (Pair "*" (Pair "(FMUL x y)" LirDouble))
+                       (Pair "fdiv" (Pair "(FDIV x y)" LirDouble)) (Pair "rem" (Pair "(FREM x y)" LirDouble))
+                       (Pair "quot" (Pair "(CALL (GLOBAL trunc) " LirDouble)) (Pair "=" (Pair "(FCMP OEQ x y)" LirI1)) (Pair "!=" (Pair "(FCMP UNE x y)" LirI1))
+                       (Pair "<" (Pair "(FCMP OLT x y)" LirI1)) (Pair "<=" (Pair "(FCMP OLE x y)" LirI1)) (Pair ">" (Pair "(FCMP OGT x y)" LirI1))
+                       (Pair ">=" (Pair "(FCMP OGE x y)" LirI1))])
         (check cs "f32 quot truncates with truncf, after the division"
                (let ((r (ran "quot" (VVal (nx/local "x") LirFloat) (VVal (nx/local "y") LirFloat) (ty-scalar SF32))))
-                 (and (has (. r cx) "(fdiv x y)") (has (. r cx) "(call @truncf ") (not (has (. r cx) "(call @trunc ")) (= (ty-of r) (some LirFloat))))))))
+                 (and (has (. r cx) "(FDIV x y)") (has (. r cx) "(CALL (GLOBAL truncf) ") (not (has (. r cx) "(CALL (GLOBAL trunc) ")) (= (ty-of r) (some LirFloat))))))))
 
 (defun other-checks (cs: Checks) -> unit
   (do (check cs "strings compare by fib.str-cmp against zero"
              (let ((cx (plain)) (r (lcx-native-method cx "Ord" "<" [(VVal (nx/local "a") LirPtr) (VVal (nx/local "b") LirPtr)] [(TCon KStr []) (TCon KStr [])] (ty-scalar SBool))))
-               (and (has cx "(call @fib.str-cmp a b)") (has cx "(icmp slt ") (has cx "(i32 0))") (= (ty-of (Ran cx r)) (some LirI1)))))
+               (and (has cx "(CALL (GLOBAL fib.str-cmp) a b)") (has cx "(ICMP SLT ") (has cx "(I32 0))") (= (ty-of (Ran cx r)) (some LirI1)))))
       (check cs "a string comparison needs its second operand"
              (starts-err (lcx-native-method (plain) "Ord" "<" [(VVal (nx/local "a") LirPtr)] [(TCon KStr [])] (ty-scalar SBool)) "a string comparison"))
       (check cs "keywords order by name through kw.rank, and the module then has the keyword helpers"
              (let ((cx (plain)) (kw (ty-scalar SKeyword)))
                (do (lcx-native-method cx "Ord" "<" [a64 b64] [kw kw] (ty-scalar SBool))
-                   (and (has cx "(call @kw.rank a)") (has cx "(call @kw.rank b)") @(. (. cx p) keyword-helpers)))))
+                   (and (has cx "(CALL (GLOBAL kw.rank) a)") (has cx "(CALL (GLOBAL kw.rank) b)") @(. (. cx p) keyword-helpers)))))
       (check cs "and equality of keywords is the integer one, with no helpers"
              (let ((cx (plain)) (kw (ty-scalar SKeyword)))
                (do (lcx-native-method cx "Eq" "=" [a64 b64] [kw kw] (ty-scalar SBool))
-                   (and (has cx "(icmp eq a b)") (not @(. (. cx p) keyword-helpers))))))
+                   (and (has cx "(ICMP EQ a b)") (not @(. (. cx p) keyword-helpers))))))
       (check cs "unit equals itself and is neither below nor above"
              (let ((u (fn (m: str) (lcx-native-method (plain) "Ord" m [VUnit VUnit] [(ty-unit) (ty-unit)] (ty-scalar SBool)))))
                (and (= (u "=") (Ok (some (v-int LirI1 1)))) (= (u ">=") (Ok (some (v-int LirI1 1)))) (= (u "<") (Ok (some (v-int LirI1 0))))
@@ -120,32 +120,32 @@
 (defun convert-checks (cs: Checks) -> unit
   (let ((conv (fn (op: ConvOp to: Scalar v: V) (let ((cx (plain))) (Pair cx (lcx-convert cx op to v)))))
         (x (VVal (nx/local "x") LirDouble)) (n (VVal (nx/local "n") LirI64)))
-    (do (check cs "trunc, zext, sext" (and (has (. (conv (CvIntToInt Trunc) SI8 n) fst) "(trunc i8 n)") (has (. (conv (CvIntToInt Zext) SI64 (VVal (nx/local "n") LirI32)) fst) "(zext i64 n)")
-                                           (has (. (conv (CvIntToInt Sext) SI64 (VVal (nx/local "n") LirI8)) fst) "(sext i64 n)")))
+    (do (check cs "trunc, zext, sext" (and (has (. (conv (CvIntToInt Trunc) SI8 n) fst) "(TRUNC I8 n)") (has (. (conv (CvIntToInt Zext) SI64 (VVal (nx/local "n") LirI32)) fst) "(ZEXT I64 n)")
+                                           (has (. (conv (CvIntToInt Sext) SI64 (VVal (nx/local "n") LirI8)) fst) "(SEXT I64 n)")))
         (check cs "an integer conversion to the same width is no instruction"
                (let ((r (conv (CvIntToInt Sext) SI64 n))) (and (= (. r snd) (Ok n)) (not (has (. r fst) "sext")))))
         (check cs "fptrunc and fpext, and a float to its own type is no instruction"
-               (and (has (. (conv CvFloatToFloat SF32 x) fst) "(fptrunc float x)") (has (. (conv CvFloatToFloat SF64 (VVal (nx/local "x") LirFloat)) fst) "(fpext double x)")
+               (and (has (. (conv CvFloatToFloat SF32 x) fst) "(FPTRUNC FLOAT x)") (has (. (conv CvFloatToFloat SF64 (VVal (nx/local "x") LirFloat)) fst) "(FPEXT DOUBLE x)")
                     (= (. (conv CvFloatToFloat SF64 x) snd) (Ok x))))
         (check cs "float to integer saturates, signed or not"
-               (and (has (. (conv (CvFloatToInt true) SI8 x) fst) "(fptosi-sat i8 x)") (has (. (conv (CvFloatToInt false) SI32 x) fst) "(fptoui-sat i32 x)")))
+               (and (has (. (conv (CvFloatToInt true) SI8 x) fst) "(FPTOSI-SAT I8 x)") (has (. (conv (CvFloatToInt false) SI32 x) fst) "(FPTOUI-SAT I32 x)")))
         (check cs "integer to float, signed or not"
-               (and (has (. (conv (CvIntToFloat true) SF64 n) fst) "(sitofp double n)") (has (. (conv (CvIntToFloat false) SF32 n) fst) "(uitofp float n)")))
+               (and (has (. (conv (CvIntToFloat true) SF64 n) fst) "(SITOFP DOUBLE n)") (has (. (conv (CvIntToFloat false) SF32 n) fst) "(UITOFP FLOAT n)")))
         (check cs "a conversion to unit or of unit is an error"
                (and (starts-err (. (conv (CvIntToInt Zext) SUnit n) snd) "conversion to unit") (starts-err (. (conv (CvIntToInt Zext) SI64 VUnit) snd) "conversion of unit"))))))
 
 (defun bits-checks (cs: Checks) -> unit
   (let ((one (fn (name: str v: V) (let ((cx (plain))) (Pair cx (lcx-float-bits cx name v))))))
     (do (check cs "the four bit casts are bitcasts to the width's other type"
-               (and (has (. (one "f64->bits" (VVal (nx/local "x") LirDouble)) fst) "(bitcast i64 x)") (has (. (one "bits->f64" a64) fst) "(bitcast double a)")
-                    (has (. (one "f32->bits" (VVal (nx/local "x") LirFloat)) fst) "(bitcast i32 x)") (has (. (one "bits->f32" (VVal (nx/local "n") LirI32)) fst) "(bitcast float n)")))
+               (and (has (. (one "f64->bits" (VVal (nx/local "x") LirDouble)) fst) "(BITCAST I64 x)") (has (. (one "bits->f64" a64) fst) "(BITCAST DOUBLE a)")
+                    (has (. (one "f32->bits" (VVal (nx/local "x") LirFloat)) fst) "(BITCAST I32 x)") (has (. (one "bits->f32" (VVal (nx/local "n") LirI32)) fst) "(BITCAST FLOAT n)")))
         (check cs "another name is an error" (starts-err (. (one "f16->bits" a64) snd) "builtin f16->bits")))))
 
 (defun trap-checks (cs: Checks) -> unit
   (let ((cx (plain)))
     (do (lcx-trap-if cx (VVal (nx/local "c") LirI1) "boom")
         (check cs "trap-if branches on the flag to a trap block and continues in a fresh ok block"
-               (and (has cx "(br c ") (has-cstr cx "boom") (has cx "(unreachable)") (s/starts-with? (fb-current (. cx b)) "ok"))))))
+               (and (has cx "(BR c ") (has-cstr cx "boom") (has cx "(UNREACHABLE)") (s/starts-with? (fb-current (. cx b)) "ok"))))))
 
 ;; ---- calls
 
@@ -154,33 +154,33 @@
 
 (defun emit-call-checks (cs: Checks) -> unit
   (do (check cs "a direct call: the unit argument is not passed, the result is a value of the return type"
-               (let ((r (emitted (TgDirect "f.g" false) [a64 VUnit b64] t64 false))) (and (has (. r cx) "(call @f.g a b)") (= (ty-of r) (some LirI64)))))
+               (let ((r (emitted (TgDirect "f.g" false) [a64 VUnit b64] t64 false))) (and (has (. r cx) "(CALL (GLOBAL f.g) a b)") (= (ty-of r) (some LirI64)))))
         (check cs "an all-owned callee takes a null environment first"
-               (has (. (emitted (TgDirect "f.g" true) [a64] t64 false) cx) "(call @f.g (ptr null) a)"))
+               (has (. (emitted (TgDirect "f.g" true) [a64] t64 false) cx) "(CALL (GLOBAL f.g) (PTR NULL) a)"))
         (check cs "a tail call ends the block and yields unit"
-               (let ((r (emitted (TgDirect "f.g" false) [a64] t64 true))) (and (= (. r r) (Ok (some VUnit))) (fb-closed (. (. r cx) b)) (has (. r cx) "(tailcall @f.g a)"))))
+               (let ((r (emitted (TgDirect "f.g" false) [a64] t64 true))) (and (= (. r r) (Ok (some VUnit))) (fb-closed (. (. r cx) b)) (has (. r cx) "(TAILCALL (GLOBAL f.g) a)"))))
         (check cs "a unit result is a statement"
-               (let ((r (emitted (TgDirect "f.g" false) [a64] (ty-unit) false))) (and (= (. r r) (Ok (some VUnit))) (has (. r cx) "(call @f.g a)"))))
+               (let ((r (emitted (TgDirect "f.g" false) [a64] (ty-unit) false))) (and (= (. r r) (Ok (some VUnit))) (has (. r cx) "(CALL (GLOBAL f.g) a)"))))
         (check cs "an extern is called by its own name"
-               (has (. (emitted (TgExtern "abs") [a64] t64 false) cx) "(call @abs a)"))
+               (has (. (emitted (TgExtern "abs") [a64] t64 false) cx) "(CALL (GLOBAL abs) a)"))
         (check cs "a vtable's code is called indirectly with this first and the types of the rest"
                (let ((r (emitted (TgCode (nx/local "c1") (nx/local "this")) [(VVal (nx/local "this") LirPtr) a64 b64] t64 false)))
-                 (has (. r cx) "(indirect-call c1 (fn tailcc i64 (ptr i64 i64)) this a b)")))
+                 (has (. r cx) "(INDIRECT-CALL c1 (FUNCTION TAILCC I64 (PTR I64 I64)) this a b)")))
         (check cs "a closure's code is loaded from the closure object and called with it first, in tail position too"
                (let ((r (emitted (TgValue (VVal (nx/local "clo") LirPtr)) [a64] t64 true)))
-                 (and (has (. r cx) "(getelementptr %struct.fib.closure clo (i32 0) (i32 3))") (has (. r cx) "(load ptr ")
-                      (has (. r cx) "(indirect-tailcall ") (has (. r cx) "(fn tailcc i64 (ptr i64)) clo a)"))))
+                 (and (has (. r cx) "(GETELEMENTPTR (STRUCT fib.closure) clo (I32 0) (I32 3))") (has (. r cx) "(LOAD PTR ")
+                      (has (. r cx) "(INDIRECT-TAILCALL ") (has (. r cx) "(FUNCTION TAILCC I64 (PTR I64)) clo a)"))))
         (check cs "a unit-returning closure call has void in its type"
-               (has (. (emitted (TgValue (VVal (nx/local "clo") LirPtr)) [] (ty-unit) false) cx) "(fn tailcc void (ptr)) clo )"))
+               (has (. (emitted (TgValue (VVal (nx/local "clo") LirPtr)) [] (ty-unit) false) cx) "(FUNCTION TAILCC VOID (PTR)) clo )"))
         (check cs "a builtin is not a callable target" (starts-err (. (emitted (TgBuiltin "x") [] t64 false) r) "not a callable target"))))
 
 (defun cell-checks (cs: Checks) -> unit
   (let ((cx (plain)) (cy (plain)))
     (do (check cs "a cell's content: the field's address, then the load"
                (and (match (lcx-cell-load cx "o.cell" (nx/local "c") t64) ((Ok (VVal _ (LirI64))) true) (_ false))
-                    (has cx "(getelementptr %struct.o.cell c (i32 0) (i32 3))") (has cx "(load i64 ")))
+                    (has cx "(GETELEMENTPTR (STRUCT o.cell) c (I32 0) (I32 3))") (has cx "(LOAD I64 ")))
         (check cs "a unit content has no load, but the address is taken as in the Rust"
-               (and (= (lcx-cell-load cy "o.cell" (nx/local "c") (ty-unit)) (Ok VUnit)) (has cy "(getelementptr") (not (has cy "(load")))))))
+               (and (= (lcx-cell-load cy "o.cell" (nx/local "c") (ty-unit)) (Ok VUnit)) (has cy "(GETELEMENTPTR") (not (has cy "(LOAD")))))))
 
 ;; ---- instance-of-pred
 

@@ -36,18 +36,18 @@
                  (_ false)) "a join with no type: a unit value, the join block current")
         (fb-term (. c b) (nx/branch "j"))
         (is cs (match (lcx-join-branches c "j" (some LirI64) [(Pair "entry" v1) (Pair "x" v2)])
-                 ((Ok (FlowVal (VVal n (LirI64)))) (and (includes c "(phi i64 (entry t1) (x t2))") (includes c (nx/text n))))
+                 ((Ok (FlowVal (VVal n (LirI64)))) (and (includes c "(PHI I64 (entry t1) (x t2))") (includes c (nx/text n))))
                  (_ false)) "a join of two values: a phi of their edges"))))
 
 (defun word-checks (cs: StepLog) -> unit
   (let ((cx (plain)))
     (do (is cs (match (lcx-obj-word cx (VVal (nx/local "p") LirPtr)) ((some word) (= (nx/text word) "p")) (nil false)) "a pointer is its own word")
         (is cs (and (nil? (lcx-obj-word cx (VVal (nx/local "p") LirRaw))) (nil? (lcx-obj-word cx (v-int LirI64 1)))) "a raw pointer and a scalar have none")
-        (is cs (and (match (lcx-obj-word cx (VVal (nx/local "d") LirDyn)) ((some w) (includes cx (str-join ["(extractvalue d 0)"]))) (nil false))) "a dyn's word is its first element")
+        (is cs (and (match (lcx-obj-word cx (VVal (nx/local "d") LirDyn)) ((some w) (includes cx (str-join ["(EXTRACTVALUE d 0)"]))) (nil false))) "a dyn's word is its first element")
         (is cs (let ((g (lcx-gep cx "o.S" (nx/local "p") 3)) (l (lcx-load cx LirI32 g)))
                  (do (lcx-store cx l (nx/local "q")) (lcx-store cx VUnit (nx/local "r"))
-                     (and (includes cx "(getelementptr %struct.o.S p (i32 0) (i32 3))") (includes cx (str-join ["(load i32 " (nx/text g) ")"]))
-                          (includes cx (str-join ["(store " (v-text l) " q)"])) (not (includes cx "(store  r)"))))) "gep, load and store text"))))
+                     (and (includes cx "(GETELEMENTPTR (STRUCT o.S) p (I32 0) (I32 3))") (includes cx (str-join ["(LOAD I32 " (nx/text g) ")"]))
+                          (includes cx (str-join ["(STORE " (v-text l) " q)"])) (not (includes cx "(STORE  r)"))))) "gep, load and store text"))))
 
 (defun ops-own (e: i64 ops: (Vec Op)) -> BodyOwn
   (BodyOwn [] (assoc (map-empty) e (ExprOwn MScalar ops)) (map-empty) (assoc (map-empty) 2 (CallOwn (CalFun 0) TlNotInTail PsScalar [] [] [(Op OpRelease (SiteValue 6) WhyJump)]))
@@ -60,14 +60,14 @@
         (is cs (match (lcx-site cx (SiteValue 5)) ((Err m) (s/starts-with? m "the plan names value 5")) (_ false)) "a site that names a value with none is an error")
         (is cs (and (match (lcx-site cx (SiteGlobal 1)) ((Ok (nil)) true) (_ false)) (match (lcx-site cx (SiteEnv 1)) ((Ok (nil)) true) (_ false))) "a def has no value, the env is the context's")
         (set! (. cx values) (assoc @(. cx values) 5 (VVal (nx/local "t5") LirPtr)))
-        (is cs (and (not (err-starts (lcx-run-ops cx (. (nth (vec (vals (. own exprs))) 0) after)) "")) (includes cx "(call @fib.retain t5)")
-                    (includes cx "(call @fib.stack-end t5)") (includes cx "(call @fib.drop-fields t5)")) "retain and the end of a stack object run in order, one `fib.stack-end` and one `fib.drop-fields`")
+        (is cs (and (not (err-starts (lcx-run-ops cx (. (nth (vec (vals (. own exprs))) 0) after)) "")) (includes cx "(CALL (GLOBAL fib.retain) t5)")
+                    (includes cx "(CALL (GLOBAL fib.stack-end) t5)") (includes cx "(CALL (GLOBAL fib.drop-fields) t5)")) "retain and the end of a stack object run in order, one `fib.stack-end` and one `fib.drop-fields`")
         (set! (. cx closure-slots) (conj @(. cx closure-slots) "t5"))
         (is cs (let ((n (count (s/split (text-of cx) "fib.drop-fields"))))
                  (do (lcx-run-ops cx [(Op OpEndStack (SiteValue 5) WhyScopeExit)])
                      (= (count (s/split (text-of cx) "fib.drop-fields")) n))) "a stack closure's end runs no drop")
         (set! (. cx values) (assoc @(. cx values) 6 (v-int LirI64 1)))
-        (is cs (and (match (lcx-run-ops cx [(Op OpRelease (SiteValue 6) WhyJump)]) ((Ok _) (not (includes cx "(call @fib.release")))  (_ false))
+        (is cs (and (match (lcx-run-ops cx [(Op OpRelease (SiteValue 6) WhyJump)]) ((Ok _) (not (includes cx "(CALL (GLOBAL fib.release")))  (_ false))
                     (err-starts (lcx-run-ops cx [(Op OpEndStack (SiteValue 6) WhyScopeExit)]) "the plan ends a scalar")) "an operation on a scalar emits nothing, and ending one as a stack object is an error"))))
 
 (defun flow-checks (cs: StepLog) -> unit
@@ -79,7 +79,7 @@
                       (match (lcx-value cx (lit 7)) ((Ok (VVal (la/LExpr (la/KLocal "hub") _) _)) true) (_ false)))) "lcx-expr is the context's function, lcx-value the value it yields")
         (is cs (let ((cx (plain)))
                  (do (set! (. cx locals) (assoc (assoc (assoc @(. cx locals) 1 (LocalVal (VVal (nx/local "v") LirI64))) 2 (LocalSlot (nx/local "s") (some LirI32))) 3 (LocalSlot (nx/local "u") nil)))
-                     (and (= (lcx-local cx 1) (Ok (VVal (nx/local "v") LirI64))) (match (lcx-local cx 2) ((Ok (VVal _ (LirI32))) (includes cx "(load i32 s)")) (_ false))
+                     (and (= (lcx-local cx 1) (Ok (VVal (nx/local "v") LirI64))) (match (lcx-local cx 2) ((Ok (VVal _ (LirI32))) (includes cx "(LOAD I32 s)")) (_ false))
                           (= (lcx-local cx 3) (Ok VUnit))))) "a local: a value as it is, a slot loaded, a unit slot unit"))))
 
 (defun unit-steps () -> (Vec StepRun)

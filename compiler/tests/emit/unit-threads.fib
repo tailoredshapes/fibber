@@ -32,55 +32,55 @@
 
 ;; The lines the Rust's `completion` prints around a result's code, for a result whose slots are of atom `a`.
 (defun entry-let (name: str a: str) -> (Vec str)
-  [(str-join ["(define internal (" name " ptr) ((ptr task))"]) "  (block entry"
-   "    (let ((f (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 9))))"
-   "          (code (load ptr (getelementptr %struct.fib.closure f (i32 0) (i32 3))))"
-   "          (atom (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 7))))"
-   (str-join ["          (lockp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 3)))"])
-   (str-join ["          (vp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 4))))"])])
+  [(str-join ["(DEFINE INTERNAL (" name " PTR) ((PTR task))"]) "  (BLOCK entry"
+   "    (LET ((f (LOAD PTR (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 9))))"
+   "          (code (LOAD PTR (GETELEMENTPTR (STRUCT fib.closure) f (I32 0) (I32 3))))"
+   "          (atom (LOAD PTR (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 7))))"
+   (str-join ["          (lockp (GETELEMENTPTR (STRUCT fib.atom." a ") atom (I32 0) (I32 3)))"])
+   (str-join ["          (vp (GETELEMENTPTR (STRUCT fib.atom." a ") atom (I32 0) (I32 4))))"])])
 
 (defun thread-tail () -> (Vec str)
-  ["      (call @fib.thread-uncount)" "      (call @fib.task-complete task)" "      (call @fib.release task)" "      (call @fib.thread-done)" "      (ret (ptr null)))))"])
+  ["      (CALL (GLOBAL fib.thread-uncount))" "      (CALL (GLOBAL fib.task-complete) task)" "      (CALL (GLOBAL fib.release) task)" "      (CALL (GLOBAL fib.thread-done))" "      (RET (PTR NULL)))))"])
 
 (defun thread-i64 () -> str
   (lines (into (into (entry-let "fib.thread.i64" "i64")
-                     ["      (let ((v (indirect-call code (fn tailcc i64 (ptr)) f)))" "        (call @fib.lock lockp)"
-                      "        (let ((old (load i64 vp)))" "          (store v vp)" "          (call @fib.unlock lockp)))"])
+                     ["      (LET ((v (INDIRECT-CALL code (FUNCTION TAILCC I64 (PTR)) f)))" "        (CALL (GLOBAL fib.lock) lockp)"
+                      "        (LET ((old (LOAD I64 vp)))" "          (STORE v vp)" "          (CALL (GLOBAL fib.unlock) lockp)))"])
                (thread-tail))))
 
 (defun thread-str () -> str
   (lines (into (into (entry-let "fib.thread.str" "ptr")
-                     ["      (let ((v (indirect-call code (fn tailcc ptr (ptr)) f)))" "        (call @fib.share v)" "        (call @fib.lock lockp)"
-                      "        (let ((old (load ptr vp)))" "          (store v vp)" "          (call @fib.retain v)" "          (call @fib.unlock lockp)"
-                      "          (call @fib.release old)" "          (call @fib.release v)))"])
+                     ["      (LET ((v (INDIRECT-CALL code (FUNCTION TAILCC PTR (PTR)) f)))" "        (CALL (GLOBAL fib.share) v)" "        (CALL (GLOBAL fib.lock) lockp)"
+                      "        (LET ((old (LOAD PTR vp)))" "          (STORE v vp)" "          (CALL (GLOBAL fib.retain) v)" "          (CALL (GLOBAL fib.unlock) lockp)"
+                      "          (CALL (GLOBAL fib.release) old)" "          (CALL (GLOBAL fib.release) v)))"])
                (thread-tail))))
 
 (defun thread-unit () -> str
   (lines (into (into (entry-let "fib.thread.unit" "i1")
-                     ["      (indirect-call code (fn tailcc void (ptr)) f)" "      (call @fib.lock lockp)" "      (call @fib.unlock lockp)"])
+                     ["      (INDIRECT-CALL code (FUNCTION TAILCC VOID (PTR)) f)" "      (CALL (GLOBAL fib.lock) lockp)" "      (CALL (GLOBAL fib.unlock) lockp)"])
                (thread-tail))))
 
 (defun complete-top (name: str param: str a: str) -> (Vec str)
-  [(str-join ["(define internal (" name " void) ((ptr task)" param ")"]) "  (block entry" "    (let ("
-   "          (atom (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 7))))"
-   (str-join ["          (lockp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 3)))"])
-   (str-join ["          (vp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 4))))"])])
+  [(str-join ["(DEFINE INTERNAL (" name " VOID) ((PTR task)" param ")"]) "  (BLOCK entry" "    (LET ("
+   "          (atom (LOAD PTR (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 7))))"
+   (str-join ["          (lockp (GETELEMENTPTR (STRUCT fib.atom." a ") atom (I32 0) (I32 3)))"])
+   (str-join ["          (vp (GETELEMENTPTR (STRUCT fib.atom." a ") atom (I32 0) (I32 4))))"])])
 
-(defun complete-tail () -> (Vec str) ["      (call @fib.task-complete task)" "      (ret))))"])
+(defun complete-tail () -> (Vec str) ["      (CALL (GLOBAL fib.task-complete) task)" "      (RET))))"])
 
 (defun complete-i64 (name: str) -> str
-  (lines (into (into (complete-top name " (i64 v0)" "i64")
-                     ["        (call @fib.lock lockp)" "        (let ((old (load i64 vp)))" "          (store v0 vp)" "          (call @fib.unlock lockp))"])
+  (lines (into (into (complete-top name " (I64 v0)" "i64")
+                     ["        (CALL (GLOBAL fib.lock) lockp)" "        (LET ((old (LOAD I64 vp)))" "          (STORE v0 vp)" "          (CALL (GLOBAL fib.unlock) lockp))"])
                (complete-tail))))
 
 (defun complete-str (name: str) -> str
-  (lines (into (into (complete-top name " (ptr v0)" "ptr")
-                     ["        (call @fib.share v0)" "        (call @fib.lock lockp)" "        (let ((old (load ptr vp)))" "          (store v0 vp)"
-                      "          (call @fib.retain v0)" "          (call @fib.unlock lockp)" "          (call @fib.release old)" "          (call @fib.release v0))"])
+  (lines (into (into (complete-top name " (PTR v0)" "ptr")
+                     ["        (CALL (GLOBAL fib.share) v0)" "        (CALL (GLOBAL fib.lock) lockp)" "        (LET ((old (LOAD PTR vp)))" "          (STORE v0 vp)"
+                      "          (CALL (GLOBAL fib.retain) v0)" "          (CALL (GLOBAL fib.unlock) lockp)" "          (CALL (GLOBAL fib.release) old)" "          (CALL (GLOBAL fib.release) v0))"])
                (complete-tail))))
 
 (defun complete-unit (name: str) -> str
-  (lines (into (into (complete-top name "" "i1") ["      (call @fib.lock lockp)" "      (call @fib.unlock lockp)"]) (complete-tail))))
+  (lines (into (into (complete-top name "" "i1") ["      (CALL (GLOBAL fib.lock) lockp)" "      (CALL (GLOBAL fib.unlock) lockp)"]) (complete-tail))))
 
 (defun helper-checks (cs: Checks) -> unit
   (let ((cx (cx-of (map-empty) (no-hub))))
@@ -105,18 +105,18 @@
 ;; The function `spawn` of an i64 task builds: the Rust's instructions (`fibc emit` of `(spawn (fn () 1))`, 2026-10-02), the names renumbered
 ;; from t1 and the atom's type id (4 here, 5 in that program).
 (defun spawn-i64-text () -> str
-  (lines ["(define internal tailcc (f.t void) ()" "  (block entry" "    (call @fib.share f0)"
-          "    (let ((t1 (call @fib.alloc (i64 32) (i32 4)))" "          (t2 (getelementptr %struct.fib.atom.i64 t1 (i32 0) (i32 3))))" "      (store (i32 0) t2))"
-          "    (let ((t3 (getelementptr %struct.fib.atom.i64 t1 (i32 0) (i32 4))))" "      (store (i64 0) t3))"
-          "    (let ((t4 (call @fib.alloc (i64 64) (i32 3))))" "      (call @fib.retain t4))"
-          "    (let ((t5 (getelementptr %struct.fib.task t4 (i32 0) (i32 3))))" "      (store (i32 1) t5))"
-          "    (let ((t6 (getelementptr %struct.fib.task t4 (i32 0) (i32 4))))" "      (store (i32 1) t6))"
-          "    (let ((t7 (getelementptr %struct.fib.task t4 (i32 0) (i32 5))))" "      (store (i32 0) t7))"
-          "    (let ((t8 (getelementptr %struct.fib.task t4 (i32 0) (i32 6))))" "      (store (ptr null) t8))"
-          "    (let ((t9 (getelementptr %struct.fib.task t4 (i32 0) (i32 8))))" "      (store (ptr null) t9))"
-          "    (let ((t10 (getelementptr %struct.fib.task t4 (i32 0) (i32 7))))" "      (store t1 t10))"
-          "    (let ((t11 (getelementptr %struct.fib.task t4 (i32 0) (i32 9))))" "      (store f0 t11))"
-          "    (call @fib.share t4)" "    (call @fib.spawn t4 @fib.thread.i64)" "  ))"]))
+  (lines ["(define internal tailcc (f.t void) ()" "  (block entry" "    (CALL (GLOBAL fib.share) f0)"
+          "    (let ((t1 (CALL (GLOBAL fib.alloc) (I64 32) (I32 4)))" "          (t2 (GETELEMENTPTR (STRUCT fib.atom.i64) t1 (I32 0) (I32 3))))" "      (STORE (I32 0) t2))"
+          "    (let ((t3 (GETELEMENTPTR (STRUCT fib.atom.i64) t1 (I32 0) (I32 4))))" "      (STORE (I64 0) t3))"
+          "    (let ((t4 (CALL (GLOBAL fib.alloc) (I64 64) (I32 3))))" "      (CALL (GLOBAL fib.retain) t4))"
+          "    (let ((t5 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 3))))" "      (STORE (I32 1) t5))"
+          "    (let ((t6 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 4))))" "      (STORE (I32 1) t6))"
+          "    (let ((t7 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 5))))" "      (STORE (I32 0) t7))"
+          "    (let ((t8 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 6))))" "      (STORE (PTR NULL) t8))"
+          "    (let ((t9 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 8))))" "      (STORE (PTR NULL) t9))"
+          "    (let ((t10 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 7))))" "      (STORE t1 t10))"
+          "    (let ((t11 (GETELEMENTPTR (STRUCT fib.task) t4 (I32 0) (I32 9))))" "      (STORE f0 t11))"
+          "    (CALL (GLOBAL fib.share) t4)" "    (CALL (GLOBAL fib.spawn) t4 (GLOBAL fib.thread.i64))" "  ))"]))
 
 (defun spawn-checks (cs: Checks) -> unit
   (let ((a (spawn-of (i64-t))) (b (spawn-of (ty-str))) (c (spawn-of (ty-unit))))
@@ -136,15 +136,15 @@
     (do (check cs "join of an i64 task: drive, then the result loaded from the atom"
                (let ((r (lcx-join cx (lit 7) (VVal (nx/local "t0") LirPtr))) (text (text-of cx)))
                  (and (match r ((Ok (VVal _ (LirI64))) true) (_ false))
-                      (s/includes? text "(call @fib.drive t0)")
-                      (s/includes? text "(getelementptr %struct.fib.task t0 (i32 0) (i32 7))")
-                      (s/includes? text "(load ptr t1)")
-                      (s/includes? text "(getelementptr %struct.fib.atom.i64 t2 (i32 0) (i32 4))"))))
+                      (s/includes? text "(CALL (GLOBAL fib.drive) t0)")
+                      (s/includes? text "(GETELEMENTPTR (STRUCT fib.task) t0 (I32 0) (I32 7))")
+                      (s/includes? text "(LOAD PTR t1)")
+                      (s/includes? text "(GETELEMENTPTR (STRUCT fib.atom.i64) t2 (I32 0) (I32 4))"))))
         (check cs "join of a unit task has no value and retains nothing"
                (let ((cx2 (cx-of (map-empty) (no-hub))))
                  (and (= (lcx-join-value cx2 (VVal (nx/local "t0") LirPtr) (ty-unit)) (Ok VUnit))
-                      (not (s/includes? (text-of cx2) "(call @fib.retain"))
-                      (s/includes? (text-of cx2) "(call @fib.drive t0)")))))))
+                      (not (s/includes? (text-of cx2) "(CALL (GLOBAL fib.retain"))
+                      (s/includes? (text-of cx2) "(CALL (GLOBAL fib.drive) t0)")))))))
 
 (defun await-checks (cs: Checks) -> unit
   (let ((cx (cx-of (assoc (map-empty) 7 (ty-task (i64-t))) (hub-of (VVal (nx/local "t9") LirPtr)))))
@@ -154,16 +154,16 @@
         (let ((r (lcx-await-task cx (lit 7))) (text (text-of cx)))
           (do (check cs "await: the next state's point stored, park or resume, the result read in the resume block"
                      (and (match r ((Ok (VVal _ (LirI64))) true) (_ false))
-                          (s/includes? text "(store (i32 1) t1)")
-                          (s/includes? text "(call @fib.await-or-park env t9)")
-                          (s/includes? text "(br t2 park3 resume4)")
+                          (s/includes? text "(STORE (I32 1) t1)")
+                          (s/includes? text "(CALL (GLOBAL fib.await-or-park) env t9)")
+                          (s/includes? text "(BR t2 park3 resume4)")
                           (s/includes? text "(block park3")
                           (s/includes? text "(block resume4")))
               (check cs "await records the continuation block as the next state of the frame"
                      (match @(. cx async-frame) ((some f) (= (. f states) ["resume4"])) (nil false)))
               (check cs "a second await stores point 2"
                      (do (lcx-await-task cx (lit 7))
-                         (and (s/includes? (text-of cx) "(store (i32 2) ")
+                         (and (s/includes? (text-of cx) "(STORE (I32 2) ")
                               (match @(. cx async-frame) ((some f) (= (count (. f states)) 2)) (nil false))))))))))
 
 (defun main () -> i64

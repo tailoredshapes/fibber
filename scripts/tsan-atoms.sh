@@ -21,7 +21,7 @@ bad=0
 for src in "$@"; do
   name=$(basename "$src" .fib); b=$OUT/$name
   ( cd "$R" && "$FIBC" emit -I compiler -I lib -I cases/stdlib/support "$src" ) > "$b.lir" 2> "$b.emit.err" || { echo "$name: emit failed"; head -3 "$b.emit.err"; bad=2; continue; }
-  # TSAN_SED: a sed expression applied to the lIR (the planted-race self-test: TSAN_SED='s/(atomic-store seq_cst /(store /' makes the stores of scalar atoms plain, which must be reported)
+  # TSAN_SED: a sed expression applied to the lIR (the planted-race self-test: TSAN_SED='s/\(ATOMIC-STORE SEQ_CST /(STORE /' makes the stores of scalar atoms plain, which must be reported)
   [ -n "${TSAN_SED:-}" ] && sed -i -E "$TSAN_SED" "$b.lir"
   "$LAIRF" emit-llvm "$b.lir" > "$b.ll" 2> "$b.ll.err" || { echo "$name: emit-llvm failed"; head -3 "$b.ll.err"; bad=2; continue; }
   sed -i -E 's/^(\s*%[0-9a-z.]+ = )load i32, ptr @fib\.mt, align 4/\1load atomic i32, ptr @fib.mt monotonic, align 4/; s/^(\s*)store i32 1, ptr @fib\.mt, align 4/\1store atomic i32 1, ptr @fib.mt monotonic, align 4/' "$b.ll"

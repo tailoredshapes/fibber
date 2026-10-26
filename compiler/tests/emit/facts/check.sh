@@ -1,7 +1,7 @@
 #!/bin/bash
 # compiler/tests/emit/facts/check.sh FIBC: the lIR facts the emitter proves (compiler/emit/lower/facts.fib, spec/lir.md 6.13).
-#   1. the lIR of cases/stdlib/8852 has its five bounded steps as `add nsw`/`sub nsw` and of vec.fib the tail read of vec-nth as
-#      `(assume (icmp ult ..))` with no `fib.trap-index` in vec-nth's body; the stage 2 before the facts emits none of them;
+#   1. the lIR of cases/stdlib/8852 has its five bounded steps as `ADD NSW`/`SUB NSW` and of vec.fib the tail read of vec-nth as
+#      `(ASSUME (ICMP ULT ..))` with no `fib.trap-index` in vec-nth's body; the stage 2 before the facts emits none of them;
 #   2. the boundary cases 8852 (steps up to the maximum and down to the minimum) and 8853 (a step under `<=`: no fact, the overflow
 #      trap) and the vec-nth edge cases 8849 to 8851 pass in the default mode and under FIB_LIR_FACTS=trap;
 #   3. --plant: two false facts are planted in copies of the emitter, built by FIBC: (a) a step under `<=` taken as bounded, (b) the
@@ -23,16 +23,16 @@ lib=${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}
 
 # 1. the facts in the lIR
 timeout 300 "$fibc" emit -I cases/stdlib/support cases/stdlib/8852-a-counted-step-at-the-edge-of-its-type.fib > "$out/steps.lir" 2> "$out/steps.err" || no "emit 8852: $(head -c 300 "$out/steps.err")"
-n=$(grep -o '(add nsw [^ ]* (i\(64\|32\) 1))\|(add nsw (i64 1) [^ )]*)\|(sub nsw [^ ]* (i64 1))' "$out/steps.lir" | wc -l)
+n=$(grep -o '(ADD NSW [^ ]* (I\(64\|32\) 1))\|(ADD NSW (I64 1) [^ )]*)\|(SUB NSW [^ ]* (I64 1))' "$out/steps.lir" | wc -l)
 [ "$n" -eq 5 ] && ok "8852: the 5 bounded steps are nsw facts" || no "8852: $n bounded steps are nsw facts, wanted 5"
 timeout 300 "$fibc" emit "$here/vec.fib" > "$out/vec.lir" 2> "$out/vec.err" || no "emit vec.fib: $(head -c 300 "$out/vec.err")"
 python3 - "$out/vec.lir" <<'PY' && ok "vec-nth: the tail read is an assume, with no index trap" || no "vec-nth: not the assume (see above)"
 import re, sys
 lines = open(sys.argv[1]).read().split('\n')
-body = [l for l in lines if re.match(r'\(define [a-z ]*\(f\.fib\.prelude\.vec-nth\.', l)]
+body = [l for l in lines if re.match(r'\(DEFINE [A-Z ]*\(f\.fib\.prelude\.vec-nth\.', l)]
 if not body: print('no vec-nth body'); sys.exit(1)
 b = body[0]
-if '(assume (icmp ult' not in b: print('no assume in vec-nth'); sys.exit(1)
+if '(ASSUME (ICMP ULT' not in b: print('no assume in vec-nth'); sys.exit(1)
 if 'fib.trap-index' in b or 'fib.raise-index' in b: print('vec-nth still has the index trap'); sys.exit(1)
 PY
 

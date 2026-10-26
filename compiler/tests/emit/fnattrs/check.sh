@@ -24,10 +24,10 @@ lir, ll = open(sys.argv[1]).read(), open(sys.argv[2]).read()
 want = {'f.cold-path': {'noinline', 'cold'}, 'f.keep-out': {'noinline'}, 'f.plain-slow': set()}
 bad = 0
 for name, attrs in want.items():
-    m = re.search(r'^\(define ([^(]*)\(' + re.escape(name) + r' ', lir, re.M)
+    m = re.search(r'^\(DEFINE ([^(]*)\(' + re.escape(name) + r' ', lir, re.M)
     if not m: print('check.sh: no lIR define of ' + name); bad = 1; continue
-    words = set(m.group(1).split()) & {'noinline', 'cold'}
-    if words != attrs: print('check.sh: lIR define of %s has %s, wanted %s' % (name, sorted(words), sorted(attrs))); bad = 1
+    words = set(m.group(1).split()) & {'NOINLINE', 'COLD'}
+    if words != {a.upper() for a in attrs}: print('check.sh: lIR define of %s has %s, wanted %s' % (name, sorted(words), sorted(attrs))); bad = 1
 groups = dict(re.findall(r'^attributes #(\d+) = \{([^}]*)\}', ll, re.M))
 for name, attrs in want.items():
     m = re.search(r'^define [^@]*@"?' + re.escape(name) + r'"?\([^\n]*?(?:#(\d+) )?\{', ll, re.M)
