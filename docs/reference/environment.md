@@ -55,7 +55,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LIVE_EMIT` | [compiler/emit/program.fib:113](../../compiler/emit/program.fib#L113) |
 | `FIB_LIVE_LIBS` | [compiler/fibc.fib:127](../../compiler/fibc.fib#L127) |
 | `FIB_LIVE_OWN_UID` | [compiler/serve/livesock.fib:81](../../compiler/serve/livesock.fib#L81) |
-| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:266](../../compiler/emit/program.fib#L266) |
+| `FIB_LIVE_QUEUE` | [compiler/emit/program.fib:267](../../compiler/emit/program.fib#L267) |
 | `FIB_LIVE_ROOTS` | [compiler/driver/front.fib:68](../../compiler/driver/front.fib#L68) |
 | `FIB_LIVE_SOCKET` | [compiler/serve/live.fib:357](../../compiler/serve/live.fib#L357) |
 | `FIB_LIVE_WITH` | [compiler/fibc.fib:77](../../compiler/fibc.fib#L77) |
