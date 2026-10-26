@@ -160,7 +160,12 @@ tool_sh-make-graph := $(T)/make/graph.sh | $(wildcard $(T)/make/*) scripts/mac-g
 # atom, a def and a spawned thread; a worker parked at a pause point it reaches through a function value, in a body swapped and retired under it
 tool_sh-live-retire := $(T)/live/retire.sh $(F_ABS) | $(T)/live/retire.sh $(T)/live/retire.py $(T)/live/retire-app.fib $(wildcard compiler/serve/live*.fib) $(wildcard compiler/live/*.fib) rt/live.lir lib/fib/os/live.fib
 
-TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph
+# fibber's copy of the lir repository (LIR's path= lines: compiler/{lir,native,llvm,c}, lir.fib, lairf.fib, spec/lir.md) is the commit LIR pins,
+# unchanged; its inputs are every file and directory of the copy, so an added or removed file reruns it too
+LIR_PATHS := $(shell sed -n 's/^path=//p' LIR)
+tool_sh-lir-drift := scripts/lir-drift.sh | LIR scripts/lir-drift.sh scripts/lib/lir-manifest.sh $(shell find $(LIR_PATHS) 2> /dev/null)
+
+TOOLS_QUICK := sh-emit-prune fibref-skeleton gen-skeleton lint-pipefail lint-portable sh-driver-check-lib sh-make-graph sh-lir-drift
 # LT4 (docs/design/live-meshql.md, docs/design/live-repl.md 9): `def`s redefined in a live session (serve.livedefs, serve.liveretype, emit.livedef):
 # the guard (no def slot in a plain emit, a duplicate def still an error), defs.py over a real socket (type changes with their readers swapped or
 # refused naming the reader, boxed values of more than one word, 1000 redefinitions under 8 reading threads, pause and retire drop the old values),
@@ -185,7 +190,7 @@ $(foreach t,$(TOOLS_FULL),$(eval $(call tool_target,$(t))))
 TOOLS_QUICK_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_QUICK)))
 TOOLS_FULL_STAMPS := $(addsuffix .ok,$(addprefix $(TOOLS_DIR)/,$(TOOLS_FULL)))
 tools: $(TOOLS_FULL_STAMPS)   ## every tool test (the unit programs, the language server, the fibref and fibgen ports, the js backend, deps)
-tools-quick: $(TOOLS_QUICK_STAMPS)   ## the quick gate's tool tests (the skeletons, the lint, check-lib, the build's own graph test)
+tools-quick: $(TOOLS_QUICK_STAMPS)   ## the quick gate's tool tests (the skeletons, the lint, check-lib, the build's own graph test, the lir copy's drift)
 .PHONY: tools tools-quick
 tools-list:   ## the stamps of the tool tests (TOOLS_MODE=quick for the quick gate's)
 	@printf '%s\n' $(if $(filter quick,$(TOOLS_MODE)),$(TOOLS_QUICK_STAMPS),$(TOOLS_FULL_STAMPS))
