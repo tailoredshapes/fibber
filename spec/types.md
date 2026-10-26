@@ -409,10 +409,10 @@ cannot unify (Simd f64 4) with f64: only a numeric literal broadcasts to a vecto
 type is the plain `cannot unify (Simd f64 8) with (Simd f64 4)`. A literal as an argument of an ordinary function is not
 broadcast: `(f 1)` for `(defun f (v: f64x4))` is a mismatch; only the operators above adopt.
 
-**Lowering** (`compiler/emit/lower/simd.fib`; checked by the cases 6200 to 6237 and 6290 to 6291). `(Simd T n)` is the lIR vector `<n x T>`, a mask `<n x i1>`;
+**Lowering** (`compiler/emit/lower/simd.fib`; checked by the cases 6200 to 6237 and 6290 to 6291). `(Simd T n)` is the lIR vector `(VECTOR n T)`, a mask `(VECTOR n I1)`;
 it is a scalar-class value (in registers, passed and returned by value, never counted). In an object (a struct field, an enum payload, a closure
-capture, a task result, an array or `Vec` element) it is a `[k x i64]` field of 8 bytes of alignment, `k` the bytes of the vector over 8 rounded up,
-and loaded and stored as the vector with `(align 8)`: the heap gives an object 8 (malloc 16) bytes, and a field `<8 x float>` would be laid out at 32.
+capture, a task result, an array or `Vec` element) it is a `(ARRAY k I64)` field of 8 bytes of alignment, `k` the bytes of the vector over 8 rounded up,
+and loaded and stored as the vector with `(ALIGN 8)`: the heap gives an object 8 (malloc 16) bytes, and a field `(VECTOR 8 FLOAT)` would be laid out at 32.
 An `(Option vector)` is a heap enum (the unboxed pair is for scalars). A lane count is a type argument and part of the specialisation key (generic
 `n` works: `(Simd f64 n)` at 2, 4 and 8 lanes is three bodies); the representative of a vector in a key is a vector. Operations, each one lIR
 instruction on the whole vector except the checks: `+ - *` on floats `fadd fsub fmul`, `fdiv` (the `Float` method) `fdiv`, `neg` `fneg`; on integers
@@ -444,7 +444,7 @@ only the active lanes and trap if an active lane is outside the array; `simd-loa
 `simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Float and integer functions** on a scalar or every lane (`emit.lower.simdfn`, one lIR instruction each, spec/lir.md 6.1): `simd/fma` (one rounding, exactly IEEE `fma`; on a target without FMA hardware (docs/adr/0008: wasm, an x86-64 CPU named below x86-64-v3) each call site is a compile-time warning, `FILE:LINE:COL: warning: simd/fma has no hardware support on T; it traps at run time: use simd/muladd for portable code`, and a trap with that text, never a libm call), `simd/muladd` (`a*b+c` as `fmuladd`: one fused instruction where the target has FMA, a multiply and an add where it has not, so the last bit may differ between targets; a kernel that must run fast everywhere uses it), `simd/sqrt`, `simd/floor`, `simd/ceil`, `simd/trunc`,
 `simd/round` (ties away from zero), `simd/round-even`, `simd/abs` (integers trap on the minimum), `simd/min` and `simd/max` (**NaN rule:** a NaN operand gives NaN; `-0.0` is below `+0.0`; integers signed), `simd/min-num` and `simd/max-num`
 (a NaN operand loses). `simd/convert v` converts every lane to the lane type of the context: int to float (`sitofp`), float to int (`fptosi-sat`: saturates, NaN is 0), wider integer `sext`, narrower `trunc`, `fpext`, `fptrunc`. `simd/bitcast v` reinterprets the bits of every lane as the lane type of the context (lIR `bitcast`): the lane count is the same and the lane widths must agree (`f64x4` and `i64x4`, `f32x8` and `i32x8`; a mask is not reinterpretable), refused at the check otherwise (`simd/bitcast: the lanes of f64x4 and i32x4 differ in width`); with the lane shifts `shl shr sar` it builds `2^k` and splits exponents without leaving the vector register.
-**`simd/movemask m`, `ctz x`, `clz x`** (JSON-2, cases 7980 to 7999, `scripts/mutant-simd-lower.sh`). `(simd/movemask m)` turns a mask of 1 to 64 lanes into an `i64` whose bit `k` is lane `k` (lane 0 the lowest bit, the bits above the lane count 0, never sign-extended): the lIR `bitcast` of the `<n x i1>` to `i8`, `i16`, `i32` or `i64` (one `pmovmskb`/`vpmovmskb` per 16 or 32 lanes on x86, `kmov` on AVX-512, the `shrn`/`addv` sequence on aarch64), the mask first padded with false lanes up to 8, 16, 32 or 64 lanes when it has another count, then `zext`. `(ctz x)` and `(clz x)` count the trailing and the leading zero bits of an integer (or of every lane of an integer vector) and answer the type of `x`; a zero has as many of each as the type has bits (lIR `cttz` and `ctlz`, `llvm.cttz` and `llvm.ctlz` with the zero-is-poison flag false, so the answer is never poison). Their rows are `BuiltinSig`s of `types.builtins` (`(fn ((Simd bool n)) i64)` and `(fn (t) t)` with `(Bits t)`), their lowering is `emit.lower.simdfn`. ADR 0010.
+**`simd/movemask m`, `ctz x`, `clz x`** (JSON-2, cases 7980 to 7999, `scripts/mutant-simd-lower.sh`). `(simd/movemask m)` turns a mask of 1 to 64 lanes into an `i64` whose bit `k` is lane `k` (lane 0 the lowest bit, the bits above the lane count 0, never sign-extended): the lIR `bitcast` of the `(VECTOR n I1)` to `i8`, `i16`, `i32` or `i64` (one `pmovmskb`/`vpmovmskb` per 16 or 32 lanes on x86, `kmov` on AVX-512, the `shrn`/`addv` sequence on aarch64), the mask first padded with false lanes up to 8, 16, 32 or 64 lanes when it has another count, then `zext`. `(ctz x)` and `(clz x)` count the trailing and the leading zero bits of an integer (or of every lane of an integer vector) and answer the type of `x`; a zero has as many of each as the type has bits (lIR `cttz` and `ctlz`, `llvm.cttz` and `llvm.ctlz` with the zero-is-poison flag false, so the answer is never poison). Their rows are `BuiltinSig`s of `types.builtins` (`(fn ((Simd bool n)) i64)` and `(fn (t) t)` with `(Bits t)`), their lowering is `emit.lower.simdfn`. ADR 0010.
 **`(native-lanes T)`** is a primitive form, an `i64` literal made by the checker: the lane count of `:native` / `f32xn` / `f64xn` for the element `T` on the target the checker was given. **`(has-fma)`** is likewise a primitive form, a `bool` literal made by the checker from the `Target` record (`lir.target`): true on x86 when the CPU is x86-64-v3 or later or one of the AVX2 CPUs, or the feature list has `+fma`; true for every aarch64 CPU (NEON `fmla`, with 128-bit vectors) whatever its lane count; false otherwise. A library picks between a fused and a multiply-then-add kernel with `(if (has-fma) ..)`, folded at compile time.
 **A vector in a `def`** is a value initialised before `main` (not static data; a vector is never counted). **Not in the library:** `MArray`; `MArray` does not exist in the library.
 A vector argument or result of an `extern` is a type error (`an extern position cannot be a vector`). The head `simd` of the
@@ -1317,19 +1317,19 @@ compiler/types/builtins.fib), each with a case (cases/stdlib 8545-8548) and a mu
 
 | builtin | type | on a kernel target (lIR, spec/lir.md 6.9a) | on the host |
 |---|---|---|---|
-| `(gpu/local-id d)` `(gpu/group-id d)` `(gpu/group-size d)` `(gpu/num-groups d)` | `(fn (i64) i64)`, `d` the dimension 0, 1 or 2 | `(sreg tid.x)`, `(sreg ctaid.x)`, `(sreg ntid.x)`, `(sreg nctaid.x)` (`.y`, `.z` by `d`) | the index `fib.gpu/host-launch` is running; outside a launch an id is 0 and a size 1 |
+| `(gpu/local-id d)` `(gpu/group-id d)` `(gpu/group-size d)` `(gpu/num-groups d)` | `(fn (i64) i64)`, `d` the dimension 0, 1 or 2 | `(SREG tid.x)`, `(SREG ctaid.x)`, `(SREG ntid.x)`, `(SREG nctaid.x)` (`.y`, `.z` by `d`) | the index `fib.gpu/host-launch` is running; outside a launch an id is 0 and a size 1 |
 | `(gpu/global-id d)` | `(fn (i64) i64)` | `group-id * group-size + local-id` | the same, from the host index |
-| `(gpu/barrier)` | `(fn () unit)` | `(barrier)`: every thread of the block waits | nothing (the host runs the threads one after another) |
-| `(gpu/shared :kind N)` | `(fn (keyword i64) ptr)`, unsafe; `:kind` one of `:f32 :f64 :i32 :i64 :i8`, `N` a literal 1 to 1048576 | a `(global shared NAME [N x T] ..)` of the module, one per call site: block-shared memory, address space 3, its content undefined at block start | a static buffer of the module (one for the whole host) |
+| `(gpu/barrier)` | `(fn () unit)` | `(BARRIER)`: every thread of the block waits | nothing (the host runs the threads one after another) |
+| `(gpu/shared :kind N)` | `(fn (keyword i64) ptr)`, unsafe; `:kind` one of `:f32 :f64 :i32 :i64 :i8`, `N` a literal 1 to 1048576 | a `(GLOBAL SHARED NAME (ARRAY N T) ..)` of the module, one per call site: block-shared memory, address space 3, its content undefined at block start | a static buffer of the module (one for the whole host) |
 | `(gpu/host-index-set! slot d v)` | `(fn (i64 i64 i64) unit)`; `slot` 0 local, 3 group, 6 group-size, 9 num-groups | nothing | writes the host index (what `host-launch` uses) |
 | `(gpu/program-ptx)` | `(fn () str)` | `""` | the PTX of the program's kernels when built with `--kernel-target` (embedded), else `""` |
-| `(gpu/atomic-add-i32 p v)` `gpu/atomic-min-i32` `gpu/atomic-max-i32` (signed) `gpu/atomic-umin-i32` `gpu/atomic-umax-i32` `gpu/atomic-xchg-i32` | `(fn (ptr i32) i32)`, unsafe | `(atomicrmw OP monotonic p v)`: PTX `atom.global.add.u32` / `atom.shared.max.s32` .. (global or block-shared memory by the pointer's origin); WGSL: `atomicAdd` .. on `array<atomic<u32>>` (webgpu.md 3.7) | the same instruction (the host runs one thread at a time); answers the OLD value |
-| `(gpu/atomic-cas-i32 p expected new)` | `(fn (ptr i32 i32) i32)`, unsafe | `(extractvalue (cmpxchg monotonic monotonic p expected new) 0)`: the old value; `new` was stored when it equals `expected` | the same |
+| `(gpu/atomic-add-i32 p v)` `gpu/atomic-min-i32` `gpu/atomic-max-i32` (signed) `gpu/atomic-umin-i32` `gpu/atomic-umax-i32` `gpu/atomic-xchg-i32` | `(fn (ptr i32) i32)`, unsafe | `(ATOMICRMW OP MONOTONIC p v)`: PTX `atom.global.add.u32` / `atom.shared.max.s32` .. (global or block-shared memory by the pointer's origin); WGSL: `atomicAdd` .. on `array<atomic<u32>>` (webgpu.md 3.7) | the same instruction (the host runs one thread at a time); answers the OLD value |
+| `(gpu/atomic-cas-i32 p expected new)` | `(fn (ptr i32 i32) i32)`, unsafe | `(EXTRACTVALUE (CMPXCHG MONOTONIC MONOTONIC p expected new) 0)`: the old value; `new` was stored when it equals `expected` | the same |
 | `(gpu/atomic-add-i64 p v)` | `(fn (ptr i64) i64)`, unsafe | `atom.global.add.u64` | the same; WGSL refuses it by name (WGSL atomics are 32-bit) |
-| `(gpu/atomic-add-f32 p v)` `(gpu/atomic-max-f32 p v)` `(gpu/atomic-min-f32 p v)` (GPU-5) | `(fn (ptr f32) f32)`, unsafe | `(atomicrmw fadd monotonic p v)` / `fmax` / `fmin`: PTX `atom.global.add.f32` (max and min are loops LLVM expands, `atom.cas`); the OLD value | the same instruction; WGSL: a compare-and-exchange loop over the u32 bits (`fibw_atomic_fadd` .., webgpu.md 3.7); add is not deterministic (within n * 2^-24 * sum \|x\| of the left-to-right sum), max and min are exact and ignore a NaN operand |
-| `(gpu/shfl-down-i32 v d)` `gpu/shfl-down-f32` `gpu/shfl-up-i32` `gpu/shfl-up-f32` `gpu/shfl-xor-i32` `gpu/shfl-xor-f32` `gpu/shfl-idx-i32` `gpu/shfl-idx-f32` (GPU-5) | `(fn (i32 i32) i32)`, `(fn (f32 i32) f32)` | `(shfl-down v d)` etc. (lir.md 6.9a): PTX `shfl.sync.down.b32 .. -1` (mask: the whole warp; `up` clamps at lane 0, `xor` is `bfly`); WGSL `subgroupShuffleDown(v, d)`, `subgroupShuffleUp`, `subgroupShuffleXor`, `subgroupShuffle` (needs `enable subgroups;`: webgpu.md 3.8) | the lane's own `v` (a thread is a warp of one) |
-| `(gpu/subgroup-size)` `(gpu/lane-id)` `(gpu/ballot c)` (GPU-5) | `(fn () i32)`, `(fn () i32)`, `(fn (bool) i32)` | `(sreg warpsize)`, `(sreg laneid)`, `(ballot c)`: PTX `%warpsize` (32), `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroup_size`, `subgroup_invocation_id`, `subgroupBallot(c).x` (lanes 0 to 31) | 1, 0, and 1 or 0 by `c` |
-| `(gpu/select c a b)` | `(fn (bool t t) t)` with `Num t` | lIR `(select c a b)`: both operands are computed, no branch | the same |
+| `(gpu/atomic-add-f32 p v)` `(gpu/atomic-max-f32 p v)` `(gpu/atomic-min-f32 p v)` (GPU-5) | `(fn (ptr f32) f32)`, unsafe | `(ATOMICRMW FADD MONOTONIC p v)` / `fmax` / `fmin`: PTX `atom.global.add.f32` (max and min are loops LLVM expands, `atom.cas`); the OLD value | the same instruction; WGSL: a compare-and-exchange loop over the u32 bits (`fibw_atomic_fadd` .., webgpu.md 3.7); add is not deterministic (within n * 2^-24 * sum \|x\| of the left-to-right sum), max and min are exact and ignore a NaN operand |
+| `(gpu/shfl-down-i32 v d)` `gpu/shfl-down-f32` `gpu/shfl-up-i32` `gpu/shfl-up-f32` `gpu/shfl-xor-i32` `gpu/shfl-xor-f32` `gpu/shfl-idx-i32` `gpu/shfl-idx-f32` (GPU-5) | `(fn (i32 i32) i32)`, `(fn (f32 i32) f32)` | `(SHFL-DOWN v d)` etc. (lir.md 6.9a): PTX `shfl.sync.down.b32 .. -1` (mask: the whole warp; `up` clamps at lane 0, `xor` is `bfly`); WGSL `subgroupShuffleDown(v, d)`, `subgroupShuffleUp`, `subgroupShuffleXor`, `subgroupShuffle` (needs `enable subgroups;`: webgpu.md 3.8) | the lane's own `v` (a thread is a warp of one) |
+| `(gpu/subgroup-size)` `(gpu/lane-id)` `(gpu/ballot c)` (GPU-5) | `(fn () i32)`, `(fn () i32)`, `(fn (bool) i32)` | `(SREG warpsize)`, `(SREG laneid)`, `(BALLOT c)`: PTX `%warpsize` (32), `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroup_size`, `subgroup_invocation_id`, `subgroupBallot(c).x` (lanes 0 to 31) | 1, 0, and 1 or 0 by `c` |
+| `(gpu/select c a b)` | `(fn (bool t t) t)` with `Num t` | lIR `(SELECT c a b)`: both operands are computed, no branch | the same |
 
 **The kernel subset.** A `defkernel` (syntax §3.22) and every function it reaches (`:kernel-pure` is inferred: a function reached from a
 kernel is checked under the same rules, and the error names the path: `kernel k: .. (reached through k -> helper)`) may hold: scalars and
@@ -1741,7 +1741,7 @@ scheme (**Decided**):
   nullable pointer, §8.1), `box` (an `(Option T)` with `T` of `unit`, of
   `dyn`, or itself an `Option`: a heap enum, §8.1), and the
   two-word `dyn`. (In stage 2 an `(Option T)` with `T` of a scalar class is of a
-  scalar class itself, its lIR type the pair `{ i1 t }`, §8.1; the stage-1
+  scalar class itself, its lIR type the pair `(LITERAL-STRUCT I1 t)`, §8.1; the stage-1
   `fibc`, which is frozen, still gives it the class `box`.)
 
 The separate `opt` and `box` classes are what keep the `Option`
@@ -3602,16 +3602,16 @@ parameter, are corrected there.
 lIR is the S-expression assembler for LLVM IR of spec/lir.md
 (**Decided**, owner, 2026-09-28), fibber's hardened successor to
 liar's `doc/lIR.md`: opaque `ptr`, `defstruct` with positional field
-types, array types `[N x T]`, `define`/`declare` with linkage,
+types, array types `(ARRAY N T)`, `define`/`declare` with linkage,
 `call`/`tailcall` lowered to `musttail` under `tailcc`, the typed
-`indirect-call`/`indirect-tailcall` `(indirect-call p (fn R (T..))
+`indirect-call`/`indirect-tailcall` `(INDIRECT-CALL p (FUNCTION R (T..))
 args..)`, `getelementptr`, `load`/`store`, `alloca` of any sized type,
 `br`/`switch`/`phi`/`select`, `icmp`/`fcmp`, the atomic operations
 `atomicrmw`, `cmpxchg`, `atomic-load`, `atomic-store` and `fence`, the
 overflow and saturation intrinsics of §8.12, and struct, array and
 function-address constants as static data. This mapping uses them as
 lir.md defines them: `match` dispatches through `switch` (§8.3);
-variable-length payloads are `[0 x T]` trailing members addressed with
+variable-length payloads are `(ARRAY 0 T)` trailing members addressed with
 `getelementptr` (§8.3); a stack object is an `alloca` of its struct
 type (§8.2); and every static object and table — the type table,
 literals, named-function closures, vtables and `def` values — is an
@@ -3636,15 +3636,15 @@ it. Runtime support functions are ordinary lIR `define`s in a
 | `unit` | no value: `void` result, no argument; `()` in a value position is dropped | none |
 | field-less `defenum` | `i32` variant index | i32 |
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
-| `(Simd T n)` (§1.9) | `<n x T>` (`<n x i1>` for a mask); in an object `[k x i64]`, 8-aligned (§1.9) | a scalar class, `vec` |
+| `(Simd T n)` (§1.9) | `(VECTOR n T)` (`(VECTOR n I1)` for a mask); in an object `(ARRAY k I64)`, 8-aligned (§1.9) | a scalar class, `vec` |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
-| `(Option T)`, `T` a scalar that has a value (`bool`, an integer, `char`, `keyword`, a float, a field-less `defenum`, `ptr`) — stage 2 | `{ i1 t }` by value, `t` the lIR type of `T`: the tag (1 for `some`), then the payload, zero for `nil`; no allocation, no count (§8.3; docs/design/unboxed-option.md) | `{ i1 t }`, a scalar class |
+| `(Option T)`, `T` a scalar that has a value (`bool`, an integer, `char`, `keyword`, a float, a field-less `defenum`, `ptr`) — stage 2 | `(LITERAL-STRUCT I1 t)` by value, `t` the lIR type of `T`: the tag (1 for `some`), then the payload, zero for `nil`; no allocation, no count (§8.3; docs/design/unboxed-option.md) | `(LITERAL-STRUCT I1 t)`, a scalar class |
 | `(Option T)`, `T` a scalar that has a value — stage 1 (frozen) | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(Option T)`, `T` `unit`, a `dyn` (with or without `:send`), a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(fn κ (Ā) R)` | `ptr` to a closure object (§8.4) | ptr |
-| `(dyn P)`, `(dyn P :send)` | `{ ptr ptr }` by value: object, vtable | dyn |
-| `(Weak (dyn P))`, `(Weak (dyn P :send))` | `{ ptr ptr }` by value: the object's weak box (§8.7), vtable | dyn |
+| `(dyn P)`, `(dyn P :send)` | `(LITERAL-STRUCT PTR PTR)` by value: object, vtable | dyn |
+| `(Weak (dyn P))`, `(Weak (dyn P :send))` | `(LITERAL-STRUCT PTR PTR)` by value: the object's weak box (§8.7), vtable | dyn |
 | `(& T)` parameter | `ptr` to a private cell (§8.6) | — |
 
 A `(Weak (dyn P))` (**Decided**, owner, 2026-09-27) is laid out like a
@@ -3667,8 +3667,8 @@ real tags (§4.5), answers 1 (method.md rule 6). The layout classes `opt` and `b
 (§4.3) keep the rule intact under monomorphisation.
 
 Scalars inside objects are stored unboxed at their lIR type. A struct
-`(defstruct P (x: i64 s: str))` is `(defstruct P.obj (i64 i32 i32 i64
-ptr))`: the header fields first, then the fields in declaration order;
+`(defstruct P (x: i64 s: str))` is `(DEFSTRUCT P.obj (I64 I32 I32 I64
+PTR))`: the header fields first, then the fields in declaration order;
 one lIR `defstruct` per monomorphised object type. A field of type
 `ptr` is such a scalar although its lIR type is `ptr` as an object
 field's is: it has no count, so no `drop`, `trace`, copy or retain
@@ -3681,7 +3681,7 @@ counted is decided by the fibber type, never by the lIR text (case 193).
 Every object begins with a 16-byte header:
 
 ```
-(defstruct fib.hdr (i64 i32 i32))       ; count, type-id, flags
+(DEFSTRUCT fib.hdr (I64 I32 I32))       ; count, type-id, flags
 flags: bit 0 SHARED    counts are atomic from now on (§7)
        bit 1 HAS-WEAK  a weak box exists or existed (§8.7); never cleared;
                        fib.unique? refuses the object (§6.6)
@@ -3702,12 +3702,12 @@ an lIR `constant`, a literal allocated by the interpreter, a stack
 object's `alloca` and `fib.immortalise` all initialise it so
 (**Decided**).
 `type-id` indexes the table `fib.types` of per-type records
-`(defstruct fib.typerec (ptr ptr ptr i64 ptr))` — `drop`, `trace`, `name`,
-`size`, `share` — one per monomorphised object type: `drop (ptr p, ptr
-wl)` queues the object's counted children on the worklist `wl`, last
-child first; `share (ptr p, ptr wl)` queues every child pointer that is
+`(DEFSTRUCT fib.typerec (PTR PTR PTR I64 PTR))` — `drop`, `trace`, `name`,
+`size`, `share` — one per monomorphised object type: `drop ((PTR p) (PTR
+wl))` queues the object's counted children on the worklist `wl`, last
+child first; `share ((PTR p) (PTR wl))` queues every child pointer that is
 not yet SHARED or IMMORTAL, marking it (share-marking, §8.8); `trace
-(ptr p, ptr cb)` calls the callback `cb` on each child pointer (the
+((PTR p) (PTR cb))` calls the callback `cb` on each child pointer (the
 retains of the children of a copy, §8.3, and `fib.immortalise`; the
 interpreter's audit walks its own heap). Neither `drop` nor `share`
 recurses: `fib.drop` and `fib.share` keep the worklist, a stack of pointers that starts in
@@ -3720,16 +3720,14 @@ would have released the children (the first child with all that its
 release frees, then the second), which is the order of the `F` lines
 of the trace (compiler.md §4). The table is **static data** (**Decided**,
 owner, 2026-09-28, lir.md §14 item 3): the whole program has one,
-`(constant fib.types [n x %struct.fib.typerec] ([n x
-%struct.fib.typerec] (%struct.fib.typerec @drop.T @trace.T @name.T
-(i64 size) @share.T) ..))`, and record `tid`'s field `k` is `(getelementptr [n x
-%struct.fib.typerec] @fib.types (i32 0) tid (i32 k))`; `fib.types[tid].drop`
+`(CONSTANT fib.types (ARRAY n (STRUCT fib.typerec)) ((ARRAY n (STRUCT fib.typerec)) ((STRUCT fib.typerec) (GLOBAL drop.T) (GLOBAL trace.T) (GLOBAL name.T)
+(I64 size) (GLOBAL share.T)) ..))`, and record `tid`'s field `k` is `(GETELEMENTPTR (ARRAY n (STRUCT fib.typerec)) (GLOBAL fib.types) (I32 0) tid (I32 k))`; `fib.types[tid].drop`
 below is that load. Every other **static object** — string and `Form`
 literals with their headers (§8.3), the constant closures of named
 functions and constructors (§8.4), vtables (§8.5) and the values of
 `def`s (§8.10) — is an lIR `constant` too, with `count` 0 and flags
 `IMMORTAL` written into its header by the emitter, reached by its
-address `@name` (a `ptr`) wherever code needs it. There is no module
+address `(GLOBAL name)` (a `ptr`) wherever code needs it. There is no module
 initialiser and nothing runs before `main`: an `IMMORTAL` object
 exists from the start, is never freed, and the audit does not track it
 (§6.7). (In v1 the objects were built at start-up by a module
@@ -3790,13 +3788,13 @@ fib.frozen  (ptr p) -> i1                        ; flags(p) & IMMORTAL
 A `STACK` object has the same layout in an `alloca` of the frame,
 never passed to `fib.release`; the compiler emits `fib.drop-fields`, the
 `fib.types[tid].drop` and the draining of its worklist, inline at scope
-exit. The object is `(alloca %struct.T.obj)` (lIR's
+exit. The object is `(ALLOCA (STRUCT T.obj))` (lIR's
 `alloca` takes any sized type; **Decided**, owner, 2026-09-28, lir.md
 §14 item 3), which gives it the struct's own size and alignment, and
-its fields are addressed through `(getelementptr %struct.T.obj p (i32
-0) (i32 i))` exactly as a heap object's are; the header is stored by
+its fields are addressed through `(GETELEMENTPTR (STRUCT T.obj) p (I32
+0) (I32 i))` exactly as a heap object's are; the header is stored by
 the code that allocates it. (v1 sized the slot in 8-byte words,
-`(alloca i64 (i32 k))`; the fields' addresses were the same.) Each `STACK`
+`(ALLOCA I64 (I32 k))`; the fields' addresses were the same.) Each `STACK`
 allocation site — a scope-local object, a stack closure, a private `&`
 cell — has exactly one such `alloca`, in the function's entry block
 (in an `async` body, whose locals live in the task object so as to
@@ -3825,10 +3823,10 @@ compiled program.
 
 ### 8.3 Structs, enums, strings, arrays, `Option`
 
-- Struct: `(i64 i32 i32 field-types..)`; object fields `ptr`, scalars
+- Struct: `(I64 I32 I32 field-types..)`; object fields `ptr`, scalars
   inline. The constructor allocates, writes the header, stores each field
   after `consume` (E2). Its `drop` releases every object field.
-- Enum with fields: `(i64 i32 i32 i32 payload..)`: tag, then the largest
+- Enum with fields: `(I64 I32 I32 I32 payload..)`: tag, then the largest
   variant's fields; one lIR `defstruct` per variant with the same prefix;
   `match` loads the tag and dispatches on it with `switch` — one case
   per clause's tag, the default the next clause or the match failure —
@@ -3836,11 +3834,11 @@ compiled program.
   v1 used an `icmp eq`/`br` chain), then `getelementptr`s through the
   variant struct; `drop` does the same on the tag.
 - `(Option T)`, `T` a non-`Option` object type: the bare nullable
-  pointer; `nil` is `(ptr null)`; `(some p)` in a pattern is a null
+  pointer; `nil` is `(PTR NULL)`; `(some p)` in a pattern is a null
   test. `fib.retain`/`release` are null-tolerant, so codegen needs no
   special case. In stage 2 an `Option` of a scalar that has a value
-  (§8.1) is the pair `{ i1 t }` by value: `nil` is
-  `(zeroinitializer { i1 t })`, `(some x)` is `{ (i1 1) x }`, a pattern
+  (§8.1) is the pair `(LITERAL-STRUCT I1 t)` by value: `nil` is
+  `(ZEROINITIALIZER (LITERAL-STRUCT I1 t))`, `(some x)` is `(LITERAL-STRUCT (I1 1) x)`, a pattern
   reads the tag with `extractvalue` and a `(some p)` sub-pattern binds
   `extractvalue 1`; there is no object, so no allocation and no count,
   and an object field, an array element, a cell, a capture or a task
@@ -3849,20 +3847,20 @@ compiled program.
   ordinary heap enum
   with tag `0` = `nil`, `1` = `some` and the payload at its own lIR type;
   `(some p)` in a pattern reads the tag.
-- `str`: `(defstruct fib.str (i64 i32 i32 i64 [0 x i8]))` (count, type
+- `str`: `(DEFSTRUCT fib.str (I64 I32 I32 I64 (ARRAY 0 I8)))` (count, type
   id, flags, byte length, then the UTF-8 bytes and a NUL for FFI in the
-  same allocation, the trailing `[0 x i8]` being C's flexible array
-  member); byte `i` is `(getelementptr %struct.fib.str s (i32 0) (i32
+  same allocation, the trailing `(ARRAY 0 I8)` being C's flexible array
+  member); byte `i` is `(GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32
   4) i)`; no children. A literal of `n` bytes is the constant
-  `(constant str.k { i64 i32 i32 i64 [n+1 x i8] } { (i64 0) (i32 tid)
-  (i32 IMMORTAL) (i64 n) ([n+1 x i8] ..) })`, whose layout is
-  `%struct.fib.str`'s with the bytes in place; code uses `@str.k`
+  `(CONSTANT str.k (LITERAL-STRUCT I64 I32 I32 I64 (ARRAY n+1 I8)) (LITERAL-STRUCT (I64 0) (I32 tid)
+  (I32 IMMORTAL) (I64 n) ((ARRAY n+1 I8) ..)))`, whose layout is
+  `(STRUCT fib.str)`'s with the bytes in place; code uses `(GLOBAL str.k)`
   (**Decided**, owner, 2026-09-28, lir.md §14 item 3; v1 built it at
   start-up from a `(string ..)` constant).
-- `(Array T)`: `(defstruct fib.array.T (i64 i32 i32 i64 [0 x T]))`
+- `(Array T)`: `(DEFSTRUCT fib.array.T (I64 I32 I32 I64 (ARRAY 0 T)))`
   (length last, then the `n` elements at `T`'s lIR type in the same
-  allocation), element `i` at `(getelementptr %struct.fib.array.T a
-  (i32 0) (i32 4) i)`; `array-set!` does a
+  allocation), element `i` at `(GETELEMENTPTR (STRUCT fib.array.T) a
+  (I32 0) (I32 4) i)`; `array-set!` does a
   unique write when `fib.unique?` holds, else allocates, copies, writes, stores
   into the place and releases the old array. `set-field!` likewise on a
   struct.
@@ -3911,15 +3909,15 @@ compiled program.
 A `fn` literal `L` with captures `c₁ .. cₖ` compiles to
 
 ```
-(defstruct fib.closure.L (i64 i32 i32  ptr  slot₁ .. slotₖ))          ; header, code, captures
-(define (L.code R) ((ptr env) (A₁ p₁) .. (Aₙ pₙ)) ..)                  ; loads captures from env
+(DEFSTRUCT fib.closure.L (I64 I32 I32  PTR  slot₁ .. slotₖ))          ; header, code, captures
+(DEFINE (L.code R) ((PTR env) (A₁ p₁) .. (Aₙ pₙ)) ..)                  ; loads captures from env
 ```
 
 A call through a function value `f` is
 
 ```
-(indirect-call (load ptr (getelementptr %struct.fib.closure.L f (i32 0) (i32 3)))
-               (fn tailcc R (ptr A₁ .. Aₙ)) f a₁ .. aₙ)
+(INDIRECT-CALL (LOAD PTR (GETELEMENTPTR (STRUCT fib.closure.L) f (I32 0) (I32 3)))
+               (FUNCTION TAILCC R (PTR A₁ .. Aₙ)) f a₁ .. aₙ)
 ```
 
 in lIR's typed form (lir.md §6.8; **Decided**, lir.md §14): the call
@@ -3930,10 +3928,10 @@ is a `musttail` jump whatever the prototypes (lir.md §7.3, §8.9).
 Named functions used as values are `IMMORTAL` closures with no
 captures whose code ignores `env`: each is an lIR `constant` of its
 closure struct holding the header and the code address, used by
-`@name` (§8.2); constructors likewise. A heap closure (§6.5: escaping,
+`(GLOBAL name)` (§8.2); constructors likewise. A heap closure (§6.5: escaping,
 or at a tail site) is `fib.alloc`ed with each object capture consumed
 (E3); its `drop` releases the captures. A stack closure is a `STACK`
-object of the creating frame: `(alloca %struct.fib.closure.L)` (§8.2),
+object of the creating frame: `(ALLOCA (STRUCT fib.closure.L))` (§8.2),
 storing uncounted pointers, among them the address of a stack closure
 it captures (§6.5, captures by closures). Colours have no representation. A named `fn`'s
 self-reference is the closure's own `env`, and each occurrence of it is
@@ -3978,7 +3976,7 @@ nothing for the convention beyond the consume of its object arguments.
 ### 8.5 Protocol dispatch
 
 Static: the monomorphiser rewrites `(count v)` at `v : (Vec i64)` to
-`(call @count.Vec.i64 v)`. No tables.
+`(CALL (GLOBAL count.Vec.i64) v)`. No tables.
 
 Dynamic: for every `(P, K)` instance reachable through a `(dyn P e)` the
 compiler emits a vtable: a block of one `ptr` slot per method in
@@ -3988,12 +3986,12 @@ supertrait of `P` in the order of its transitive closure (depth first,
 each protocol once) holding the address of that supertrait's vtable
 `Q.vt.K` (§4.1 rule 3, **Decided**, owner, 2026-09-28): a call of `Q`'s
 method through a `(dyn P)` loads `Q`'s slot and then the method's, and
-the upcast `(dyn Q d)` builds `{ obj, Q's slot }`. The vtable is
+the upcast `(dyn Q d)` builds `(LITERAL-STRUCT obj Q.slot)`. The vtable is
 static data (**Decided**, owner, 2026-09-28, lir.md §14 item 3):
-`(constant P.vt.K [m x ptr] ([m x ptr] @P.m1.K .. @Q.vt.K ..))`, its
+`(CONSTANT P.vt.K (ARRAY m PTR) ((ARRAY m PTR) (GLOBAL P.m1.K) .. (GLOBAL Q.vt.K) ..))`, its
 slots the code addresses and supertrait vtable addresses (v1 built the
 block at start-up and reached it through a `ptr` global). `(dyn P e)`
-builds `{ e, @P.vt.K }`,
+builds `(LITERAL-STRUCT e (GLOBAL P.vt.K))`,
 `e` always an object (a `ptr`, or an `opt` that may be null, which the
 null-tolerant count operations accept; a scalar `e` is rejected by
 §2.15);
@@ -4003,13 +4001,13 @@ Retain and release of a `(dyn P)` value act on `obj`.
 ### 8.6 Cells, private `&` cells, atoms
 
 ```
-(defstruct fib.cell (i64 i32 i32  T))             ; T = lIR type of the content (ptr for objects)
-(defstruct fib.atom (i64 i32 i32  i32  ptr))      ; header, lock word (unused by a scalar atom), value
+(DEFSTRUCT fib.cell (I64 I32 I32  T))             ; T = lIR type of the content (ptr for objects)
+(DEFSTRUCT fib.atom (I64 I32 I32  I32  PTR))      ; header, lock word (unused by a scalar atom), value
 ```
 
 `fib.cell` is one `defstruct` per content layout. A `(dyn P)` content,
 two words by value (§8.1), is laid out as two `ptr` fields, object then
-vtable: `(i64 i32 i32 ptr ptr)`, and a `(Weak (dyn P))` content the same
+vtable: `(I64 I32 I32 PTR PTR)`, and a `(Weak (dyn P))` content the same
 way, box then vtable (lir.md §2).
 
 - `@c` on a cell: `load`, then `fib.retain` if the content is an object
@@ -4018,14 +4016,14 @@ way, box then vtable (lir.md §2).
   old`. If the cell is `SHARED` (only an atom can be), the value is
   share-marked before the store.
 - A private `&` cell: a `STACK` object in the caller's frame, one
-  `(alloca %struct.fib.cell.T)` per call site in the entry block,
+  `(ALLOCA (STRUCT fib.cell.T))` per call site in the entry block,
   reused by every execution of the call (§8.2), sized by its struct
   like any stack object: the header and the content, one word for a
   scalar, a `ptr` or an `opt` and two for a `(dyn P)` or a `(Weak (dyn
   P))` (a cell sized for one word would let the copy-in and every
   `set!` of a `dyn` write its vtable word past the slot, into a
   neighbouring slot of the entry block: proposed case 77) — addressed
-  through `(getelementptr %struct.fib.cell.T t (i32 0) (i32 3))`
+  through `(GETELEMENTPTR (STRUCT fib.cell.T) t (I32 0) (I32 3))`
   (§8.2); its header is stored (count 0,
   `STACK`) and it is initialised by the copy-in at call entry, after
   the last argument has been evaluated, in parameter order (`store` the
@@ -4125,7 +4123,7 @@ become shared.
 ### 8.7 Weak references
 
 ```
-(defstruct fib.weakbox (i64 i32 i32  i32  ptr))   ; header (its count = number of Weak values), lock, target
+(DEFSTRUCT fib.weakbox (I64 I32 I32  I32  PTR))   ; header (its count = number of Weak values), lock, target
 ```
 
 `(weak x)`: under the mutex of the global table `fib.weak-table`
@@ -4153,15 +4151,15 @@ stays set on the object until it is freed, whatever happens to its
 `Weak` values, and makes `fib.unique?` false (§8.2, §6.6).
 
 **`(Weak (dyn P))`** (**Decided**, owner, 2026-09-27; case 87). The
-value is `{ box, vt }` by value (§8.1). `(weak d)` for `d : (dyn P)` =
-`{ obj, vt }`: the box is found or made for `obj` exactly as above,
+value is `(LITERAL-STRUCT box vt)` by value (§8.1). `(weak d)` for `d : (dyn P)` =
+`(LITERAL-STRUCT obj vt)`: the box is found or made for `obj` exactly as above,
 so an object has one box however many weak references are taken of it
 and through whichever protocols (a `(weak x)` of the object itself and
 a `(weak (dyn Q x))` share it), and it is retained once for the new
 value; the vtable is copied from `d`. The `(Weak (dyn P))` value holds
 that one count on the box and no count on `obj`; its retain and
 release act on the box. `@w`: the upgrade above on the box gives `t`
-or `nil`; for `t` the result is `(some { t, vt })`, which by §8.1 is a
+or `nil`; for `t` the result is `(some (LITERAL-STRUCT t vt))`, which by §8.1 is a
 heap enum of tag `some` holding the two words, allocated with count 1
 for the caller and owning the count the upgrade took on `t`; for `nil`
 it is the heap enum of tag `nil`. The vtable is `IMMORTAL` (§8.2) and
@@ -4230,8 +4228,8 @@ returned. Cases 8640 to 8652; `lib/fib/parallel` runs on this tier
 (`fork`, `pmap`, `pfor`, `preduce`, `pscan`), `spawn` and `future` stay
 threads, `async` stays the stackless tier.
 
-`(Task T)`: `(i64 i32 i32  i32 state  i32 driver  i32 lock  ptr resume
-ptr result  ptr waiters  ptr closure  ptr failure  ..captures ..locals)`
+`(Task T)`: `(I64 I32 I32  I32 state  I32 driver  I32 lock  PTR resume
+PTR result  PTR waiters  PTR closure  PTR failure  ..captures ..locals)`
 (slots 6 to 10; captures start at slot 11, `compiler/emit/objects/kinds.fib`; amended 2026-10-06: the closure slot and the failure slot of exceptions stage 1 were missing here, so `unit-objects` had rotted against this text). `async` lowers to a
 state machine, not to LLVM coroutine intrinsics: `resume(task)`
 switches on `state`, runs to the next `await`, stores the live locals
@@ -4372,7 +4370,7 @@ quantum.
 
 ### 8.9 Calls, returns, tail calls
 
-- A `defun` is `(define (R) ((A₁ p₁) .. (Aₙ pₙ)) ..)`; `&` parameters
+- A `defun` is `(DEFINE (R) ((A₁ p₁) .. (Aₙ pₙ)) ..)`; `&` parameters
   are `ptr`; `unit` results are `void`. An owned parameter (§6.4) is an
   owning binding of the frame: `fib.release` on every exit path unless
   it was moved out, which only its being the function's value or an
@@ -4393,15 +4391,15 @@ quantum.
   arguments; run the scope-exit releases of the enclosing scopes,
   release the step's other temporaries and the frame's owned parameters
   not moved (`env` among them in a closure body); then
-  `(tailcall @g args..)` for a known callee, or
-  `(indirect-tailcall code (fn tailcc R (ptr A..)) env args..)`
+  `(TAILCALL (GLOBAL g) args..)` for a known callee, or
+  `(INDIRECT-TAILCALL code (FUNCTION TAILCC R (PTR A..)) env args..)`
   through a closure value with the consumed closure object as `env`
   (§8.4); nothing follows in the
   function. An `async` body has no tail call: a call in its tail
   position is a `call` whose value `resume` stores as the task's result
   (§6.10 rule (f), §8.8). A `loop`'s `recur` is the sequence §6.10 gives
   for `recur` — moving only what it exits and releasing no owned
-  parameter, since the frame stays — ending in `(br loop)` on
+  parameter, since the frame stays — ending in `(BR loop)` on
   entry-block `alloca` slots for the loop variables, since it cannot
   leave the function. lIR's `tailcall` must lower to `musttail` (§8.11):
   a frame that stays would make a 100000-deep recursion overflow where
@@ -4440,7 +4438,7 @@ quantum.
 | `cell-update!` | load the content of the cell, store null there (object content) or retain it (`dyn`), call `f` with it owned, store the result without a retain (§2.13.1) |
 | static objects: the type table, literals, named-function closures, vtables | lIR `constant`s with `count` 0 and `IMMORTAL` in their headers, referring to each other by address (§8.2, §8.3, §8.4, §8.5); no module initialiser, nothing runs before `main` |
 | `def` initialisation | the constant expression is evaluated at compile time — its literal parts folded, the prelude calls of the collection-literal rewrite (`conj`, `assoc`, syntax §1.4) run through the JIT that runs macros (ROADMAP, M4) — and the resulting graph, `def`s in source order, is emitted as static objects as above (syntax §3.19); `fib.immortalise` is then the interpreter's only (**Decided**, owner, 2026-09-28, lir.md §14 item 3) |
-| stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca %struct.T)` of its layout, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
+| stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(ALLOCA (STRUCT T))` of its layout, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
 | `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7); for a `dyn` operand, the box of its object paired with its vtable |
 | integer `/`, `rem`, `+`, `-`, `*`, `neg`; shifts; `fptosi`, `fptoui` | the checks and saturations of §8.12, before or instead of the bare LLVM operation |
 | tail call, `loop`/`recur` | §8.9: consume the arguments, run the releases, `tailcall`/`indirect-tailcall` or `br` |
@@ -4469,7 +4467,7 @@ asked for in v1 is in lIR now, and this mapping uses it:
 - the conveniences v1 did without, adopted by the owner's decision of
   2026-09-28 (lir.md §14 item 3): `switch` for `match` (§8.3), a
   struct as the type of an `alloca` for stack objects (§8.2, §8.4,
-  §8.6), array types `[N x T]` for trailing elements and the type
+  §8.6), array types `(ARRAY N T)` for trailing elements and the type
   table (§8.2, §8.3), and struct, array and function-address constants
   for every static object (§8.2, §8.5, §8.10), which removed the
   module initialiser;
@@ -4490,9 +4488,9 @@ minimum by -1, `add`/`sub`/`mul` with `nsw` on overflow, a shift by at
 least the width, `fptosi`/`fptoui` out of range), so the compiler
 emits every check itself, never the bare instruction, and never the
 `nsw`/`nuw` flags. `w` is the operand width, `MIN`/`MAX` its signed
-bounds; a trap is `(call @fib.trap msg)`, where `fib.trap` is a
+bounds; a trap is `(CALL (GLOBAL fib.trap) msg)`, where `fib.trap` is a
 `fib.rt` function that writes the message (a string constant) to
-standard error (`(declare-global stderr ptr)`, lir.md §4.4) and
+standard error (`(DECLARE-GLOBAL stderr PTR)`, lir.md §4.4) and
 aborts, as the builtin `trap` does (§2.11); the
 block it is called from branches nowhere after it (it ends in
 `unreachable`), and it releases
@@ -4500,25 +4498,25 @@ nothing (§2.11: the objects live at an abort are not leaks).
 
 | Operation | lIR emitted |
 |---|---|
-| `(/ a b)`, `(quot a b)`, `(rem a b)` at an integer type | `(icmp eq b 0)` → trap `integer / by zero` (or `rem`; `quot` is `/`); `(and (icmp eq a MIN) (icmp eq b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
+| `(/ a b)`, `(quot a b)`, `(rem a b)` at an integer type | `(ICMP EQ b 0)` → trap `integer / by zero` (or `rem`; `quot` is `/`); `(AND (ICMP EQ a MIN) (ICMP EQ b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
 | `(fdiv a b)`, `(/ a b)` at a float type | `fdiv`: IEEE division, no check |
-| `(quot a b)` at a float type | `(call @trunc (fdiv a b))`, `@truncf` at `f32`: libm's rounding toward zero of the quotient at its width (lIR has no float truncation; `(a - (rem a b)) / b` is not it: it gives 2.9999999999999996 for `(quot 9.6 2.8)`, which is 3.0, and 8.0 for `(quot 7.2 0.8)`, which is 9.0); no check |
-| `(+ a b)` | `r = (sadd-overflow a b)`; `(extractvalue r 1)` → trap `integer overflow in + at w`; else `(extractvalue r 0)` |
-| `(- a b)` | `r = (ssub-overflow a b)`; likewise, trap `integer overflow in - at w` |
-| `(* a b)` | `r = (smul-overflow a b)`; likewise, trap `integer overflow in * at w`, at every width |
-| `(neg a)` | `(icmp eq a MIN)` → trap `integer overflow in neg at w`; else `(sub 0 a)` |
-| `(shl a n)`, `(shr a n)`, `(sar a n)` | `(shl a (and n (w - 1)))`, `(lshr ..)`, `(ashr ..)`: `w` is a power of two, so the `and` is `n mod w` |
-| `(fptosi T x)` | `(fptosi-sat T x)`: NaN → 0, above `MAX` → `MAX`, below `MIN` → `MIN`, else truncation towards zero |
-| `(fptoui T x)` | `(fptoui-sat T x)`: NaN or negative → 0, at or above `2^bits(T)` → all ones, else truncation |
+| `(quot a b)` at a float type | `(CALL (GLOBAL trunc) (FDIV a b))`, `(GLOBAL truncf)` at `f32`: libm's rounding toward zero of the quotient at its width (lIR has no float truncation; `(a - (rem a b)) / b` is not it: it gives 2.9999999999999996 for `(quot 9.6 2.8)`, which is 3.0, and 8.0 for `(quot 7.2 0.8)`, which is 9.0); no check |
+| `(+ a b)` | `r = (SADD-OVERFLOW a b)`; `(EXTRACTVALUE r 1)` → trap `integer overflow in + at w`; else `(EXTRACTVALUE r 0)` |
+| `(- a b)` | `r = (SSUB-OVERFLOW a b)`; likewise, trap `integer overflow in - at w` |
+| `(* a b)` | `r = (SMUL-OVERFLOW a b)`; likewise, trap `integer overflow in * at w`, at every width |
+| `(neg a)` | `(ICMP EQ a MIN)` → trap `integer overflow in neg at w`; else `(SUB 0 a)` |
+| `(shl a n)`, `(shr a n)`, `(sar a n)` | `(SHL a (AND n (w - 1)))`, `(LSHR ..)`, `(ASHR ..)`: `w` is a power of two, so the `and` is `n mod w` |
+| `(fptosi T x)` | `(FPTOSI-SAT T x)`: NaN → 0, above `MAX` → `MAX`, below `MIN` → `MIN`, else truncation towards zero |
+| `(fptoui T x)` | `(FPTOUI-SAT T x)`: NaN or negative → 0, at or above `2^bits(T)` → all ones, else truncation |
 | `=`, `!=`, `<`, `<=`, `>`, `>=` at a float type | `fcmp` with `oeq`, `une`, `olt`, `ole`, `ogt`, `oge` respectively: the ordered predicates are false on a NaN operand and the unordered `une` of `!=` is true (§2.12); never the `Ord` defaults |
 | `(rem a b)` at a float type | `frem`: `fmod`, the sign of the dividend (§2.12); no check |
-| `(f64->bits x)`, `(bits->f64 n)`, `(f32->bits x)`, `(bits->f32 n)` | `(bitcast i64 x)`, `(bitcast double n)`, `(bitcast i32 x)`, `(bitcast float n)`: same size, no check, every bit kept |
+| `(f64->bits x)`, `(bits->f64 n)`, `(f32->bits x)`, `(bits->f32 n)` | `(BITCAST I64 x)`, `(BITCAST DOUBLE n)`, `(BITCAST I32 x)`, `(BITCAST FLOAT n)`: same size, no check, every bit kept |
 | `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount` (`ctpop`), integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
 
 The intrinsics compute exactly what v1's hand-written sequences
 computed (kept as `cases/lir/mapping/arith-checks.lir`, which now
 checks the intrinsics against them on every boundary): `sadd-overflow`
-reports `(icmp slt (and (xor a r) (xor b r)) 0)` on the wrapped `r`,
+reports `(ICMP SLT (AND (XOR a r) (XOR b r)) 0)` on the wrapped `r`,
 `smul-overflow` the widened-multiply test, and the saturating
 conversions the `fcmp` chains of §2.12. The interpreter computes each
 operation exactly and traps or saturates under the same conditions
@@ -5002,9 +5000,9 @@ On 2026-09-28 the owner decided the seven open questions of spec/lir.md
 
 1. **lIR's conveniences are adopted** (lir.md §14 item 3; §8, §8.2,
    §8.3, §8.4, §8.5, §8.6, §8.9, §8.10, §8.11; syntax §3.19). `match`
-   dispatches through `switch`; a stack object is `(alloca %struct.T)`
+   dispatches through `switch`; a stack object is `(ALLOCA (STRUCT T))`
    of its own layout, not a count of `i64` words; strings and arrays
-   carry their elements as a trailing `[0 x T]` and the type table is
+   carry their elements as a trailing `(ARRAY 0 T)` and the type table is
    an array of records; and every static object — the type table,
    literals and quoted graphs, the constant closures of named
    functions and constructors, vtables, and `def` values — is an lIR

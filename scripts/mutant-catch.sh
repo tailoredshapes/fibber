@@ -56,9 +56,9 @@ case $MODE in
   no-release)          mut compiler/emit/lower/call.fib 's/\(lcx-run-ops cx ops\)\)\)\)/(Ok ()))))/' ;;
   no-pending)          mut compiler/emit/lower/call.fib 's/\(doseq \[v \(reverse \@\(\. cx pending\)\)\] \(lcx-release cx v\)\)/()/' ;;
   double-release)      mut compiler/emit/lower/call.fib 's/\(lcx-run-ops cx ops\)\)\)\)/(do (lcx-run-ops cx ops) (lcx-run-ops cx ops)))))/' ;;
-  finally-catchable)   mut rt/core.lir 's/\(br \(call \@fib\.in-finally\) fin task\)/(br (i1 0) fin task)/; s/      \(store \(i64 0\) dp\)\n      \(store \(add \(load i64 fp\)/      (store (add (load i64 fp)/' ;;
-  no-catch)            mut rt/core.lir 's/\(br \(icmp eq ex \(ptr null\)\) ok caught\)/(br (i1 1) ok caught)/' ;;
-  catch-everywhere)    mut rt/core.lir 's/\(block no \(ret \(i1 0\)\)\)\n  \(block yes \(ret \(icmp sgt \(load i64 \(getelementptr %struct\.fib\.exc s \(i32 0\) \(i32 0\)\)\) \(i64 0\)\)\)\)\)/(block no (ret (i1 1)))\n  (block yes (ret (i1 1))))/' ;;
+  finally-catchable)   mut rt/core.lir 's/\(BR \(CALL \(GLOBAL fib\.in-finally\)\) fin task\)/(BR (I1 0) fin task)/; s/      \(STORE \(I64 0\) dp\)\n      \(STORE \(ADD \(LOAD I64 fp\)/      (STORE (ADD (LOAD I64 fp)/' ;;
+  no-catch)            mut rt/core.lir 's/\(BR \(ICMP EQ ex \(PTR NULL\)\) ok caught\)/(BR (I1 1) ok caught)/' ;;
+  catch-everywhere)    mut rt/core.lir 's/\(BLOCK no \(RET \(I1 0\)\)\)\n  \(BLOCK yes \(RET \(ICMP SGT \(LOAD I64 \(GETELEMENTPTR \(STRUCT fib\.exc\) s \(I32 0\) \(I32 0\)\)\) \(I64 0\)\)\)\)\)/(BLOCK no (RET (I1 1)))\n  (BLOCK yes (RET (I1 1))))/' ;;
   take-unwinds)        mut compiler/emit/lower/mod.fib 's/\(takes-slots\? p \(body-expr g \(\. inst key\)\)\)/false/; s/\(takes-slots\? p \(\. f body\)\)/false/' ;;
   update-unwinds)      mut compiler/emit/lower/cells.fib 's/\(fatal-while cx \(fn \(\) \(\(\. \(\. cx hub\) emit-call\) cx \(TgValue f\) \[old\] content false\)\)\)/((. (. cx hub) emit-call) cx (TgValue f) [old] content false)/' ;;
   no-write-back)       mut compiler/emit/lower/call.fib 's/\(\(some w\) \(call-write-backs cx \(\. w fst\) \(\. \(\. w snd\) fst\) \(\. \(\. w snd\) snd\)\)\)/((some w) (Ok ()))/' ;;

@@ -4,110 +4,110 @@
 ;;
 ;; The compiler appends the type table @fib.types and the class table
 ;; @fib.classes (one byte per type id) to the module this text opens.
-(declare malloc ptr (i64))
-(declare calloc ptr (i64 i64))
-(declare free void (ptr))
-(declare memcpy ptr (ptr ptr i64))
-(declare memmove ptr (ptr ptr i64))
-(declare memcmp i32 (ptr ptr i64))
-(declare write i64 (i32 ptr i64))
-(declare abort void ())
-(declare madvise i32 (ptr i64 i32))
-(declare getenv ptr (ptr))
-(declare strlen i64 (ptr))
-(declare snprintf i32 (ptr i64 ptr ...))
-(declare fdopen ptr (i32 ptr))
-(declare setvbuf i32 (ptr ptr i32 i64))
-(declare fflush i32 (ptr))
+(DECLARE malloc PTR (I64))
+(DECLARE calloc PTR (I64 I64))
+(DECLARE free VOID (PTR))
+(DECLARE memcpy PTR (PTR PTR I64))
+(DECLARE memmove PTR (PTR PTR I64))
+(DECLARE memcmp I32 (PTR PTR I64))
+(DECLARE write I64 (I32 PTR I64))
+(DECLARE abort VOID ())
+(DECLARE madvise I32 (PTR I64 I32))
+(DECLARE getenv PTR (PTR))
+(DECLARE strlen I64 (PTR))
+(DECLARE snprintf I32 (PTR I64 PTR ...))
+(DECLARE fdopen PTR (I32 PTR))
+(DECLARE setvbuf I32 (PTR PTR I32 I64))
+(DECLARE fflush I32 (PTR))
 ;; the quotient of float `quot` is rounded toward zero by libm (lower/arith.rs)
-(declare trunc double (double))
-(declare truncf float (float))
-(defstruct fib.hdr (i64 i32 i32))
-(defstruct fib.typerec (ptr ptr ptr i64 ptr))
+(DECLARE trunc DOUBLE (DOUBLE))
+(DECLARE truncf FLOAT (FLOAT))
+(DEFSTRUCT fib.hdr (I64 I32 I32))
+(DEFSTRUCT fib.typerec (PTR PTR PTR I64 PTR))
 ;; The prefix every closure object shares: header, code (§8.4).
-(defstruct fib.closure (i64 i32 i32 ptr))
+(DEFSTRUCT fib.closure (I64 I32 I32 PTR))
 
 ;; Trace mode (compiler.md §4): 1 when FIB_TRACE is set; the next
 ;; ordinal; and a buffer for one line.
-(global internal fib.tracing i32 (i32 0))
+(GLOBAL INTERNAL fib.tracing I32 (I32 0))
 ;; The stream the trace lines go to in trace mode: a buffered stdio stream on fd 2 (64 KiB), so that a run of millions of events is not millions of
 ;; write calls (docs/design/gate-profile.md). Null outside trace mode, or when fdopen failed: then each line is one write, as it was. A line is
 ;; one fwrite (stdio holds the stream's lock for the call, so lines of two threads do not mix), exit() flushes the stream, and every place that
 ;; writes to fd 2 by itself, or ends the process with abort, calls fib.trace-flush first so that the order of the bytes on fd 2 is the order of the events.
-(global internal fib.errf ptr (ptr null))
+(GLOBAL INTERNAL fib.errf PTR (PTR NULL))
 ;; The expansion-time hooks of a macro module (compiler.md §6): null
 ;; in a program, where the builtins they serve never run.
-(global internal fibm.gensym-hook ptr (ptr null))
-(global internal fibm.reflect-hook ptr (ptr null))
+(GLOBAL INTERNAL fibm.gensym-hook PTR (PTR NULL))
+(GLOBAL INTERNAL fibm.reflect-hook PTR (PTR NULL))
 ;; `(trap msg)` of a macro: the hook fails the expansion and does not
 ;; return (macros/bridge.rs); a program's trap is `fib.trap`.
-(global internal fibm.trap-hook ptr (ptr null))
-(global internal fibm.hook-cx ptr (ptr null))
-(global internal fib.ordinal i64 (i64 0))
+(GLOBAL INTERNAL fibm.trap-hook PTR (PTR NULL))
+(GLOBAL INTERNAL fibm.hook-cx PTR (PTR NULL))
+(GLOBAL INTERNAL fib.ordinal I64 (I64 0))
 ;; The pthread key under which a spawned task's thread keeps its task (fib.thread-enter): what a trap on that thread
 ;; completes as failed (fib.trap-bytes). Created by fib.init; the main thread and the pool's workers have no value.
-(global internal fib.task-key i32 (i32 0))
+(GLOBAL INTERNAL fib.task-key I32 (I32 0))
 ;; The pthread key under which a thread keeps its catch state (fib.exc-state): what `catch-run` and a trap read; made on the first
 ;; catch of the thread and freed when the thread ends.
-(global internal fib.exc-key i32 (i32 0))
-(declare pthread_key_create i32 (ptr ptr))
-(declare pthread_setspecific i32 (i32 ptr))
-(declare pthread_getspecific ptr (i32))
-(declare pthread_exit void (ptr))
+(GLOBAL INTERNAL fib.exc-key I32 (I32 0))
+(DECLARE pthread_key_create I32 (PTR PTR))
+(DECLARE pthread_setspecific I32 (I32 PTR))
+(DECLARE pthread_getspecific PTR (I32))
+(DECLARE pthread_exit VOID (PTR))
 
-(define internal (fib.init void) ()
-  (block entry
-    (call @fib.rq-init)
-    (call @pthread_key_create @fib.task-key (ptr null))
-    (call @pthread_key_create @fib.exc-key @free)
-    (call @fib.lc-init)
-    (let ((v (call @getenv (string "FIB_TRACE"))))
-      (br (icmp eq v (ptr null)) done set)))
-  (block set
-    (store (i32 1) @fib.tracing)
-    (let ((f (call @fdopen (i32 2) (string "w"))))
-      (store f @fib.errf)
-      (br (icmp eq f (ptr null)) done buffered)))
-  (block buffered (call @setvbuf (load ptr @fib.errf) (ptr null) (i32 0) (i64 65536)) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.init VOID) ()
+  (BLOCK entry
+    (CALL (GLOBAL fib.rq-init))
+    (CALL (GLOBAL pthread_key_create) (GLOBAL fib.task-key) (PTR NULL))
+    (CALL (GLOBAL pthread_key_create) (GLOBAL fib.exc-key) (GLOBAL free))
+    (CALL (GLOBAL fib.lc-init))
+    (LET ((v (CALL (GLOBAL getenv) (STRING "FIB_TRACE"))))
+      (BR (ICMP EQ v (PTR NULL)) done set)))
+  (BLOCK set
+    (STORE (I32 1) (GLOBAL fib.tracing))
+    (LET ((f (CALL (GLOBAL fdopen) (I32 2) (STRING "w"))))
+      (STORE f (GLOBAL fib.errf))
+      (BR (ICMP EQ f (PTR NULL)) done buffered)))
+  (BLOCK buffered (CALL (GLOBAL setvbuf) (LOAD PTR (GLOBAL fib.errf)) (PTR NULL) (I32 0) (I64 65536)) (BR done))
+  (BLOCK done (RET)))
 
 ;; Trace bytes (whole lines) to fd 2: through the buffered stream, or by write where there is none.
-(define internal (fib.trace-out void) ((ptr buf) (i64 n))
-  (block entry (br (icmp eq (load ptr @fib.errf) (ptr null)) raw buffered))
-  (block raw (call @write (i32 2) buf n) (ret))
-  (block buffered (call @fwrite buf (i64 1) n (load ptr @fib.errf)) (ret)))
+(DEFINE INTERNAL (fib.trace-out VOID) ((PTR buf) (I64 n))
+  (BLOCK entry (BR (ICMP EQ (LOAD PTR (GLOBAL fib.errf)) (PTR NULL)) raw buffered))
+  (BLOCK raw (CALL (GLOBAL write) (I32 2) buf n) (RET))
+  (BLOCK buffered (CALL (GLOBAL fwrite) buf (I64 1) n (LOAD PTR (GLOBAL fib.errf))) (RET)))
 
 ;; The buffered trace lines go out now (before an abort, and before bytes written to fd 2 by other means).
-(define internal (fib.trace-flush void) ()
-  (block entry (br (icmp eq (load ptr @fib.errf) (ptr null)) done go))
-  (block go (call @fflush (load ptr @fib.errf)) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.trace-flush VOID) ()
+  (BLOCK entry (BR (ICMP EQ (LOAD PTR (GLOBAL fib.errf)) (PTR NULL)) done go))
+  (BLOCK go (CALL (GLOBAL fflush) (LOAD PTR (GLOBAL fib.errf))) (BR done))
+  (BLOCK done (RET)))
 
 ;; fib.trace-flush for a write the program makes itself: only fd 2 shares the stream's order.
-(define internal (fib.trace-flush-fd void) ((i64 fd))
-  (block entry (br (icmp eq fd (i64 2)) go done))
-  (block go (call @fib.trace-flush) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.trace-flush-fd VOID) ((I64 fd))
+  (BLOCK entry (BR (ICMP EQ fd (I64 2)) go done))
+  (BLOCK go (CALL (GLOBAL fib.trace-flush)) (BR done))
+  (BLOCK done (RET)))
 
 ;; One trace line: "K n c\n" or "K n\n" (c = 0: no class).
-(define internal (fib.trace-line void) ((i8 kind) (i64 n) (i8 class))
-  (block entry
-    (let ((buf (alloca i8 (i32 64))))
-      (br (icmp eq class (i8 0)) short long)))
-  (block long
-    (let ((len (call @snprintf buf (i64 64) (string "%c %lld %c\n") (zext i32 kind) n (zext i32 class))))
-      (call @fib.trace-out buf (sext i64 len))
-      (ret)))
-  (block short
-    (let ((len2 (call @snprintf buf (i64 64) (string "%c %lld\n") (zext i32 kind) n)))
-      (call @fib.trace-out buf (sext i64 len2))
-      (ret))))
+(DEFINE INTERNAL (fib.trace-line VOID) ((I8 kind) (I64 n) (I8 class))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 64))))
+      (BR (ICMP EQ class (I8 0)) short long)))
+  (BLOCK long
+    (LET ((len (CALL (GLOBAL snprintf) buf (I64 64) (STRING "%c %lld %c\n") (ZEXT I32 kind) n (ZEXT I32 class))))
+      (CALL (GLOBAL fib.trace-out) buf (SEXT I64 len))
+      (RET)))
+  (BLOCK short
+    (LET ((len2 (CALL (GLOBAL snprintf) buf (I64 64) (STRING "%c %lld\n") (ZEXT I32 kind) n)))
+      (CALL (GLOBAL fib.trace-out) buf (SEXT I64 len2))
+      (RET))))
 
-(define internal (fib.next-ordinal i64) ()
-  (block entry (ret (add (atomicrmw add monotonic @fib.ordinal (i64 1)) (i64 1)))))
+(DEFINE INTERNAL (fib.next-ordinal I64) ()
+  (BLOCK entry (RET (ADD (ATOMICRMW ADD MONOTONIC (GLOBAL fib.ordinal) (I64 1)) (I64 1)))))
 
-(define internal (fib.class i8) ((i32 tid))
-  (block entry (ret (load i8 (getelementptr i8 @fib.classes (zext i64 tid))))))
+(DEFINE INTERNAL (fib.class I8) ((I32 tid))
+  (BLOCK entry (RET (LOAD I8 (GETELEMENTPTR I8 (GLOBAL fib.classes) (ZEXT I64 tid))))))
 
 ;; The small-object free lists (spec/types.md §8.2, the allocator). An object
 ;; of at most 512 bytes is a block of 16 * cls bytes, cls = 1..32, and its
@@ -127,34 +127,34 @@
 ;; one thread that exists, before pthread_create, which orders it before everything the new thread does; a later store writes the
 ;; same 1; no other data is published through the flag (the lists are never written once it is 1). On x86 and arm64 a monotonic
 ;; i32 load and store are the plain mov / ldr and str.
-(global internal fib.mt i32 (i32 0))
-(global internal fib.fl [33 x ptr] (zeroinitializer [33 x ptr]))
+(GLOBAL INTERNAL fib.mt I32 (I32 0))
+(GLOBAL INTERNAL fib.fl (ARRAY 33 PTR) (ZEROINITIALIZER (ARRAY 33 PTR)))
 
 ;; A library (`fibc build --export`, emit.compile) has no main thread of its own: its callers are the host's threads, which the runtime
 ;; neither started nor can count, so a library is multi-threaded from its first call (docs/design/host-threads.md): `fib.mt` is set
 ;; before anything allocates, the small-object free lists are never used, and the runtime's start runs once, under a lock, whichever
 ;; threads arrive first. `fib.lib-state` is 0 (not started), 1 (a thread is starting it, holding `fib.lib-lock`) or 2 (started).
-(global internal fib.lib-state i32 (i32 0))
-(global internal fib.lib-lock i32 (i32 0))
+(GLOBAL INTERNAL fib.lib-state I32 (I32 0))
+(GLOBAL INTERNAL fib.lib-lock I32 (I32 0))
 
 ;; 1 when the caller must start the runtime (and then call fib.lib-ready); 0 when it is started. The fast path is one acquire load.
-(define internal (fib.lib-enter i32) ()
-  (block entry (br (icmp eq (atomic-load acquire i32 @fib.lib-state) (i32 2)) ready slow))
-  (block ready (ret (i32 0)))
-  (block slow
-    (call @fib.lock @fib.lib-lock)
-    (br (icmp eq (atomic-load acquire i32 @fib.lib-state) (i32 2)) late first))
-  (block late (call @fib.unlock @fib.lib-lock) (ret (i32 0)))
-  (block first
-    (atomic-store monotonic (i32 1) @fib.mt)
-    (atomic-store monotonic (i32 1) @fib.lib-state)
-    (ret (i32 1))))
+(DEFINE INTERNAL (fib.lib-enter I32) ()
+  (BLOCK entry (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GLOBAL fib.lib-state)) (I32 2)) ready slow))
+  (BLOCK ready (RET (I32 0)))
+  (BLOCK slow
+    (CALL (GLOBAL fib.lock) (GLOBAL fib.lib-lock))
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GLOBAL fib.lib-state)) (I32 2)) late first))
+  (BLOCK late (CALL (GLOBAL fib.unlock) (GLOBAL fib.lib-lock)) (RET (I32 0)))
+  (BLOCK first
+    (ATOMIC-STORE MONOTONIC (I32 1) (GLOBAL fib.mt))
+    (ATOMIC-STORE MONOTONIC (I32 1) (GLOBAL fib.lib-state))
+    (RET (I32 1))))
 
-(define internal (fib.lib-ready void) ()
-  (block entry
-    (atomic-store release (i32 2) @fib.lib-state)
-    (call @fib.unlock @fib.lib-lock)
-    (ret)))
+(DEFINE INTERNAL (fib.lib-ready VOID) ()
+  (BLOCK entry
+    (ATOMIC-STORE RELEASE (I32 2) (GLOBAL fib.lib-state))
+    (CALL (GLOBAL fib.unlock) (GLOBAL fib.lib-lock))
+    (RET)))
 
 ;; §8.2: count 1, tid, flags 0 (and the class). In trace mode 16 bytes in
 ;; front hold the ordinal (compiler.md §4). A failed malloc is the trap
@@ -165,236 +165,236 @@
 ;; (the slow paths are `noinline`, spec/lir.md 4.3, else LLVM inlines an
 ;; internal function with one call site whatever its size, and every
 ;; allocation, retain and release becomes a real call).
-(define internal (fib.alloc ptr) ((i64 size) (i32 tid))
-  (block entry
-    (let ((cls (lshr (add size (i64 15)) (i64 4)))
-          (quiet (and (icmp eq (load i32 @fib.tracing) (i32 0)) (icmp eq (atomic-load monotonic i32 @fib.mt) (i32 0)))))
-      (br (and quiet (icmp ule cls (i64 32))) hit miss)))
-  (block hit
-    (let ((slot (getelementptr ptr @fib.fl cls))
-          (head (load ptr slot)))
-      (br (icmp ne head (ptr null)) pop miss)))
-  (block pop
-    (store (load ptr head) slot)
-    (call @fib.init-hdr head tid (shl (trunc i32 cls) (i32 8)))
-    (ret head))
-  (block miss (ret (call @fib.alloc-slow size tid))))
+(DEFINE INTERNAL (fib.alloc PTR) ((I64 size) (I32 tid))
+  (BLOCK entry
+    (LET ((cls (LSHR (ADD size (I64 15)) (I64 4)))
+          (quiet (AND (ICMP EQ (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) (ICMP EQ (ATOMIC-LOAD MONOTONIC I32 (GLOBAL fib.mt)) (I32 0)))))
+      (BR (AND quiet (ICMP ULE cls (I64 32))) hit miss)))
+  (BLOCK hit
+    (LET ((slot (GETELEMENTPTR PTR (GLOBAL fib.fl) cls))
+          (head (LOAD PTR slot)))
+      (BR (ICMP NE head (PTR NULL)) pop miss)))
+  (BLOCK pop
+    (STORE (LOAD PTR head) slot)
+    (CALL (GLOBAL fib.init-hdr) head tid (SHL (TRUNC I32 cls) (I32 8)))
+    (RET head))
+  (BLOCK miss (RET (CALL (GLOBAL fib.alloc-slow) size tid))))
 
 ;; A block of 4 MiB or more asks for transparent huge pages (madvise MADV_HUGEPAGE, 14) on the whole pages inside it, as NumPy does for
 ;; its arrays: a fresh array of 1e7 doubles is otherwise 20000 page faults of 4 KiB, which cost more than the arithmetic that fills it.
 ;; Advice only: a kernel without THP, or one set to `never`, ignores it, and the result of madvise is not used.
-(define internal (fib.advise-huge void) ((ptr p) (i64 size))
-  (block entry
-    (let ((lo (and (add (ptrtoint i64 p) (i64 4095)) (i64 -4096)))
-          (hi (and (add (ptrtoint i64 p) size) (i64 -4096))))
-      (br (icmp ult lo hi) go done)))
-  (block go
-    (call @madvise (inttoptr ptr lo) (sub hi lo) (i32 14))
-    (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.advise-huge VOID) ((PTR p) (I64 size))
+  (BLOCK entry
+    (LET ((lo (AND (ADD (PTRTOINT I64 p) (I64 4095)) (I64 -4096)))
+          (hi (AND (ADD (PTRTOINT I64 p) size) (I64 -4096))))
+      (BR (ICMP ULT lo hi) go done)))
+  (BLOCK go
+    (CALL (GLOBAL madvise) (INTTOPTR PTR lo) (SUB hi lo) (I32 14))
+    (BR done))
+  (BLOCK done (RET)))
 
-(define internal noinline (fib.alloc-slow ptr) ((i64 size) (i32 tid))
-  (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
-  (block plain
-    (let ((cls (lshr (add size (i64 15)) (i64 4))))
-      (br (icmp ule cls (i64 32)) small big)))
-  (block small
-    (let ((slot (getelementptr ptr @fib.fl cls))
-          (head (load ptr slot)))
-      (br (icmp ne (atomic-load monotonic i32 @fib.mt) (i32 0)) fresh single)))
-  (block single
-    (br (icmp ne head (ptr null)) pop fresh))
-  (block pop
-    (store (load ptr head) slot)
-    (br made))
-  (block fresh
+(DEFINE INTERNAL NOINLINE (fib.alloc-slow PTR) ((I64 size) (I32 tid))
+  (BLOCK entry (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced plain))
+  (BLOCK plain
+    (LET ((cls (LSHR (ADD size (I64 15)) (I64 4))))
+      (BR (ICMP ULE cls (I64 32)) small big)))
+  (BLOCK small
+    (LET ((slot (GETELEMENTPTR PTR (GLOBAL fib.fl) cls))
+          (head (LOAD PTR slot)))
+      (BR (ICMP NE (ATOMIC-LOAD MONOTONIC I32 (GLOBAL fib.mt)) (I32 0)) fresh single)))
+  (BLOCK single
+    (BR (ICMP NE head (PTR NULL)) pop fresh))
+  (BLOCK pop
+    (STORE (LOAD PTR head) slot)
+    (BR made))
+  (BLOCK fresh
     ;; A small block from malloc (more than one thread, or an empty list): the large-block cache's decay check (rt/alloc.lir), so
     ;; that a threaded server whose requests are small still gives a spike's blocks back. An atomic load while the cache is empty.
-    (call @fib.lc-tick)
-    (let ((q (call @malloc (shl cls (i64 4)))))
-      (br (icmp eq q (ptr null)) oom made)))
-  (block made
-    (let ((p (phi ptr (pop head) (fresh q))))
-      (call @fib.init-hdr p tid (shl (trunc i32 cls) (i32 8)))
-      (ret p)))
-  (block big
-    (let ((p1 (call @fib.lc-get size)))
-      (br (icmp eq p1 (ptr null)) oom bigok)))
-  (block bigok
-    (call @fib.init-hdr p1 tid (i32 0))
-    (br (icmp uge size (i64 4194304)) huge fin))
-  (block huge
-    (call @fib.advise-huge p1 size)
-    (br fin))
-  (block fin (ret p1))
-  (block traced
-    (let ((q2 (call @fib.lc-get (add size (i64 16)))))
-      (br (icmp eq q2 (ptr null)) oom tracedok)))
-  (block tracedok
-    (let ((n (call @fib.next-ordinal))
-          (p2 (getelementptr i8 q2 (i64 16))))
-      (store n q2)
-      (call @fib.init-hdr p2 tid (i32 0))
-      (call @fib.trace-line (i8 65) n (call @fib.class tid))
-      (ret p2)))
-  (block oom
-    (call @fib.fatal-c (string "out of memory"))
-    (unreachable)))
+    (CALL (GLOBAL fib.lc-tick))
+    (LET ((q (CALL (GLOBAL malloc) (SHL cls (I64 4)))))
+      (BR (ICMP EQ q (PTR NULL)) oom made)))
+  (BLOCK made
+    (LET ((p (PHI PTR (pop head) (fresh q))))
+      (CALL (GLOBAL fib.init-hdr) p tid (SHL (TRUNC I32 cls) (I32 8)))
+      (RET p)))
+  (BLOCK big
+    (LET ((p1 (CALL (GLOBAL fib.lc-get) size)))
+      (BR (ICMP EQ p1 (PTR NULL)) oom bigok)))
+  (BLOCK bigok
+    (CALL (GLOBAL fib.init-hdr) p1 tid (I32 0))
+    (BR (ICMP UGE size (I64 4194304)) huge fin))
+  (BLOCK huge
+    (CALL (GLOBAL fib.advise-huge) p1 size)
+    (BR fin))
+  (BLOCK fin (RET p1))
+  (BLOCK traced
+    (LET ((q2 (CALL (GLOBAL fib.lc-get) (ADD size (I64 16)))))
+      (BR (ICMP EQ q2 (PTR NULL)) oom tracedok)))
+  (BLOCK tracedok
+    (LET ((n (CALL (GLOBAL fib.next-ordinal)))
+          (p2 (GETELEMENTPTR I8 q2 (I64 16))))
+      (STORE n q2)
+      (CALL (GLOBAL fib.init-hdr) p2 tid (I32 0))
+      (CALL (GLOBAL fib.trace-line) (I8 65) n (CALL (GLOBAL fib.class) tid))
+      (RET p2)))
+  (BLOCK oom
+    (CALL (GLOBAL fib.fatal-c) (STRING "out of memory"))
+    (UNREACHABLE)))
 
 ;; Gives a dead object's block back: onto its class's list while there is
 ;; one thread, else to free; a block of no class (above 512 bytes) to the
 ;; large-block cache (rt/alloc.lir), which frees what it does not keep.
 ;; `f` is the flags word read before the drop.
-(define internal (fib.free-block void) ((ptr p) (i32 f))
-  (block entry
-    (let ((cls (zext i64 (lshr f (i32 8)))))
-      (br (icmp ne cls (i64 0)) classed large)))
-  (block classed
-    (br (icmp eq (atomic-load monotonic i32 @fib.mt) (i32 0)) push plain))
-  (block push
-    (let ((cls2 (zext i64 (lshr f (i32 8))))
-          (slot (getelementptr ptr @fib.fl cls2)))
-      (store (load ptr slot) p)
-      (store p slot)
-      (call @fib.lc-every)
-      (ret)))
-  (block plain (call @free p) (ret))
-  (block large (call @fib.lc-put p) (ret)))
+(DEFINE INTERNAL (fib.free-block VOID) ((PTR p) (I32 f))
+  (BLOCK entry
+    (LET ((cls (ZEXT I64 (LSHR f (I32 8)))))
+      (BR (ICMP NE cls (I64 0)) classed large)))
+  (BLOCK classed
+    (BR (ICMP EQ (ATOMIC-LOAD MONOTONIC I32 (GLOBAL fib.mt)) (I32 0)) push plain))
+  (BLOCK push
+    (LET ((cls2 (ZEXT I64 (LSHR f (I32 8))))
+          (slot (GETELEMENTPTR PTR (GLOBAL fib.fl) cls2)))
+      (STORE (LOAD PTR slot) p)
+      (STORE p slot)
+      (CALL (GLOBAL fib.lc-every))
+      (RET)))
+  (BLOCK plain (CALL (GLOBAL free) p) (RET))
+  (BLOCK large (CALL (GLOBAL fib.lc-put) p) (RET)))
 
 ;; The program's `(alloc n)` after its `calloc` (syntax §3.15): the block,
 ;; or the trap "out of memory" when there is none, as the interpreter
 ;; traps, not a null pointer for the program to write through. A size of
 ;; 0 may be answered with null by calloc: that is no failure.
-(define internal (fib.alloc-check ptr) ((ptr p) (i64 n))
-  (block entry (br (icmp ne p (ptr null)) ok none))
-  (block ok (ret p))
-  (block none (br (icmp eq n (i64 0)) ok oom))
-  (block oom
-    (call @fib.fatal-c (string "out of memory"))
-    (unreachable)))
+(DEFINE INTERNAL (fib.alloc-check PTR) ((PTR p) (I64 n))
+  (BLOCK entry (BR (ICMP NE p (PTR NULL)) ok none))
+  (BLOCK ok (RET p))
+  (BLOCK none (BR (ICMP EQ n (I64 0)) ok oom))
+  (BLOCK oom
+    (CALL (GLOBAL fib.fatal-c) (STRING "out of memory"))
+    (UNREACHABLE)))
 
-(define internal (fib.init-hdr void) ((ptr p) (i32 tid) (i32 flags))
-  (block entry
-    (store (select (icmp eq (and flags (i32 15)) (i32 0)) (i64 1) (i64 0)) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
-    (store tid (getelementptr %struct.fib.hdr p (i32 0) (i32 1)))
-    (store flags (getelementptr %struct.fib.hdr p (i32 0) (i32 2)))
-    (ret)))
+(DEFINE INTERNAL (fib.init-hdr VOID) ((PTR p) (I32 tid) (I32 flags))
+  (BLOCK entry
+    (STORE (SELECT (ICMP EQ (AND flags (I32 15)) (I32 0)) (I64 1) (I64 0)) (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))
+    (STORE tid (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 1)))
+    (STORE flags (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 2)))
+    (RET)))
 
 ;; A STACK object's header (§8.2, §6.11): count 0, flags STACK; in
 ;; trace mode the ordinal in the count word (compiler.md §4).
-(define internal (fib.stack-init void) ((ptr p) (i32 tid))
-  (block entry
-    (call @fib.init-hdr p tid (i32 4))
-    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
-  (block traced
-    (let ((n (call @fib.next-ordinal)))
-      (store n (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
-      (call @fib.trace-line (i8 83) n (call @fib.class tid))
-      (br done)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.stack-init VOID) ((PTR p) (I32 tid))
+  (BLOCK entry
+    (CALL (GLOBAL fib.init-hdr) p tid (I32 4))
+    (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced done))
+  (BLOCK traced
+    (LET ((n (CALL (GLOBAL fib.next-ordinal))))
+      (STORE n (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))
+      (CALL (GLOBAL fib.trace-line) (I8 83) n (CALL (GLOBAL fib.class) tid))
+      (BR done)))
+  (BLOCK done (RET)))
 
-(define internal (fib.stack-end void) ((ptr p))
-  (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
-  (block traced
-    (call @fib.trace-line (i8 68) (load i64 (getelementptr %struct.fib.hdr p (i32 0) (i32 0))) (i8 0))
-    (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.stack-end VOID) ((PTR p))
+  (BLOCK entry (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced done))
+  (BLOCK traced
+    (CALL (GLOBAL fib.trace-line) (I8 68) (LOAD I64 (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))) (I8 0))
+    (BR done))
+  (BLOCK done (RET)))
 
-(define internal (fib.flags i32) ((ptr p))
-  (block entry (ret (atomic-load monotonic i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 2))))))
+(DEFINE INTERNAL (fib.flags I32) ((PTR p))
+  (BLOCK entry (RET (ATOMIC-LOAD MONOTONIC I32 (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 2))))))
 
-(define internal (fib.tid i32) ((ptr p))
-  (block entry (ret (load i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 1))))))
+(DEFINE INTERNAL (fib.tid I32) ((PTR p))
+  (BLOCK entry (RET (LOAD I32 (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 1))))))
 
-(define internal noinline (fib.retain-slow void) ((ptr p) (i32 f))
-  (block entry
-    (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
-  (block counted
-    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
-      (atomicrmw add monotonic cp (i64 1))
-      (br done)))
-  (block done (ret)))
+(DEFINE INTERNAL NOINLINE (fib.retain-slow VOID) ((PTR p) (I32 f))
+  (BLOCK entry
+    (BR (ICMP NE (AND f (I32 12)) (I32 0)) done counted))
+  (BLOCK counted
+    (LET ((cp (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))))
+      (ATOMICRMW ADD MONOTONIC cp (I64 1))
+      (BR done)))
+  (BLOCK done (RET)))
 
 ;; The fast path is the one that is small enough to be inlined at every
 ;; call: null, a STACK or IMMORTAL object (bits 4, 8: no count, nothing to
 ;; do) and a plain object (not SHARED, bit 1; HAS-WEAK does not matter
 ;; here), whose count is incremented. The rest is retain-slow.
-(define internal (fib.retain void) ((ptr p))
-  (block entry (br (icmp eq p (ptr null)) done check))
-  (block check
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
-  (block counted (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
-  (block local
-    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
-      (store (add (load i64 cp) (i64 1)) cp)
-      (br done)))
-  (block slow (call @fib.retain-slow p f) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.retain VOID) ((PTR p))
+  (BLOCK entry (BR (ICMP EQ p (PTR NULL)) done check))
+  (BLOCK check
+    (LET ((f (CALL (GLOBAL fib.flags) p)))
+      (BR (ICMP NE (AND f (I32 12)) (I32 0)) done counted)))
+  (BLOCK counted (BR (ICMP EQ (AND f (I32 1)) (I32 0)) local slow))
+  (BLOCK local
+    (LET ((cp (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))))
+      (STORE (ADD (LOAD I64 cp) (I64 1)) cp)
+      (BR done)))
+  (BLOCK slow (CALL (GLOBAL fib.retain-slow) p f) (BR done))
+  (BLOCK done (RET)))
 
 ;; The release of an object that is SHARED (count atomic) or whose
 ;; flags are not known to be plain; counted objects only reach the
 ;; atomic branch.
-(define internal noinline (fib.release-slow void) ((ptr p) (i32 f))
-  (block entry
-    (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
-  (block counted
-    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
-      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
-  (block shared
-    (let ((old (atomicrmw sub acq_rel cp (i64 1))))
-      (br (icmp eq old (i64 1)) drop done)))
-  (block local
-    (let ((c (load i64 cp)))
-      (br (icmp eq c (i64 1)) drop dec)))
-  (block dec (store (sub c (i64 1)) cp) (br done))
-  (block drop (call @fib.drop p) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL NOINLINE (fib.release-slow VOID) ((PTR p) (I32 f))
+  (BLOCK entry
+    (BR (ICMP NE (AND f (I32 12)) (I32 0)) done counted))
+  (BLOCK counted
+    (LET ((cp (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))))
+      (BR (ICMP NE (AND f (I32 1)) (I32 0)) shared local)))
+  (BLOCK shared
+    (LET ((old (ATOMICRMW SUB ACQ_REL cp (I64 1))))
+      (BR (ICMP EQ old (I64 1)) drop done)))
+  (BLOCK local
+    (LET ((c (LOAD I64 cp)))
+      (BR (ICMP EQ c (I64 1)) drop dec)))
+  (BLOCK dec (STORE (SUB c (I64 1)) cp) (BR done))
+  (BLOCK drop (CALL (GLOBAL fib.drop) p) (BR done))
+  (BLOCK done (RET)))
 
 ;; Small enough to be inlined at every call: a STACK or IMMORTAL object
 ;; (bits 4, 8) is no work; a plain object (not SHARED) whose count is above
 ;; 1 is decremented in place; everything else is release-slow.
-(define internal (fib.release void) ((ptr p))
-  (block entry (br (icmp eq p (ptr null)) done check))
-  (block check
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
-  (block counted (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
-  (block local
-    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
-          (c (load i64 cp)))
-      (br (icmp ugt c (i64 1)) dec slow)))
-  (block dec (store (sub c (i64 1)) cp) (br done))
-  (block slow (call @fib.release-slow p f) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.release VOID) ((PTR p))
+  (BLOCK entry (BR (ICMP EQ p (PTR NULL)) done check))
+  (BLOCK check
+    (LET ((f (CALL (GLOBAL fib.flags) p)))
+      (BR (ICMP NE (AND f (I32 12)) (I32 0)) done counted)))
+  (BLOCK counted (BR (ICMP EQ (AND f (I32 1)) (I32 0)) local slow))
+  (BLOCK local
+    (LET ((cp (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))
+          (c (LOAD I64 cp)))
+      (BR (ICMP UGT c (I64 1)) dec slow)))
+  (BLOCK dec (STORE (SUB c (I64 1)) cp) (BR done))
+  (BLOCK slow (CALL (GLOBAL fib.release-slow) p f) (BR done))
+  (BLOCK done (RET)))
 
 ;; §8.2: the drop of an object whose count reached zero: weak-clear if
 ;; flagged, the type's drop (hands the children to the worklist `wl`),
 ;; then free, from 16 bytes before the object in trace mode. The drop
 ;; never releases a child itself: a chain a million objects long would
 ;; otherwise be a recursion a million frames deep (spec/types.md §8.2).
-(define internal (fib.drop-one void) ((ptr wl) (ptr p))
-  (block entry
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 2)) (i32 0)) weak children)))
-  (block weak (call @fib.weak-clear p) (br children))
-  (block children
-    (let ((tid (call @fib.tid p))
-          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 0))))
-      (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain)))
-  (block plain
-    (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
-    (call @fib.free-block p f)
-    (ret))
-  (block traced
+(DEFINE INTERNAL (fib.drop-one VOID) ((PTR wl) (PTR p))
+  (BLOCK entry
+    (LET ((f (CALL (GLOBAL fib.flags) p)))
+      (BR (ICMP NE (AND f (I32 2)) (I32 0)) weak children)))
+  (BLOCK weak (CALL (GLOBAL fib.weak-clear) p) (BR children))
+  (BLOCK children
+    (LET ((tid (CALL (GLOBAL fib.tid) p))
+          (rec (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) tid (I32 0))))
+      (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced plain)))
+  (BLOCK plain
+    (INDIRECT-CALL (LOAD PTR rec) (FUNCTION VOID (PTR PTR)) p wl)
+    (CALL (GLOBAL fib.free-block) p f)
+    (RET))
+  (BLOCK traced
     ;; The free is traced before the children's releases, as the
     ;; interpreter's trace orders them (heap/event.rs: Free, then the
     ;; releases of what the object held).
-    (let ((q (getelementptr i8 p (i64 -16))))
-      (call @fib.trace-line (i8 70) (load i64 q) (i8 0))
-      (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
-      (call @fib.lc-put q)
-      (ret))))
+    (LET ((q (GETELEMENTPTR I8 p (I64 -16))))
+      (CALL (GLOBAL fib.trace-line) (I8 70) (LOAD I64 q) (I8 0))
+      (INDIRECT-CALL (LOAD PTR rec) (FUNCTION VOID (PTR PTR)) p wl)
+      (CALL (GLOBAL fib.lc-put) q)
+      (RET))))
 
 ;; The worklist of a drop: the objects whose release is still to run,
 ;; as a stack in the order of the recursion it replaces (the type's drop
@@ -403,300 +403,300 @@
 ;; number of entries, the capacity, and the inline buffer that a drop
 ;; starts with on its own stack frame. It is private to one drop, so
 ;; there is no state shared between threads.
-(defstruct fib.wl (ptr i64 i64 ptr i64))
+(DEFSTRUCT fib.wl (PTR I64 I64 PTR I64))
 
 ;; A worklist on the buffer `buf` of `cap` entries. Its fifth field, the mode, says what a share-marking does to the objects it queues
 ;; (rt/atom.lir: 1 SHARED, 2 IMMORTAL for a `def`, 3 IMMORTAL for `freeze`); a drop does not read it. The mode lives in the worklist, which
 ;; is private to one walk, and not in a global, so that a `freeze` and a `spawn` on two threads at once do not disturb each other.
-(define internal (fib.wl-init void) ((ptr wl) (ptr buf) (i64 cap))
-  (block entry
-    (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
-    (store (i64 0) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
-    (store cap (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
-    (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))
-    (store (i64 1) (getelementptr %struct.fib.wl wl (i32 0) (i32 4)))
-    (ret)))
+(DEFINE INTERNAL (fib.wl-init VOID) ((PTR wl) (PTR buf) (I64 cap))
+  (BLOCK entry
+    (STORE buf (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0)))
+    (STORE (I64 0) (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1)))
+    (STORE cap (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 2)))
+    (STORE buf (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 3)))
+    (STORE (I64 1) (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 4)))
+    (RET)))
 
 ;; Doubles the capacity, moving to the heap; the inline buffer is never
 ;; freed. A failed malloc is the trap "out of memory".
-(define internal (fib.wl-grow void) ((ptr wl))
-  (block entry
-    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
-          (len (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))))
-          (cap (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 2))))
-          (inline (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 3))))
-          (cap2 (mul cap (i64 2)))
-          (bigger (call @malloc (mul cap2 (i64 8)))))
-      (br (icmp eq bigger (ptr null)) oom copy)))
-  (block copy
-    (call @memcpy bigger base (mul len (i64 8)))
-    (store bigger (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
-    (store cap2 (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
-    (br (icmp eq base inline) done old))
-  (block old (call @free base) (br done))
-  (block done (ret))
-  (block oom
-    (call @fib.fatal-c (string "out of memory"))
-    (unreachable)))
+(DEFINE INTERNAL (fib.wl-grow VOID) ((PTR wl))
+  (BLOCK entry
+    (LET ((base (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0))))
+          (len (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1))))
+          (cap (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 2))))
+          (inline (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 3))))
+          (cap2 (MUL cap (I64 2)))
+          (bigger (CALL (GLOBAL malloc) (MUL cap2 (I64 8)))))
+      (BR (ICMP EQ bigger (PTR NULL)) oom copy)))
+  (BLOCK copy
+    (CALL (GLOBAL memcpy) bigger base (MUL len (I64 8)))
+    (STORE bigger (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0)))
+    (STORE cap2 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 2)))
+    (BR (ICMP EQ base inline) done old))
+  (BLOCK old (CALL (GLOBAL free) base) (BR done))
+  (BLOCK done (RET))
+  (BLOCK oom
+    (CALL (GLOBAL fib.fatal-c) (STRING "out of memory"))
+    (UNREACHABLE)))
 
 ;; Frees the heap buffer, if the worklist moved to one.
-(define internal (fib.wl-free void) ((ptr wl))
-  (block entry
-    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
-          (inline (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))))
-      (br (icmp eq base inline) done heap)))
-  (block heap (call @free base) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.wl-free VOID) ((PTR wl))
+  (BLOCK entry
+    (LET ((base (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0))))
+          (inline (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 3)))))
+      (BR (ICMP EQ base inline) done heap)))
+  (BLOCK heap (CALL (GLOBAL free) base) (BR done))
+  (BLOCK done (RET)))
 
 ;; Appends p to the worklist, growing it when it is full.
-(define internal (fib.wl-push void) ((ptr wl) (ptr p))
-  (block entry
-    (let ((len (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))))
-          (cap (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))))
-      (br (icmp eq len cap) grow push)))
-  (block grow (call @fib.wl-grow wl) (br push))
-  (block push
-    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
-          (n (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))))
-      (store p (getelementptr ptr base n))
-      (store (add n (i64 1)) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
-      (ret))))
+(DEFINE INTERNAL (fib.wl-push VOID) ((PTR wl) (PTR p))
+  (BLOCK entry
+    (LET ((len (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1))))
+          (cap (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 2)))))
+      (BR (ICMP EQ len cap) grow push)))
+  (BLOCK grow (CALL (GLOBAL fib.wl-grow) wl) (BR push))
+  (BLOCK push
+    (LET ((base (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0))))
+          (n (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1)))))
+      (STORE p (GETELEMENTPTR PTR base n))
+      (STORE (ADD n (I64 1)) (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1)))
+      (RET))))
 
 ;; Removes and returns the last entry; the worklist is not empty.
-(define internal (fib.wl-pop ptr) ((ptr wl))
-  (block entry
-    (let ((n1 (sub (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))) (i64 1)))
-          (base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))))
-      (store n1 (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
-      (ret (load ptr (getelementptr ptr base n1))))))
+(DEFINE INTERNAL (fib.wl-pop PTR) ((PTR wl))
+  (BLOCK entry
+    (LET ((n1 (SUB (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1))) (I64 1)))
+          (base (LOAD PTR (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 0)))))
+      (STORE n1 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1)))
+      (RET (LOAD PTR (GETELEMENTPTR PTR base n1))))))
 
-(define internal (fib.wl-empty i1) ((ptr wl))
-  (block entry
-    (ret (icmp eq (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))) (i64 0)))))
+(DEFINE INTERNAL (fib.wl-empty I1) ((PTR wl))
+  (BLOCK entry
+    (RET (ICMP EQ (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 1))) (I64 0)))))
 
 ;; What a drop does in place of releasing a child: queue it. Null and
 ;; the objects no count reaches (IMMORTAL, STACK) are skipped now, as
 ;; their flags never change; the count is touched only when the entry
 ;; is taken off the worklist, so every release runs in the order the
 ;; recursion ran it (the order of the frees in the trace, compiler.md §4).
-(define internal (fib.defer void) ((ptr wl) (ptr p))
-  (block entry (br (icmp eq p (ptr null)) done check))
-  (block check
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done push)))
-  (block push (call @fib.wl-push wl p) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.defer VOID) ((PTR wl) (PTR p))
+  (BLOCK entry (BR (ICMP EQ p (PTR NULL)) done check))
+  (BLOCK check
+    (LET ((f (CALL (GLOBAL fib.flags) p)))
+      (BR (ICMP NE (AND f (I32 12)) (I32 0)) done push)))
+  (BLOCK push (CALL (GLOBAL fib.wl-push) wl p) (BR done))
+  (BLOCK done (RET)))
 
 ;; fib.release of a queued object (never null, immortal or a stack
 ;; object): a count that reaches zero drops it into the same worklist.
-(define internal (fib.release-queued void) ((ptr wl) (ptr p))
-  (block entry
-    (let ((f (call @fib.flags p))
-          (cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
-      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
-  (block shared
-    (let ((old (atomicrmw sub acq_rel cp (i64 1))))
-      (br (icmp eq old (i64 1)) drop done)))
-  (block local
-    (let ((c (load i64 cp)))
-      (br (icmp eq c (i64 1)) drop dec)))
-  (block dec (store (sub c (i64 1)) cp) (br done))
-  (block drop (call @fib.drop-one wl p) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.release-queued VOID) ((PTR wl) (PTR p))
+  (BLOCK entry
+    (LET ((f (CALL (GLOBAL fib.flags) p))
+          (cp (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))))
+      (BR (ICMP NE (AND f (I32 1)) (I32 0)) shared local)))
+  (BLOCK shared
+    (LET ((old (ATOMICRMW SUB ACQ_REL cp (I64 1))))
+      (BR (ICMP EQ old (I64 1)) drop done)))
+  (BLOCK local
+    (LET ((c (LOAD I64 cp)))
+      (BR (ICMP EQ c (I64 1)) drop dec)))
+  (BLOCK dec (STORE (SUB c (I64 1)) cp) (BR done))
+  (BLOCK drop (CALL (GLOBAL fib.drop-one) wl p) (BR done))
+  (BLOCK done (RET)))
 
 ;; Releases the queued objects, last in first out, until none is left.
-(define internal (fib.drain void) ((ptr wl))
-  (block entry (br loop))
-  (block loop (br (call @fib.wl-empty wl) done pop))
-  (block pop
-    (call @fib.release-queued wl (call @fib.wl-pop wl))
-    (br loop))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.drain VOID) ((PTR wl))
+  (BLOCK entry (BR loop))
+  (BLOCK loop (BR (CALL (GLOBAL fib.wl-empty) wl) done pop))
+  (BLOCK pop
+    (CALL (GLOBAL fib.release-queued) wl (CALL (GLOBAL fib.wl-pop) wl))
+    (BR loop))
+  (BLOCK done (RET)))
 
 ;; §8.2: the drop of an object whose count reached zero, with every
 ;; release it causes: the native stack stays as deep as one drop.
-(define internal (fib.drop void) ((ptr p))
-  (block entry
-    (let ((wl (alloca %struct.fib.wl))
-          (buf (alloca (align 8) i8 (i32 256))))
-      (call @fib.wl-init wl buf (i64 32))
-      (call @fib.drop-one wl p)
-      (call @fib.drain wl)
-      (call @fib.wl-free wl)
-      (ret))))
+(DEFINE INTERNAL (fib.drop VOID) ((PTR p))
+  (BLOCK entry
+    (LET ((wl (ALLOCA (STRUCT fib.wl)))
+          (buf (ALLOCA (ALIGN 8) I8 (I32 256))))
+      (CALL (GLOBAL fib.wl-init) wl buf (I64 32))
+      (CALL (GLOBAL fib.drop-one) wl p)
+      (CALL (GLOBAL fib.drain) wl)
+      (CALL (GLOBAL fib.wl-free) wl)
+      (RET))))
 
 ;; A stack object's scope end (§6.11): its children are released; it
 ;; is not freed. The type's drop is slot 0 of the type table.
-(define internal (fib.drop-fields void) ((ptr p))
-  (block entry
-    (let ((wl (alloca %struct.fib.wl))
-          (buf (alloca (align 8) i8 (i32 256)))
-          (rec (getelementptr %struct.fib.typerec @fib.types (call @fib.tid p) (i32 0))))
-      (call @fib.wl-init wl buf (i64 32))
-      (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
-      (call @fib.drain wl)
-      (call @fib.wl-free wl)
-      (ret))))
+(DEFINE INTERNAL (fib.drop-fields VOID) ((PTR p))
+  (BLOCK entry
+    (LET ((wl (ALLOCA (STRUCT fib.wl)))
+          (buf (ALLOCA (ALIGN 8) I8 (I32 256)))
+          (rec (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) (CALL (GLOBAL fib.tid) p) (I32 0))))
+      (CALL (GLOBAL fib.wl-init) wl buf (I64 32))
+      (INDIRECT-CALL (LOAD PTR rec) (FUNCTION VOID (PTR PTR)) p wl)
+      (CALL (GLOBAL fib.drain) wl)
+      (CALL (GLOBAL fib.wl-free) wl)
+      (RET))))
 
 ;; §8.2: neither SHARED, IMMORTAL, STACK nor HAS-WEAK, and count 1.
-(define internal (fib.unique? i1) ((ptr p))
-  (block entry
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 15)) (i32 0)) no test)))
-  (block no (ret (i1 0)))
-  (block test (ret (icmp eq (load i64 (getelementptr %struct.fib.hdr p (i32 0) (i32 0))) (i64 1)))))
+(DEFINE INTERNAL (fib.unique? I1) ((PTR p))
+  (BLOCK entry
+    (LET ((f (CALL (GLOBAL fib.flags) p)))
+      (BR (ICMP NE (AND f (I32 15)) (I32 0)) no test)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK test (RET (ICMP EQ (LOAD I64 (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0))) (I64 1)))))
 
 ;; The size of an object: its type's record.
-(define internal (fib.size-of i64) ((i32 tid))
-  (block entry
-    (ret (load i64 (getelementptr %struct.fib.typerec @fib.types tid (i32 3))))))
+(DEFINE INTERNAL (fib.size-of I64) ((I32 tid))
+  (BLOCK entry
+    (RET (LOAD I64 (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) tid (I32 3))))))
 
 ;; While the init functions of the `def`s run (L15), the text "def NAME: "
 ;; of the `def` being made, else null: a trap in an initialiser names it.
-(global internal fib.initdef ptr (ptr null))
+(GLOBAL INTERNAL fib.initdef PTR (PTR NULL))
 
 ;; The init functions are done: in trace mode the line "I k", k the last
 ;; ordinal handed out. The objects the initialisers allocated (and
 ;; made immortal) are not part of the trace (compiler.md §4), as the
 ;; interpreter's trace leaves out its `def` evaluation: the reader of
 ;; the trace drops every line up to this one and numbers from k.
-(define internal (fib.init-done void) ()
-  (block entry
-    (store (ptr null) @fib.initdef)
-    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
-  (block traced
-    (call @fib.trace-line (i8 73) (load i64 @fib.ordinal) (i8 0))
-    (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.init-done VOID) ()
+  (BLOCK entry
+    (STORE (PTR NULL) (GLOBAL fib.initdef))
+    (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced done))
+  (BLOCK traced
+    (CALL (GLOBAL fib.trace-line) (I8 73) (LOAD I64 (GLOBAL fib.ordinal)) (I8 0))
+    (BR done))
+  (BLOCK done (RET)))
 
 ;; §8.12, §2.11: "trap: MESSAGE\n" to fd 2, then abort.
 ;; In a macro module (the trap hook is set) the trap fails the expansion
 ;; instead (macros/bridge.rs): `pos` is the C string POS of the faulting
 ;; expression, or null where the runtime does not know it. The hook does
 ;; not return.
-(define internal (fib.trap-hooked void) ((ptr pos) (ptr bytes) (i64 n))
-  (block entry
-    (let ((hook (load ptr @fibm.trap-hook))
-          (cx (load ptr @fibm.hook-cx)))
-      (indirect-call hook (fn void (ptr ptr ptr i64)) cx pos bytes n)
-      (unreachable))))
+(DEFINE INTERNAL (fib.trap-hooked VOID) ((PTR pos) (PTR bytes) (I64 n))
+  (BLOCK entry
+    (LET ((hook (LOAD PTR (GLOBAL fibm.trap-hook)))
+          (cx (LOAD PTR (GLOBAL fibm.hook-cx))))
+      (INDIRECT-CALL hook (FUNCTION VOID (PTR PTR PTR I64)) cx pos bytes n)
+      (UNREACHABLE))))
 
 ;; `trap` and a fault of a macro module's own code, with the position.
-(define internal (fib.trap-at void) ((ptr pos) (ptr s))
-  (block entry
-    (call @fib.trap-hooked pos (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
-      (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
-    (unreachable)))
+(DEFINE INTERNAL (fib.trap-at VOID) ((PTR pos) (PTR s))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trap-hooked) pos (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) (I64 0))
+      (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3))))
+    (UNREACHABLE)))
 
-(define internal (fib.trap-at-c void) ((ptr pos) (ptr msg))
-  (block entry
-    (call @fib.trap-hooked pos msg (call @strlen msg))
-    (unreachable)))
+(DEFINE INTERNAL (fib.trap-at-c VOID) ((PTR pos) (PTR msg))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trap-hooked) pos msg (CALL (GLOBAL strlen) msg))
+    (UNREACHABLE)))
 
 ;; "trap: MESSAGE\n" to fd 2, then abort: what a trap is where it is not isolated, and what a fatal failure is everywhere.
-(define internal (fib.fatal-bytes void) ((ptr bytes) (i64 n))
-  (block entry
-    (call @fib.trace-flush)
-    (call @write (i32 2) (string "trap: ") (i64 6))
-    (let ((pre (load ptr @fib.initdef)))
-      (br (icmp eq pre (ptr null)) body named)))
-  (block named
-    (call @write (i32 2) pre (call @strlen pre))
-    (br body))
-  (block body
-    (call @write (i32 2) bytes n)
-    (call @write (i32 2) (string "\n") (i64 1))
-    (call @abort)
-    (unreachable)))
+(DEFINE INTERNAL (fib.fatal-bytes VOID) ((PTR bytes) (I64 n))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trace-flush))
+    (CALL (GLOBAL write) (I32 2) (STRING "trap: ") (I64 6))
+    (LET ((pre (LOAD PTR (GLOBAL fib.initdef))))
+      (BR (ICMP EQ pre (PTR NULL)) body named)))
+  (BLOCK named
+    (CALL (GLOBAL write) (I32 2) pre (CALL (GLOBAL strlen) pre))
+    (BR body))
+  (BLOCK body
+    (CALL (GLOBAL write) (I32 2) bytes n)
+    (CALL (GLOBAL write) (I32 2) (STRING "\n") (I64 1))
+    (CALL (GLOBAL abort))
+    (UNREACHABLE)))
 
 ;; A failure the program cannot survive whatever runs it: out of memory (a handler and the unwinder allocate), a thread or a
 ;; worker that cannot be started. Never isolated, never caught (docs/design/exceptions.md 1.2, the owner's list of 2026-10-05).
-(define internal (fib.fatal-c void) ((ptr msg))
-  (block entry
-    (call @fib.fatal-bytes msg (call @strlen msg))
-    (unreachable)))
+(DEFINE INTERNAL (fib.fatal-c VOID) ((PTR msg))
+  (BLOCK entry
+    (CALL (GLOBAL fib.fatal-bytes) msg (CALL (GLOBAL strlen) msg))
+    (UNREACHABLE)))
 
 ;; A trap on the thread of a spawned task ends that task, not the process (docs/design/exceptions.md 4.1, stage 1): the message
 ;; goes to fd 2 as `trap in task: MESSAGE` in ONE write (a trace line of another thread must not land inside it), a share-marked copy of it is stored as the task's failure, the task completes (state
 ;; done, its waiters woken: a joiner finds the failure and traps in its turn, or try-join returns it), the thread releases its
 ;; count of the task and ends. What the task's frames owned is abandoned (never freed): audit: abandoned. A pool task (sched.lir)
 ;; fails the worker's chain of tasks instead, and the worker is replaced (fib.sched-fail).
-(define internal (fib.fail-task void) ((ptr task) (ptr bytes) (i64 n))
-  (block entry
-    (let ((line (call @malloc (add n (i64 16)))))
-      (br (icmp eq line (ptr null)) record print)))
-  (block print
-    (call @memcpy line (string "trap in task: ") (i64 14))
-    (call @memcpy (getelementptr i8 line (i64 14)) bytes n)
-    (store (i8 10) (getelementptr i8 line (add n (i64 14))))
-    (call @fib.trace-flush)
-    (call @write (i32 2) line (add n (i64 15)))
-    (call @free line)
-    (br record))
-  (block record
-    (let ((msg (call @fib.str-from-bytes bytes n)))
-      (call @fib.share msg)
-      (atomic-store release msg (getelementptr %struct.fib.task task (i32 0) (i32 10)))
-      (br (call @fib.sched-pool-task task) pool thread)))
-  (block pool
-    (call @fib.sched-fail task msg)
-    (unreachable))
-  (block thread
-    (call @fib.thread-uncount)
-    (call @fib.task-complete task)
-    (call @fib.release task)
-    (call @fib.thread-done)
-    (call @pthread_exit (ptr null))
-    (unreachable)))
+(DEFINE INTERNAL (fib.fail-task VOID) ((PTR task) (PTR bytes) (I64 n))
+  (BLOCK entry
+    (LET ((line (CALL (GLOBAL malloc) (ADD n (I64 16)))))
+      (BR (ICMP EQ line (PTR NULL)) record print)))
+  (BLOCK print
+    (CALL (GLOBAL memcpy) line (STRING "trap in task: ") (I64 14))
+    (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 line (I64 14)) bytes n)
+    (STORE (I8 10) (GETELEMENTPTR I8 line (ADD n (I64 14))))
+    (CALL (GLOBAL fib.trace-flush))
+    (CALL (GLOBAL write) (I32 2) line (ADD n (I64 15)))
+    (CALL (GLOBAL free) line)
+    (BR record))
+  (BLOCK record
+    (LET ((msg (CALL (GLOBAL fib.str-from-bytes) bytes n)))
+      (CALL (GLOBAL fib.share) msg)
+      (ATOMIC-STORE RELEASE msg (GETELEMENTPTR (STRUCT fib.task) task (I32 0) (I32 10)))
+      (BR (CALL (GLOBAL fib.sched-pool-task) task) pool thread)))
+  (BLOCK pool
+    (CALL (GLOBAL fib.sched-fail) task msg)
+    (UNREACHABLE))
+  (BLOCK thread
+    (CALL (GLOBAL fib.thread-uncount))
+    (CALL (GLOBAL fib.task-complete) task)
+    (CALL (GLOBAL fib.release) task)
+    (CALL (GLOBAL fib.thread-done))
+    (CALL (GLOBAL pthread_exit) (PTR NULL))
+    (UNREACHABLE)))
 
-(define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
-  (block entry
-    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked check))
-  (block hooked
-    (call @fib.trap-hooked (ptr null) bytes n)
-    (unreachable))
-  (block check
-    (br (call @fib.in-finally) fin task))
-  (block fin
-    (call @fib.fatal-finally bytes n)
-    (unreachable))
-  (block task
-    (let ((tk (call @pthread_getspecific (load i32 @fib.task-key))))
-      (br (icmp ne tk (ptr null)) in-task plain)))
-  (block in-task
-    (call @fib.fail-task (call @pthread_getspecific (load i32 @fib.task-key)) bytes n)
-    (unreachable))
-  (block plain
-    (call @fib.fatal-bytes bytes n)
-    (unreachable)))
+(DEFINE INTERNAL (fib.trap-bytes VOID) ((PTR bytes) (I64 n))
+  (BLOCK entry
+    (BR (ICMP NE (LOAD PTR (GLOBAL fibm.trap-hook)) (PTR NULL)) hooked check))
+  (BLOCK hooked
+    (CALL (GLOBAL fib.trap-hooked) (PTR NULL) bytes n)
+    (UNREACHABLE))
+  (BLOCK check
+    (BR (CALL (GLOBAL fib.in-finally)) fin task))
+  (BLOCK fin
+    (CALL (GLOBAL fib.fatal-finally) bytes n)
+    (UNREACHABLE))
+  (BLOCK task
+    (LET ((tk (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.task-key)))))
+      (BR (ICMP NE tk (PTR NULL)) in-task plain)))
+  (BLOCK in-task
+    (CALL (GLOBAL fib.fail-task) (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.task-key))) bytes n)
+    (UNREACHABLE))
+  (BLOCK plain
+    (CALL (GLOBAL fib.fatal-bytes) bytes n)
+    (UNREACHABLE)))
 
-(define internal (fib.trap-c void) ((ptr msg))
-  (block entry
-    (call @fib.trap-bytes msg (call @strlen msg))
-    (unreachable)))
+(DEFINE INTERNAL (fib.trap-c VOID) ((PTR msg))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trap-bytes) msg (CALL (GLOBAL strlen) msg))
+    (UNREACHABLE)))
 
-(define internal (fib.trap void) ((ptr s))
-  (block entry
-    (call @fib.trap-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
-      (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
-    (unreachable)))
+(DEFINE INTERNAL (fib.trap VOID) ((PTR s))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trap-bytes) (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) (I64 0))
+      (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3))))
+    (UNREACHABLE)))
 
 ;; A fresh object of the same type with the bytes after the header
 ;; copied (§8.3: a changed copy for a unique write that cannot be in
 ;; place); the caller retains the children and replaces the field.
-(define internal (fib.copy-object ptr) ((ptr p) (i64 size) (i32 tid))
-  (block entry
-    (let ((q (call @fib.alloc size tid)))
-      (call @memcpy (getelementptr i8 q (i64 16)) (getelementptr i8 p (i64 16)) (sub size (i64 16)))
-      (ret q))))
+(DEFINE INTERNAL (fib.copy-object PTR) ((PTR p) (I64 size) (I32 tid))
+  (BLOCK entry
+    (LET ((q (CALL (GLOBAL fib.alloc) size tid)))
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 q (I64 16)) (GETELEMENTPTR I8 p (I64 16)) (SUB size (I64 16)))
+      (RET q))))
 
 ;; The interpreter's message for an index out of range (eval/arrays.rs).
-(define internal (fib.trap-index void) ((i64 i) (i64 n))
-  (block entry
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "array index %lld out of range 0..%lld") i n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable))))
+(DEFINE INTERNAL (fib.trap-index VOID) ((I64 i) (I64 n))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "array index %lld out of range 0..%lld") i n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE))))
 
 ;; ---- catching traps (stage 2, docs/design/exceptions.md 4.2, ADR 0009)
 ;; A program that calls `catch-run` is compiled so that its functions return a failure next to their value (`{ T ptr }`, or `ptr` for
@@ -706,228 +706,228 @@
 
 ;; The catch state of a thread: the number of catch-runs active, the failure caught last (until catch-run's caller takes it), and the
 ;; number of finally clauses running for an unwinding.
-(defstruct fib.exc (i64 ptr i64))
+(DEFSTRUCT fib.exc (I64 PTR I64))
 
-(define internal (fib.exc-state ptr) ()
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) make done)))
-  (block make
-    (let ((n (call @calloc (i64 1) (i64 24))))
-      (br (icmp eq n (ptr null)) oom set)))
-  (block oom
-    (call @fib.fatal-c (string "out of memory"))
-    (unreachable))
-  (block set
-    (call @pthread_setspecific (load i32 @fib.exc-key) n)
-    (ret n))
-  (block done (ret s)))
+(DEFINE INTERNAL (fib.exc-state PTR) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) make done)))
+  (BLOCK make
+    (LET ((n (CALL (GLOBAL calloc) (I64 1) (I64 24))))
+      (BR (ICMP EQ n (PTR NULL)) oom set)))
+  (BLOCK oom
+    (CALL (GLOBAL fib.fatal-c) (STRING "out of memory"))
+    (UNREACHABLE))
+  (BLOCK set
+    (CALL (GLOBAL pthread_setspecific) (LOAD I32 (GLOBAL fib.exc-key)) n)
+    (RET n))
+  (BLOCK done (RET s)))
 
 ;; Whether a trap on this thread unwinds: a catch-run is active.
-(define internal (fib.catching i1) ()
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) no yes)))
-  (block no (ret (i1 0)))
-  (block yes (ret (icmp sgt (load i64 (getelementptr %struct.fib.exc s (i32 0) (i32 0))) (i64 0)))))
+(DEFINE INTERNAL (fib.catching I1) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) no yes)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK yes (RET (ICMP SGT (LOAD I64 (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 0))) (I64 0)))))
 
 ;; Whether a finally clause runs for an unwinding on this thread (a trap there is fatal).
-(define internal (fib.in-finally i1) ()
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) no yes)))
-  (block no (ret (i1 0)))
-  (block yes (ret (icmp sgt (load i64 (getelementptr %struct.fib.exc s (i32 0) (i32 2))) (i64 0)))))
+(DEFINE INTERNAL (fib.in-finally I1) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) no yes)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK yes (RET (ICMP SGT (LOAD I64 (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 2))) (I64 0)))))
 
-(define internal (fib.catch-enter ptr) ()
-  (block entry
-    (let ((s (call @fib.exc-state))
-          (dp (getelementptr %struct.fib.exc s (i32 0) (i32 0))))
-      (store (add (load i64 dp) (i64 1)) dp)
-      (ret s))))
+(DEFINE INTERNAL (fib.catch-enter PTR) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.exc-state)))
+          (dp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 0))))
+      (STORE (ADD (LOAD I64 dp) (I64 1)) dp)
+      (RET s))))
 
 ;; The end of a catch-run: the depth restored; 0 when the body returned, else the failure is kept for the caller to take (1: a trap's
 ;; message, 2: a thrown object).
-(define internal (fib.catch-leave i64) ((ptr s) (ptr ex))
-  (block entry
-    (let ((dp (getelementptr %struct.fib.exc s (i32 0) (i32 0))))
-      (store (sub (load i64 dp) (i64 1)) dp)
-      (br (icmp eq ex (ptr null)) ok caught)))
-  (block ok (ret (i64 0)))
-  (block caught
-    (let ((sp (getelementptr %struct.fib.exc s (i32 0) (i32 1))))
-      (call @fib.release (inttoptr ptr (and (ptrtoint i64 (load ptr sp)) (i64 -2))))
-      (store ex sp)
-      (ret (select (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) (i64 1) (i64 2))))))
+(DEFINE INTERNAL (fib.catch-leave I64) ((PTR s) (PTR ex))
+  (BLOCK entry
+    (LET ((dp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 0))))
+      (STORE (SUB (LOAD I64 dp) (I64 1)) dp)
+      (BR (ICMP EQ ex (PTR NULL)) ok caught)))
+  (BLOCK ok (RET (I64 0)))
+  (BLOCK caught
+    (LET ((sp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 1))))
+      (CALL (GLOBAL fib.release) (INTTOPTR PTR (AND (PTRTOINT I64 (LOAD PTR sp)) (I64 -2))))
+      (STORE ex sp)
+      (RET (SELECT (ICMP NE (AND (PTRTOINT I64 ex) (I64 1)) (I64 0)) (I64 1) (I64 2))))))
 
 ;; The failure caught last, taken (its count moves to the caller): `want` 1 the message str of a trap, 0 a thrown object; asking for the
 ;; other kind, or when nothing was caught, is a trap.
-(define internal (fib.caught-take ptr) ((i64 want))
-  (block entry
-    (let ((s (call @fib.exc-state))
-          (sp (getelementptr %struct.fib.exc s (i32 0) (i32 1)))
-          (ex (load ptr sp))
-          (tag (and (ptrtoint i64 ex) (i64 1))))
-      (br (icmp eq ex (ptr null)) none kind)))
-  (block kind (br (icmp eq tag want) take none))
-  (block none
-    (call @fib.trap-c (string "caught: no failure of that kind was caught"))
-    (unreachable))
-  (block take
-    (store (ptr null) sp)
-    (ret (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))))
+(DEFINE INTERNAL (fib.caught-take PTR) ((I64 want))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.exc-state)))
+          (sp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 1)))
+          (ex (LOAD PTR sp))
+          (tag (AND (PTRTOINT I64 ex) (I64 1))))
+      (BR (ICMP EQ ex (PTR NULL)) none kind)))
+  (BLOCK kind (BR (ICMP EQ tag want) take none))
+  (BLOCK none
+    (CALL (GLOBAL fib.trap-c) (STRING "caught: no failure of that kind was caught"))
+    (UNREACHABLE))
+  (BLOCK take
+    (STORE (PTR NULL) sp)
+    (RET (INTTOPTR PTR (AND (PTRTOINT I64 ex) (I64 -2))))))
 
 ;; ---- What a library's export leaves for its host (docs/design/stack-check.md 6; compiler/emit/export.fib). The export wrapper of a library that passes failures on
 ;; runs the function under a catch; a failure is kept in the caught slot of the thread's catch state (the one `catch-leave` filled) until the next export call on
 ;; the thread clears it (fib.export-clear), and the host reads it with `fib_status` and `fib_error`, which are these two below.
 
 ;; The start of an export call: the failure the previous call left on this thread is released.
-(define internal (fib.export-clear void) ()
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) done look)))
-  (block look
-    (let ((sp (getelementptr %struct.fib.exc s (i32 0) (i32 1)))
-          (ex (load ptr sp)))
-      (br (icmp eq ex (ptr null)) done drop)))
-  (block drop
-    (store (ptr null) sp)
-    (call @fib.release (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
-    (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.export-clear VOID) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) done look)))
+  (BLOCK look
+    (LET ((sp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 1)))
+          (ex (LOAD PTR sp)))
+      (BR (ICMP EQ ex (PTR NULL)) done drop)))
+  (BLOCK drop
+    (STORE (PTR NULL) sp)
+    (CALL (GLOBAL fib.release) (INTTOPTR PTR (AND (PTRTOINT I64 ex) (I64 -2))))
+    (BR done))
+  (BLOCK done (RET)))
 
 ;; 0 when the last export call on this thread returned, 1 when it trapped (a message), 2 when it threw an object.
-(define internal (fib.export-status i32) ()
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) none look)))
-  (block none (ret (i32 0)))
-  (block look
-    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1)))))
-      (br (icmp eq ex (ptr null)) none some)))
-  (block some
-    (ret (select (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) (i32 1) (i32 2)))))
+(DEFINE INTERNAL (fib.export-status I32) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) none look)))
+  (BLOCK none (RET (I32 0)))
+  (BLOCK look
+    (LET ((ex (LOAD PTR (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 1)))))
+      (BR (ICMP EQ ex (PTR NULL)) none some)))
+  (BLOCK some
+    (RET (SELECT (ICMP NE (AND (PTRTOINT I64 ex) (I64 1)) (I64 0)) (I32 1) (I32 2)))))
 
 ;; The message of that failure into the host's buffer, as a `str` result is written: at most `cap` bytes (none when `out` is NULL or `cap` is not positive), the
 ;; length returned. A thrown object has the message "exception"; no failure has the empty one.
-(define internal (fib.export-error i64) ((ptr out) (i64 cap))
-  (block entry
-    (let ((s (call @pthread_getspecific (load i32 @fib.exc-key))))
-      (br (icmp eq s (ptr null)) none look)))
-  (block none (ret (i64 0)))
-  (block look
-    (let ((ex (load ptr (getelementptr %struct.fib.exc s (i32 0) (i32 1))))
-          (tag (and (ptrtoint i64 ex) (i64 1))))
-      (br (icmp eq ex (ptr null)) none have)))
-  (block have
-    (br (icmp ne tag (i64 0)) msg obj))
-  (block msg
-    (let ((m (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2))))
-          (n (load i64 (getelementptr %struct.fib.str m (i32 0) (i32 3))))
-          (c (select (icmp slt cap (i64 0)) (i64 0) cap))
-          (k0 (select (icmp slt n c) n c))
-          (k (select (icmp eq out (ptr null)) (i64 0) k0)))
-      (call @memcpy out (getelementptr %struct.fib.str m (i32 0) (i32 4) (i64 0)) k)
-      (ret n)))
-  (block obj
-    (let ((oc (select (icmp slt cap (i64 0)) (i64 0) cap))
-          (ok0 (select (icmp slt (i64 9) oc) (i64 9) oc))
-          (okk (select (icmp eq out (ptr null)) (i64 0) ok0)))
-      (call @memcpy out (string "exception") okk)
-      (ret (i64 9)))))
+(DEFINE INTERNAL (fib.export-error I64) ((PTR out) (I64 cap))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.exc-key)))))
+      (BR (ICMP EQ s (PTR NULL)) none look)))
+  (BLOCK none (RET (I64 0)))
+  (BLOCK look
+    (LET ((ex (LOAD PTR (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 1))))
+          (tag (AND (PTRTOINT I64 ex) (I64 1))))
+      (BR (ICMP EQ ex (PTR NULL)) none have)))
+  (BLOCK have
+    (BR (ICMP NE tag (I64 0)) msg obj))
+  (BLOCK msg
+    (LET ((m (INTTOPTR PTR (AND (PTRTOINT I64 ex) (I64 -2))))
+          (n (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) m (I32 0) (I32 3))))
+          (c (SELECT (ICMP SLT cap (I64 0)) (I64 0) cap))
+          (k0 (SELECT (ICMP SLT n c) n c))
+          (k (SELECT (ICMP EQ out (PTR NULL)) (I64 0) k0)))
+      (CALL (GLOBAL memcpy) out (GETELEMENTPTR (STRUCT fib.str) m (I32 0) (I32 4) (I64 0)) k)
+      (RET n)))
+  (BLOCK obj
+    (LET ((oc (SELECT (ICMP SLT cap (I64 0)) (I64 0) cap))
+          (ok0 (SELECT (ICMP SLT (I64 9) oc) (I64 9) oc))
+          (okk (SELECT (ICMP EQ out (PTR NULL)) (I64 0) ok0)))
+      (CALL (GLOBAL memcpy) out (STRING "exception") okk)
+      (RET (I64 9)))))
 
 ;; A trap of the message at bytes: the failure to unwind with when a catch is active (a fresh tagged str), else the trap as before.
-(define internal (fib.raise-bytes ptr) ((ptr bytes) (i64 n))
-  (block entry
-    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) plain check))
-  (block check (br (call @fib.catching) unwind plain))
-  (block plain
-    (call @fib.trap-bytes bytes n)
-    (unreachable))
-  (block unwind
-    (let ((m (call @fib.str-from-bytes bytes n)))
-      (ret (inttoptr ptr (or (ptrtoint i64 m) (i64 1)))))))
+(DEFINE INTERNAL (fib.raise-bytes PTR) ((PTR bytes) (I64 n))
+  (BLOCK entry
+    (BR (ICMP NE (LOAD PTR (GLOBAL fibm.trap-hook)) (PTR NULL)) plain check))
+  (BLOCK check (BR (CALL (GLOBAL fib.catching)) unwind plain))
+  (BLOCK plain
+    (CALL (GLOBAL fib.trap-bytes) bytes n)
+    (UNREACHABLE))
+  (BLOCK unwind
+    (LET ((m (CALL (GLOBAL fib.str-from-bytes) bytes n)))
+      (RET (INTTOPTR PTR (OR (PTRTOINT I64 m) (I64 1)))))))
 
-(define internal (fib.raise-c ptr) ((ptr msg))
-  (block entry (ret (call @fib.raise-bytes msg (call @strlen msg)))))
+(DEFINE INTERNAL (fib.raise-c PTR) ((PTR msg))
+  (BLOCK entry (RET (CALL (GLOBAL fib.raise-bytes) msg (CALL (GLOBAL strlen) msg)))))
 
-(define internal (fib.raise ptr) ((ptr s))
-  (block entry
-    (ret (call @fib.raise-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
-           (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3)))))))
+(DEFINE INTERNAL (fib.raise PTR) ((PTR s))
+  (BLOCK entry
+    (RET (CALL (GLOBAL fib.raise-bytes) (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) (I64 0))
+           (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3)))))))
 
-(define internal (fib.raise-index ptr) ((i64 i) (i64 n))
-  (block entry
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "array index %lld out of range 0..%lld") i n)))
-      (ret (call @fib.raise-bytes buf (sext i64 len))))))
+(DEFINE INTERNAL (fib.raise-index PTR) ((I64 i) (I64 n))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "array index %lld out of range 0..%lld") i n)))
+      (RET (CALL (GLOBAL fib.raise-bytes) buf (SEXT I64 len))))))
 
 ;; `throw-object`: the object (its count) is the failure; outside a catch there is no one to take it.
-(define internal (fib.raise-object ptr) ((ptr p))
-  (block entry (br (call @fib.catching) unwind plain))
-  (block plain
-    (call @fib.trap-c (string "throw: no catch is active"))
-    (unreachable))
-  (block unwind (ret p)))
+(DEFINE INTERNAL (fib.raise-object PTR) ((PTR p))
+  (BLOCK entry (BR (CALL (GLOBAL fib.catching)) unwind plain))
+  (BLOCK plain
+    (CALL (GLOBAL fib.trap-c) (STRING "throw: no catch is active"))
+    (UNREACHABLE))
+  (BLOCK unwind (RET p)))
 
 ;; A failure that reached a function that cannot pass it on (a def's initialiser, an async body, a region that left a slot moved from):
 ;; the trap it was, reported as before.
-(define internal (fib.unwound-fatal void) ((ptr ex))
-  (block entry
-    (br (icmp ne (and (ptrtoint i64 ex) (i64 1)) (i64 0)) msg obj))
-  (block msg
-    (let ((s (inttoptr ptr (and (ptrtoint i64 ex) (i64 -2)))))
-      (call @fib.trap-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
-        (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
-      (unreachable)))
-  (block obj
-    (call @fib.trap-c (string "a thrown exception reached code that cannot unwind"))
-    (unreachable)))
+(DEFINE INTERNAL (fib.unwound-fatal VOID) ((PTR ex))
+  (BLOCK entry
+    (BR (ICMP NE (AND (PTRTOINT I64 ex) (I64 1)) (I64 0)) msg obj))
+  (BLOCK msg
+    (LET ((s (INTTOPTR PTR (AND (PTRTOINT I64 ex) (I64 -2)))))
+      (CALL (GLOBAL fib.trap-bytes) (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) (I64 0))
+        (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3))))
+      (UNREACHABLE)))
+  (BLOCK obj
+    (CALL (GLOBAL fib.trap-c) (STRING "a thrown exception reached code that cannot unwind"))
+    (UNREACHABLE)))
 
 ;; The failure a thread's entry finds (none can reach it: no catch is active below it).
-(define internal (fib.unwound-check void) ((ptr ex))
-  (block entry (br (icmp eq ex (ptr null)) done bad))
-  (block bad
-    (call @fib.unwound-fatal ex)
-    (unreachable))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.unwound-check VOID) ((PTR ex))
+  (BLOCK entry (BR (ICMP EQ ex (PTR NULL)) done bad))
+  (BLOCK bad
+    (CALL (GLOBAL fib.unwound-fatal) ex)
+    (UNREACHABLE))
+  (BLOCK done (RET)))
 
 ;; A finally clause run for an unwinding: no catch is active inside it, and a trap there is fatal. Returns the depth to restore.
-(define internal (fib.finally-enter i64) ()
-  (block entry
-    (let ((s (call @fib.exc-state))
-          (dp (getelementptr %struct.fib.exc s (i32 0) (i32 0)))
-          (d (load i64 dp))
-          (fp (getelementptr %struct.fib.exc s (i32 0) (i32 2))))
-      (store (i64 0) dp)
-      (store (add (load i64 fp) (i64 1)) fp)
-      (ret d))))
+(DEFINE INTERNAL (fib.finally-enter I64) ()
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.exc-state)))
+          (dp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 0)))
+          (d (LOAD I64 dp))
+          (fp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 2))))
+      (STORE (I64 0) dp)
+      (STORE (ADD (LOAD I64 fp) (I64 1)) fp)
+      (RET d))))
 
-(define internal (fib.finally-leave void) ((i64 d))
-  (block entry
-    (let ((s (call @fib.exc-state))
-          (fp (getelementptr %struct.fib.exc s (i32 0) (i32 2))))
-      (store d (getelementptr %struct.fib.exc s (i32 0) (i32 0)))
-      (store (sub (load i64 fp) (i64 1)) fp)
-      (ret))))
+(DEFINE INTERNAL (fib.finally-leave VOID) ((I64 d))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.exc-state)))
+          (fp (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 2))))
+      (STORE d (GETELEMENTPTR (STRUCT fib.exc) s (I32 0) (I32 0)))
+      (STORE (SUB (LOAD I64 fp) (I64 1)) fp)
+      (RET))))
 
-(define internal (fib.fatal-finally void) ((ptr bytes) (i64 n))
-  (block entry
-    (call @fib.trace-flush)
-    (call @write (i32 2) (string "trap: in a finally clause run while unwinding: ") (i64 47))
-    (call @write (i32 2) bytes n)
-    (call @write (i32 2) (string "\n") (i64 1))
-    (call @abort)
-    (unreachable)))
+(DEFINE INTERNAL (fib.fatal-finally VOID) ((PTR bytes) (I64 n))
+  (BLOCK entry
+    (CALL (GLOBAL fib.trace-flush))
+    (CALL (GLOBAL write) (I32 2) (STRING "trap: in a finally clause run while unwinding: ") (I64 47))
+    (CALL (GLOBAL write) (I32 2) bytes n)
+    (CALL (GLOBAL write) (I32 2) (STRING "\n") (I64 1))
+    (CALL (GLOBAL abort))
+    (UNREACHABLE)))
 
 ;; (hash x) on a float (types §2.12): the bits of the value as a double,
 ;; except that -0.0 hashes as 0.0 and every NaN as the quiet NaN's bits
 ;; 0x7ff8000000000000, so that = implies equal hashes (eval/arith.rs
 ;; float_hash). A float is widened first: the hash of an f32 is that of
 ;; its f64.
-(define internal (fib.double-hash i64) ((double x))
-  (block entry
-    (let ((bits (bitcast i64 x))
-          (is-zero (fcmp oeq x (double 0.0)))
-          (is-nan (fcmp uno x x)))
-      (ret (select is-nan (i64 9221120237041090560) (select is-zero (i64 0) bits))))))
+(DEFINE INTERNAL (fib.double-hash I64) ((DOUBLE x))
+  (BLOCK entry
+    (LET ((bits (BITCAST I64 x))
+          (is-zero (FCMP OEQ x (DOUBLE 0.0)))
+          (is-nan (FCMP UNO x x)))
+      (RET (SELECT is-nan (I64 9221120237041090560) (SELECT is-zero (I64 0) bits))))))

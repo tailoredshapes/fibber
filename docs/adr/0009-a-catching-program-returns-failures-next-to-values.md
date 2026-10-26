@@ -68,11 +68,11 @@ The shape of the compiler and the runtime that the decision rests on:
 
 ```fibber fitness
 (rule "a trap unwinds only while a catch is active on its thread"
-  (must-contain repo "rt/core.lir" "(block check (br (call @fib.catching) unwind plain))")
-  (plant-file "rt/core.lir" "(define internal (fib.raise-bytes ptr) ((ptr b) (i64 n)) (block entry (ret b)))"))
+  (must-contain repo "rt/core.lir" "(BLOCK check (BR (CALL (GLOBAL fib.catching)) unwind plain))")
+  (plant-file "rt/core.lir" "(DEFINE INTERNAL (fib.raise-bytes PTR) ((PTR b) (I64 n)) (BLOCK entry (RET b)))"))
 
 (rule "a trap in a finally clause run while unwinding is fatal"
-  (must-contain repo "rt/core.lir" "(br (call @fib.in-finally) fin task)")
+  (must-contain repo "rt/core.lir" "(BR (CALL (GLOBAL fib.in-finally)) fin task)")
   (plant-file "rt/core.lir" ""))
 
 (rule "a function with an array-take! does not pass failures on"

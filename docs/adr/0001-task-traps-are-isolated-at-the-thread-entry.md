@@ -58,29 +58,29 @@ The shape of the runtime: only a thread that has a task isolates, and only the t
 
 ```fibber fitness
 (rule "fib.fail-task is called by the trap path in rt/core.lir and by nothing else"
-  (grep-live repo ["rt/*.lir" "!rt/core.lir"] "@fib.fail-task")
-  (plant "rt/str.lir" "\n    (call @fib.fail-task t b n)\n"))
+  (grep-live repo ["rt/*.lir" "!rt/core.lir"] "(GLOBAL fib.fail-task)")
+  (plant "rt/str.lir" "\n    (CALL (GLOBAL fib.fail-task) t b n)\n"))
 
 (rule "the trap path asks whether the thread has a task before isolating"
-  (must-contain repo "rt/core.lir" "(call @pthread_getspecific (load i32 @fib.task-key))")
-  (plant-file "rt/core.lir" "(define internal (fib.trap-bytes void) () (call @abort))"))
+  (must-contain repo "rt/core.lir" "(CALL (GLOBAL pthread_getspecific) (LOAD I32 (GLOBAL fib.task-key)))")
+  (plant-file "rt/core.lir" "(DEFINE INTERNAL (fib.trap-bytes VOID) () (CALL (GLOBAL abort)))"))
 
 (rule "only the thread entry and the pool runner store the task key"
-  (grep-live repo ["rt/*.lir" "!rt/thread.lir" "!rt/sched.lir"] "pthread_setspecific (load i32 @fib.task-key)")
-  (plant "rt/task.lir" "\n    (call @pthread_setspecific (load i32 @fib.task-key) task)\n"))
+  (grep-live repo ["rt/*.lir" "!rt/thread.lir" "!rt/sched.lir"] "pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key))")
+  (plant "rt/task.lir" "\n    (CALL (GLOBAL pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key)) task)\n"))
 
 (rule "the pool runner stores it too, and puts the previous task back"
-  (into (must-contain repo "rt/sched.lir" "pthread_setspecific (load i32 @fib.task-key) t)")
-        (must-contain repo "rt/sched.lir" "pthread_setspecific (load i32 @fib.task-key) prev)"))
+  (into (must-contain repo "rt/sched.lir" "pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key)) t)")
+        (must-contain repo "rt/sched.lir" "pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key)) prev)"))
   (plant-file "rt/sched.lir" ""))
 
 (rule "the thread entry does store it"
-  (must-contain repo "rt/thread.lir" "pthread_setspecific (load i32 @fib.task-key)")
+  (must-contain repo "rt/thread.lir" "pthread_setspecific) (LOAD I32 (GLOBAL fib.task-key))")
   (plant-file "rt/thread.lir" ""))
 
 (rule "out of memory is fatal, never a trap a task survives"
-  (grep-live repo ["rt/*.lir"] "fib.trap-c (string \"out of memory\")")
-  (plant "rt/core.lir" "\n    (call @fib.trap-c (string \"out of memory\"))\n"))
+  (grep-live repo ["rt/*.lir"] "fib.trap-c) (STRING \"out of memory\")")
+  (plant "rt/core.lir" "\n    (CALL (GLOBAL fib.trap-c) (STRING \"out of memory\"))\n"))
 
 (rule "the cases that pin it (stdlib 911 to 926) are in the tree"
   (at-least repo ["cases/stdlib/911-*" "cases/stdlib/912-*" "cases/stdlib/913-*" "cases/stdlib/914-*" "cases/stdlib/915-*" "cases/stdlib/916-*"

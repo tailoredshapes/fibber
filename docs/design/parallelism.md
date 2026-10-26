@@ -173,7 +173,7 @@ atomic K=1 13.9, 97, 312, 1324, 2874, 3603 ns. Padding removes false sharing (K=
 | `def` (IMMORTAL) node | 72 | 71 | 113 | 172 | 228 | 260 |
 | shared Vec, plain field read `(. (vec-nth nodes i) a)` | 77 | 108 | 123 | 200 | 345 | 441 |
 
-The last row is the surprise: **a plain field read of an element of a shared Vec is not free**: `vec-nth` returns an owned value, the lIR has `call @f.fib.prelude.vec-nth.str` then `call @fib.release`, so the read is a retain
+The last row is the surprise: **a plain field read of an element of a shared Vec is not free**: `vec-nth` returns an owned value, the lIR has `(CALL (GLOBAL f.fib.prelude.vec-nth.str) ..)` then `(CALL (GLOBAL fib.release) ..)`, so the read is a retain
 and a release (one atomic pair on a SHARED object). The `def` row shows what freezing buys: 22x at T=28, no code change but the object's flag. (The private and `def` rows also degrade 3 to 3.6x from T=1 to 28 because each iteration allocates a Vec and the machine has 8 P + 12 E cores; the comparison is between rows, not against a flat line.)
 Uncontended, SHARED costs 17 against 5 ns per pair (3.5x), 10% on the whole fibber loop (85 against 77 ms).
 
@@ -207,7 +207,7 @@ Note the sequential result is a third value: determinism needs the sequential pa
 ### 2.8 Race detection: ThreadSanitizer works on lIR output
 
 Pipeline (`mktsan.sh`, ~10 lines): `F emit prog.fib` (lIR) -> `lairf emit-llvm` -> add `sanitize_thread` to every `define` (342 functions of one program, runtime included) -> `opt -passes=tsan` (LLVM 21) -> `llc -relocation-model=pic -filetype=obj` -> `gcc -fsanitize=thread`
-(GCC 15's `libtsan` has LLVM's ABI). No fibber change; `tsan.sh` runs six kernels. First run, unpatched: **a data race on the global `fib.mt`** in five of six kernels: `fib.spawn` and `fib.pool-start` store `1` to the plain `i32` `@fib.mt` on every spawn
+(GCC 15's `libtsan` has LLVM's ABI). No fibber change; `tsan.sh` runs six kernels. First run, unpatched: **a data race on the global `fib.mt`** in five of six kernels: `fib.spawn` and `fib.pool-start` store `1` to the plain `i32` `(GLOBAL fib.mt)` on every spawn
 (`rt/thread.lir`) while allocation and release read it on other threads (`fib.alloc`, `fib.alloc-slow`, `fib.free-block`): benign in practice, a race in the LLVM memory model; the fix is `atomic-load/store monotonic`. With `fib.mt` made atomic
 (`mktsan.sh prog.fib out patch`), five kernels are silent and **`with-tiles` reports a real race**: `tile-window` (`lib/fib/view/tiles.fib`) reads `(array-get arr 0)` as the seed in every task while tile 0's task writes element 0; the fix is to read the seed once
 before spawning. TSAN on the lIR deque and its four mutants (`cltsan.sh`): no reports on any (every access is atomic); `dup` counts as in 2.3. So: TSAN finds races on non-atomic memory, which is where the runtime has them; it cannot find ordering bugs among atomics (section 3.8).
@@ -440,7 +440,7 @@ Frozen at 28 threads is 1.3x the private copies (the target was within 3x); shar
 
 **Borrowed element reads** (measured, not extended). The existing rule (spec/types.md 6.3, "Element reads": the `Derived` mode of `array-get`) covers a builtin
 `array-get` on a borrowed array in a function body. It does not cover `(. (vec-nth v i) a)`: `vec-nth` is a prelude function that returns an owned
-element, and the emitted lIR of `field-read` (scripts/bench/freeze-contention.fib) has `call @f.fib.prelude.vec-nth.str` then `call @fib.release` on
+element, and the emitted lIR of `field-read` (scripts/bench/freeze-contention.fib) has `(CALL (GLOBAL f.fib.prelude.vec-nth.str) ..)` then `(CALL (GLOBAL fib.release) ..)` on
 the result: a retain and a release of the element, atomic when the Vec is SHARED. That is the "shared, plain field read" row above (197 ms at 28
 threads against 79 private). Freezing removes it for data that lives to the end of the program (9 ms). For shared data that must still be freed, the
 fix is an interprocedural one (a function whose result is `Derived` from a parameter: a summary in the ownership pass and a second return convention
@@ -448,7 +448,7 @@ in the emitter); it was **not built**: no measured benchmark here needs it once 
 touches no count), and the change is a checker feature of its own.
 
 **The closure forms** (built as `private-copy`, spec/types.md 2.10.2; not the `:scoped` colour). A closure call retains the closure it calls and the body of the
-closure releases it (lIR: `call @fib.retain p0` before the `indirect-call`, `call @fib.release env` in the body), so a closure shared by W tasks is an atomic count
+closure releases it (lIR: `(CALL (GLOBAL fib.retain) p0)` before the `indirect-call`, `(CALL (GLOBAL fib.release) env)` in the body), so a closure shared by W tasks is an atomic count
 pair per call. The `:scoped` colour of 3.6 would remove that by passing the environment borrowed (a second calling convention for scoped closures) and by not
 share-marking what the scope lends. Measured first: share-marking a captured environment is 9.6 ns an object once per task; the call pair is 60 ns a call. `freeze` cannot
 help (it would make the caller's closure and what it captured immortal for good). A shallow copy per chunk with a count of its own turns the pair into a plain count

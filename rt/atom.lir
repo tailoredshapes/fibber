@@ -2,7 +2,7 @@
 ;; an atom or a weak box (a cmpxchg on its i32 lock word), and
 ;; fib.share, which marks an object and everything reachable from it
 ;; SHARED through the type table's trace functions.
-(declare sched_yield i32 ())
+(DECLARE sched_yield I32 ())
 
 ;; The lock of an object atom, a weak box and a task's result (the atom of a scalar takes none: emit.lower.atoms): a `cmpxchg` (acquire) that
 ;; takes it when the word is 0, and a `sched_yield` after each failure, so that a waiter gives its CPU to the holder and does not hammer the
@@ -12,16 +12,16 @@
 ;; with the spinners): what a waiter waits for is the holder's retain of a shared count (a contended atomic), not the lock word, and a waiter
 ;; that sleeps in `sched_yield` keeps its traffic off that line. The cost of an object atom under contention is the count of the object
 ;; (P-count-b: `freeze`, borrowed reads), not this lock. Held for a load and a retain, or a compare and a store; never across a call of `f`.
-(define internal (fib.lock void) ((ptr lockp))
-  (block entry (br spin))
-  (block spin
-    (let ((r (cmpxchg acquire monotonic lockp (i32 0) (i32 1))))
-      (br (extractvalue r 1) done wait)))
-  (block wait (call @sched_yield) (br spin))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.lock VOID) ((PTR lockp))
+  (BLOCK entry (BR spin))
+  (BLOCK spin
+    (LET ((r (CMPXCHG ACQUIRE MONOTONIC lockp (I32 0) (I32 1))))
+      (BR (EXTRACTVALUE r 1) done wait)))
+  (BLOCK wait (CALL (GLOBAL sched_yield)) (BR spin))
+  (BLOCK done (RET)))
 
-(define internal (fib.unlock void) ((ptr lockp))
-  (block entry (atomic-store release (i32 0) lockp) (ret)))
+(DEFINE INTERNAL (fib.unlock VOID) ((PTR lockp))
+  (BLOCK entry (ATOMIC-STORE RELEASE (I32 0) lockp) (RET)))
 
 ;; §8.8: set SHARED with atomicrmw or, stopping at objects already
 ;; SHARED and at IMMORTAL ones, then walk the children. Each type's share
@@ -41,101 +41,101 @@
 ;;                 task (fib.freeze-check), and in trace mode reports each object frozen
 ;;                 as `F n`: it is never freed, and the audit counts it as intended, as a
 ;;                 literal is (it was not allocated by the program's own account).
-(define internal (fib.walk-mode i64) ((ptr wl))
-  (block entry (ret (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 4))))))
+(DEFINE INTERNAL (fib.walk-mode I64) ((PTR wl))
+  (BLOCK entry (RET (LOAD I64 (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 4))))))
 
 ;; An object that `freeze` must not publish: a cell, an atom, a weak
 ;; reference or a task is mutable in place (or observes its target); as
 ;; IMMORTAL data it would be written by one thread while all others read it
 ;; with no count and no lock to order them. Kind 0 is anything else
 ;; (rt table `fib.kinds`, emitted with the type table).
-(define internal (fib.freeze-check void) ((ptr p))
-  (block entry
-    (let ((k (load i8 (getelementptr i8 @fib.kinds (zext i64 (call @fib.tid p))))))
-      (br (icmp eq k (i8 0)) done r0)))
-  (block r0 (br (icmp eq k (i8 5)) done refuse))
-  (block refuse (br (icmp eq k (i8 1)) cell r2))
-  (block r2 (br (icmp eq k (i8 2)) atom r3))
-  (block r3 (br (icmp eq k (i8 3)) weak task))
-  (block cell (call @fib.trap-c (string "freeze: a cell is reachable from the value (a cell is mutable in place)")) (unreachable))
-  (block atom (call @fib.trap-c (string "freeze: an atom is reachable from the value (an atom is mutable in place)")) (unreachable))
-  (block weak (call @fib.trap-c (string "freeze: a weak reference is reachable from the value")) (unreachable))
-  (block task (call @fib.trap-c (string "freeze: a task is reachable from the value")) (unreachable))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.freeze-check VOID) ((PTR p))
+  (BLOCK entry
+    (LET ((k (LOAD I8 (GETELEMENTPTR I8 (GLOBAL fib.kinds) (ZEXT I64 (CALL (GLOBAL fib.tid) p))))))
+      (BR (ICMP EQ k (I8 0)) done r0)))
+  (BLOCK r0 (BR (ICMP EQ k (I8 5)) done refuse))
+  (BLOCK refuse (BR (ICMP EQ k (I8 1)) cell r2))
+  (BLOCK r2 (BR (ICMP EQ k (I8 2)) atom r3))
+  (BLOCK r3 (BR (ICMP EQ k (I8 3)) weak task))
+  (BLOCK cell (CALL (GLOBAL fib.trap-c) (STRING "freeze: a cell is reachable from the value (a cell is mutable in place)")) (UNREACHABLE))
+  (BLOCK atom (CALL (GLOBAL fib.trap-c) (STRING "freeze: an atom is reachable from the value (an atom is mutable in place)")) (UNREACHABLE))
+  (BLOCK weak (CALL (GLOBAL fib.trap-c) (STRING "freeze: a weak reference is reachable from the value")) (UNREACHABLE))
+  (BLOCK task (CALL (GLOBAL fib.trap-c) (STRING "freeze: a task is reachable from the value")) (UNREACHABLE))
+  (BLOCK done (RET)))
 
-(define internal (fib.share-queue void) ((ptr wl) (ptr p))
-  (block entry (br (icmp eq p (ptr null)) done check))
-  (block check
-    (let ((f (call @fib.flags p))
-          (mode (call @fib.walk-mode wl))
-          (skip (select (icmp eq mode (i64 1)) (i32 9) (select (icmp eq mode (i64 3)) (i32 12) (i32 8)))))
-      (br (icmp ne (and f skip) (i32 0)) done mark)))
-  (block mark (br (icmp eq mode (i64 3)) refuse set))
-  (block refuse (call @fib.freeze-check p) (br set))
-  (block set
-    (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (select (icmp eq mode (i64 1)) (i32 1) (i32 9)))
-    (br (icmp eq mode (i64 1)) push forever))
-  (block forever
-    (store (i64 0) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
-    (br (icmp eq mode (i64 3)) maybetrace def))
-  (block def
-    (br (icmp eq (call @fib.class (call @fib.tid p)) (i8 97)) register push))
-  (block register (call @fib.def-atom-register p) (br push))
-  (block maybetrace (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced push))
-  (block traced
-    (call @fib.trace-line (i8 70) (load i64 (getelementptr i8 p (i64 -16))) (i8 0))
-    (br push))
-  (block push
-    (call @fib.wl-push wl p)
-    (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.share-queue VOID) ((PTR wl) (PTR p))
+  (BLOCK entry (BR (ICMP EQ p (PTR NULL)) done check))
+  (BLOCK check
+    (LET ((f (CALL (GLOBAL fib.flags) p))
+          (mode (CALL (GLOBAL fib.walk-mode) wl))
+          (skip (SELECT (ICMP EQ mode (I64 1)) (I32 9) (SELECT (ICMP EQ mode (I64 3)) (I32 12) (I32 8)))))
+      (BR (ICMP NE (AND f skip) (I32 0)) done mark)))
+  (BLOCK mark (BR (ICMP EQ mode (I64 3)) refuse set))
+  (BLOCK refuse (CALL (GLOBAL fib.freeze-check) p) (BR set))
+  (BLOCK set
+    (ATOMICRMW OR MONOTONIC (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 2)) (SELECT (ICMP EQ mode (I64 1)) (I32 1) (I32 9)))
+    (BR (ICMP EQ mode (I64 1)) push forever))
+  (BLOCK forever
+    (STORE (I64 0) (GETELEMENTPTR (STRUCT fib.hdr) p (I32 0) (I32 0)))
+    (BR (ICMP EQ mode (I64 3)) maybetrace def))
+  (BLOCK def
+    (BR (ICMP EQ (CALL (GLOBAL fib.class) (CALL (GLOBAL fib.tid) p)) (I8 97)) register push))
+  (BLOCK register (CALL (GLOBAL fib.def-atom-register) p) (BR push))
+  (BLOCK maybetrace (BR (ICMP NE (LOAD I32 (GLOBAL fib.tracing)) (I32 0)) traced push))
+  (BLOCK traced
+    (CALL (GLOBAL fib.trace-line) (I8 70) (LOAD I64 (GETELEMENTPTR I8 p (I64 -16))) (I8 0))
+    (BR push))
+  (BLOCK push
+    (CALL (GLOBAL fib.wl-push) wl p)
+    (BR done))
+  (BLOCK done (RET)))
 
 ;; §8.2 (syntax §3.19, L15): the value of a `def` made at run time and
 ;; everything reachable from it become IMMORTAL, and SHARED: every task
 ;; reaches them, and an atom among them locks. Count 0, never freed,
 ;; count operations no-ops. Single-threaded: the init functions run
 ;; before `main`.
-(define internal (fib.immortalise void) ((ptr p))
-  (block entry
-    (call @fib.walk p (i64 2))
-    (ret)))
+(DEFINE INTERNAL (fib.immortalise VOID) ((PTR p))
+  (BLOCK entry
+    (CALL (GLOBAL fib.walk) p (I64 2))
+    (RET)))
 
 ;; A runtime def may contain an atom, including one inside an immortal graph.
 ;; Register each atom once while it first becomes immortal. Initialization is
 ;; single-threaded, and the records contain no counted references of their own.
-(defstruct fib.defatom (ptr ptr))
-(global internal fib.defatoms ptr (ptr null))
-(define internal (fib.def-atom-register void) ((ptr p))
-  (block entry
-    (let ((record (call @malloc (i64 16))))
-      (br (icmp eq record (ptr null)) oom save)))
-  (block oom (call @fib.fatal-c (string "out of memory")) (unreachable))
-  (block save
-    (store (load ptr @fib.defatoms) (getelementptr %struct.fib.defatom record (i32 0) (i32 0)))
-    (store p (getelementptr %struct.fib.defatom record (i32 0) (i32 1)))
-    (store record @fib.defatoms)
-    (ret)))
+(DEFSTRUCT fib.defatom (PTR PTR))
+(GLOBAL INTERNAL fib.defatoms PTR (PTR NULL))
+(DEFINE INTERNAL (fib.def-atom-register VOID) ((PTR p))
+  (BLOCK entry
+    (LET ((record (CALL (GLOBAL malloc) (I64 16))))
+      (BR (ICMP EQ record (PTR NULL)) oom save)))
+  (BLOCK oom (CALL (GLOBAL fib.fatal-c) (STRING "out of memory")) (UNREACHABLE))
+  (BLOCK save
+    (STORE (LOAD PTR (GLOBAL fib.defatoms)) (GETELEMENTPTR (STRUCT fib.defatom) record (I32 0) (I32 0)))
+    (STORE p (GETELEMENTPTR (STRUCT fib.defatom) record (I32 0) (I32 1)))
+    (STORE record (GLOBAL fib.defatoms))
+    (RET)))
 
 ;; After joining threads and quiescing the pool, release the final payloads of
 ;; immortal atoms. The roots and their original immortal children stay immortal;
 ;; values installed while main ran retain normal counts and must be released.
 ;; Detaching the list makes repeated cleanup harmless.
-(define internal (fib.defs-drop void) ()
-  (block entry
-    (let ((head (load ptr @fib.defatoms)))
-      (store (ptr null) @fib.defatoms)
-      (br loop)))
-  (block loop
-    (let ((record (phi ptr (entry head) (drop next))))
-      (br (icmp eq record (ptr null)) done drop)))
-  (block drop
-    (let ((next (load ptr (getelementptr %struct.fib.defatom record (i32 0) (i32 0))))
-          (p (load ptr (getelementptr %struct.fib.defatom record (i32 0) (i32 1))))
-          (trace (load ptr (getelementptr %struct.fib.typerec @fib.types (call @fib.tid p) (i32 1)))))
-      (indirect-call trace (fn void (ptr ptr)) p @fib.release)
-      (call @free record)
-      (br loop)))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.defs-drop VOID) ()
+  (BLOCK entry
+    (LET ((head (LOAD PTR (GLOBAL fib.defatoms))))
+      (STORE (PTR NULL) (GLOBAL fib.defatoms))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((record (PHI PTR (entry head) (drop next))))
+      (BR (ICMP EQ record (PTR NULL)) done drop)))
+  (BLOCK drop
+    (LET ((next (LOAD PTR (GETELEMENTPTR (STRUCT fib.defatom) record (I32 0) (I32 0))))
+          (p (LOAD PTR (GETELEMENTPTR (STRUCT fib.defatom) record (I32 0) (I32 1))))
+          (trace (LOAD PTR (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) (CALL (GLOBAL fib.tid) p) (I32 1)))))
+      (INDIRECT-CALL trace (FUNCTION VOID (PTR PTR)) p (GLOBAL fib.release))
+      (CALL (GLOBAL free) record)
+      (BR loop)))
+  (BLOCK done (RET)))
 
 ;; `(freeze x)` (P-count-b, spec/types.md 8.2): the value graph of x becomes
 ;; IMMORTAL and SHARED, so that a retain or a release of any object in it is a
@@ -146,10 +146,10 @@
 ;; counts are atomic) and a count they change after the flag is set is
 ;; never read again. Traps (nothing is undone: the objects above the one
 ;; refused stay frozen, which is safe) at a cell, atom, weak reference or task.
-(define internal (fib.freeze void) ((ptr p))
-  (block entry
-    (call @fib.walk p (i64 3))
-    (ret)))
+(DEFINE INTERNAL (fib.freeze VOID) ((PTR p))
+  (BLOCK entry
+    (CALL (GLOBAL fib.walk) p (I64 3))
+    (RET)))
 
 ;; `(private-copy x)` (P-count-b): a shallow copy of the object x with a count of its own: count 1, not SHARED, the children retained once.
 ;; A closure that many tasks call is one object whose count every call touches (the caller retains the closure it calls and the callee
@@ -159,63 +159,63 @@
 ;; an identity (a cell, atom, weak reference or task, fib.kinds) and a string or an array (whose size the type table does not give) are
 ;; returned retained, not copied: they are immutable or have an identity, so one count more is all a user of the "copy" needs. A STACK object is copied to the heap.
 ;; The size of an object is its record's (header included).
-(define internal (fib.private-copy ptr) ((ptr p))
-  (block entry (br (icmp eq p (ptr null)) same check))
-  (block check
-    (let ((f (call @fib.flags p))
-          (tid (call @fib.tid p))
-          (k (load i8 (getelementptr i8 @fib.kinds (zext i64 tid)))))
-      (br (icmp ne (and f (i32 8)) (i32 0)) same kind)))
-  (block kind (br (icmp ne k (i8 0)) identity copy))
-  (block identity (call @fib.retain p) (br same))
-  (block same (ret p))
-  (block copy
-    (let ((size (call @fib.size-of tid))
-          (q (call @fib.alloc size tid))
-          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 1))))
-      (call @memcpy (getelementptr i8 q (i64 16)) (getelementptr i8 p (i64 16)) (sub size (i64 16)))
-      (indirect-call (load ptr rec) (fn void (ptr ptr)) p @fib.retain)
-      (ret q))))
+(DEFINE INTERNAL (fib.private-copy PTR) ((PTR p))
+  (BLOCK entry (BR (ICMP EQ p (PTR NULL)) same check))
+  (BLOCK check
+    (LET ((f (CALL (GLOBAL fib.flags) p))
+          (tid (CALL (GLOBAL fib.tid) p))
+          (k (LOAD I8 (GETELEMENTPTR I8 (GLOBAL fib.kinds) (ZEXT I64 tid)))))
+      (BR (ICMP NE (AND f (I32 8)) (I32 0)) same kind)))
+  (BLOCK kind (BR (ICMP NE k (I8 0)) identity copy))
+  (BLOCK identity (CALL (GLOBAL fib.retain) p) (BR same))
+  (BLOCK same (RET p))
+  (BLOCK copy
+    (LET ((size (CALL (GLOBAL fib.size-of) tid))
+          (q (CALL (GLOBAL fib.alloc) size tid))
+          (rec (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) tid (I32 1))))
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 q (I64 16)) (GETELEMENTPTR I8 p (I64 16)) (SUB size (I64 16)))
+      (INDIRECT-CALL (LOAD PTR rec) (FUNCTION VOID (PTR PTR)) p (GLOBAL fib.retain))
+      (RET q))))
 
-(define internal (fib.frozen i1) ((ptr p))
-  (block entry (ret (icmp ne (and (call @fib.flags p) (i32 8)) (i32 0)))))
+(DEFINE INTERNAL (fib.frozen I1) ((PTR p))
+  (BLOCK entry (RET (ICMP NE (AND (CALL (GLOBAL fib.flags) p) (I32 8)) (I32 0)))))
 
-(define internal (fib.share void) ((ptr p))
-  (block entry
-    (call @fib.walk p (i64 1))
-    (ret)))
+(DEFINE INTERNAL (fib.share VOID) ((PTR p))
+  (BLOCK entry
+    (CALL (GLOBAL fib.walk) p (I64 1))
+    (RET)))
 
-(define internal (fib.walk void) ((ptr p) (i64 mode))
-  (block entry
-    (let ((wl (alloca %struct.fib.wl))
-          (buf (alloca (align 8) i8 (i32 256))))
-      (call @fib.wl-init wl buf (i64 32))
-      (store mode (getelementptr %struct.fib.wl wl (i32 0) (i32 4)))
-      (call @fib.share-queue wl p)
-      (br loop)))
-  (block loop (br (call @fib.wl-empty wl) done walk))
-  (block walk
-    (let ((q (call @fib.wl-pop wl))
-          (rec (getelementptr %struct.fib.typerec @fib.types (call @fib.tid q) (i32 4))))
-      (indirect-call (load ptr rec) (fn void (ptr ptr)) q wl)
-      (br loop)))
-  (block done (call @fib.wl-free wl) (ret)))
+(DEFINE INTERNAL (fib.walk VOID) ((PTR p) (I64 mode))
+  (BLOCK entry
+    (LET ((wl (ALLOCA (STRUCT fib.wl)))
+          (buf (ALLOCA (ALIGN 8) I8 (I32 256))))
+      (CALL (GLOBAL fib.wl-init) wl buf (I64 32))
+      (STORE mode (GETELEMENTPTR (STRUCT fib.wl) wl (I32 0) (I32 4)))
+      (CALL (GLOBAL fib.share-queue) wl p)
+      (BR loop)))
+  (BLOCK loop (BR (CALL (GLOBAL fib.wl-empty) wl) done walk))
+  (BLOCK walk
+    (LET ((q (CALL (GLOBAL fib.wl-pop) wl))
+          (rec (GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) (CALL (GLOBAL fib.tid) q) (I32 4))))
+      (INDIRECT-CALL (LOAD PTR rec) (FUNCTION VOID (PTR PTR)) q wl)
+      (BR loop)))
+  (BLOCK done (CALL (GLOBAL fib.wl-free) wl) (RET)))
 
 ;; Share-marks v when the holder h is SHARED (§8.6: a value stored
 ;; into a shared atom is marked before the store).
-(define internal (fib.share-into void) ((ptr h) (ptr v))
-  (block entry (br (icmp ne (and (call @fib.flags h) (i32 1)) (i32 0)) yes done))
-  (block yes (call @fib.share v) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.share-into VOID) ((PTR h) (PTR v))
+  (BLOCK entry (BR (ICMP NE (AND (CALL (GLOBAL fib.flags) h) (I32 1)) (I32 0)) yes done))
+  (BLOCK yes (CALL (GLOBAL fib.share) v) (BR done))
+  (BLOCK done (RET)))
 
 ;; A number that is the same for the calls of one thread (and, in practice, differs between threads), for the stripe of a counter that
 ;; many threads add to (lib/fib/adder.fib): the address of a local, which lies in the thread's own stack (stacks are 8 MB apart), shifted
 ;; by 21 bits so that the frames of one thread's calls agree, multiplied by an odd constant (Fibonacci hashing) and cut to 31 bits. A
 ;; hint only: two threads may share a value, and one thread may see two (a deep call chain, a task resumed on another thread); every
 ;; value of the hint is a correct stripe, only the contention differs.
-(define internal (fib.sys-thread-stripe i64) ()
-  (block entry
-    (let ((slot (alloca i64))
-          (a (lshr (ptrtoint i64 slot) (i64 21)))
-          (h (mul a (i64 -7046029254386353131))))
-      (ret (and (lshr h (i64 32)) (i64 2147483647))))))
+(DEFINE INTERNAL (fib.sys-thread-stripe I64) ()
+  (BLOCK entry
+    (LET ((slot (ALLOCA I64))
+          (a (LSHR (PTRTOINT I64 slot) (I64 21)))
+          (h (MUL a (I64 -7046029254386353131))))
+      (RET (AND (LSHR h (I64 32)) (I64 2147483647))))))

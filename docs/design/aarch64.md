@@ -65,7 +65,7 @@ Measured, **ran on the Mac**: the cross-built `fibc` (signature: ad-hoc, linker-
 One failure was found here and fixed in A64-1: `cases/stdlib/6223-vectors-cross-calls-and-loops-at-odd-widths.fib` crashed (exit 139) under `fibc run -O 0`
 (`jit-new-fast-codegen`, FastISel) and passed under `-O 1`, `-O 2` and as an AOT executable at `-O 2`.
 *Root cause* (a LLVM 21 bug, not ORC, the memory manager or alignment): the lIR functions are `tailcc`, where the callee pops its stack arguments. A call that passes
-more vector data than the eight vector registers hold (`mix`: `<7 x double>`, `<16 x i32>`, `<16 x float>`: 112 bytes on the stack) is followed by a `sub sp, sp, #112` that restores the
+more vector data than the eight vector registers hold (`mix`: `(VECTOR 7 DOUBLE)`, `(VECTOR 16 I32)`, `(VECTOR 16 FLOAT)`: 112 bytes on the stack) is followed by a `sub sp, sp, #112` that restores the
 caller's `sp`. At code generation level None (FastISel and RegAllocFast) the reload of a spilled value that the next call needs (`ldr x0, [sp, #264]`, the `Checks` pointer) was placed
 *before* that `sub`, so it read 112 bytes above the frame and `check` crashed. An AOT executable built with `-O 0` crashed the same way (the earlier claim that it passed was an
 `-O 2` build). `lairf build --target arm64-apple-macosx13.0.0 -O 0 --emit asm` on x86 shows the bad order. x86 is not affected: its FastISel does not select `tailcc` calls, and `case 6223` passes there at `-O 0`.
@@ -100,8 +100,8 @@ or the call is wrong on Apple arm64 and right on Linux x86-64 and aarch64: the o
 |---|---|---|---|---|
 | errno location | `rt/sys.lir:20,26`; `lib/fib/os/backend.fib:3` | `__errno_location` | `__error` | adapted by `emit/os.fib` (text replace) |
 | `openat` cwd | `rt/sys.lir:39` | `AT_FDCWD = -100` | `-2` | adapted |
-| monotonic clock | `rt/sys.lir:148` `fib.sys-clock (i32 1)` | `CLOCK_MONOTONIC = 1` | `6` | adapted |
-| processor count | `rt/task.lir:155` `sysconf (i32 84)` | `_SC_NPROCESSORS_ONLN = 84` | `58` | **not adapted**: `sysconf(84)` is `-1` on macOS, so the pool starts one worker (`select slt n0 1`): correct but single-core. A64-3 |
+| monotonic clock | `rt/sys.lir:148` `fib.sys-clock (I32 1)` | `CLOCK_MONOTONIC = 1` | `6` | adapted |
+| processor count | `rt/task.lir:155` `sysconf (I32 84)` | `_SC_NPROCESSORS_ONLN = 84` | `58` | **not adapted**: `sysconf(84)` is `-1` on macOS, so the pool starts one worker (`select slt n0 1`): correct but single-core. A64-3 |
 | `strfromd` | `lib/fib/fmt/libc.fib:5`, `fmt.fib:26` | glibc | absent | **fails to link/JIT** (case 4205). A64-3: use `snprintf` declared `:varargs` |
 | errno numbers | tests (`3607`: `-39` for ENOTEMPTY) and `lib/fib/os/abi-data.fib` | Linux | ENOTEMPTY is 66 | the library maps through `abi-data`; the *test* hard-codes Linux numbers |
 | `sched_yield`, `pthread_*`, `getenv`, `malloc` family | rt | POSIX | POSIX | work (ran) |
@@ -125,8 +125,8 @@ backend, and which `fibc cases` already uses): A64-3.
 
 ### 2.8 Vectors in objects (SIMD3)
 
-Vectors are stored inside objects as `[k x i64]` (`emit/value.fib:36-49`) and loaded/stored with `(align 8)` (`value.fib:49`), so object layout does not depend on the target's vector
-alignment (AArch64's ABI alignment for `<2 x double>` is 16; x86's is 16 for 128 bits and 32 for 256). Explicit-alignment vector loads (`emit/lower/simdmem.fib:69`) use the
+Vectors are stored inside objects as `(ARRAY k I64)` (`emit/value.fib:36-49`) and loaded/stored with `(ALIGN 8)` (`value.fib:49`), so object layout does not depend on the target's vector
+alignment (AArch64's ABI alignment for `(VECTOR 2 DOUBLE)` is 16; x86's is 16 for 128 bits and 32 for 256). Explicit-alignment vector loads (`emit/lower/simdmem.fib:69`) use the
 alignment the program states; AArch64 has no aligned-only vector loads, so a misstated alignment does not fault. **Ran on the Mac**: cases 6219 (vector in a struct, enum, option), 6221, 6244, 6245 pass natively.
 
 ### 2.9 Linker
@@ -283,7 +283,7 @@ Step 6 passes by listing the known failures; a failure outside `KNOWN` is printe
 
 | # | Finding | Status after A64-1 |
 |---|---|---|
-| 1 | `sysconf(84)`: one worker thread on macOS | fixed: `emit.os` rewrites the runtime's `@sysconf (i32 84)` to `58` for Darwin (on the Mac `sysconf(84)` is -1, `sysconf(58)` is 20); `compiler/tests/emit/unit-runtime.fib` checks both texts. Not measured as pool size on the Mac (the library's `spawn` makes a thread per task, the pool serves `async`/`await`) |
+| 1 | `sysconf(84)`: one worker thread on macOS | fixed: `emit.os` rewrites the runtime's `(GLOBAL sysconf) (I32 84)` to `58` for Darwin (on the Mac `sysconf(84)` is -1, `sysconf(58)` is 20); `compiler/tests/emit/unit-runtime.fib` checks both texts. Not measured as pool size on the Mac (the library's `spawn` makes a thread per task, the pool serves `async`/`await`) |
 | 2 | `strfromd` | fixed: `fib.fmt` calls `snprintf` (`:varargs :fixed 3`); case 4205 passes on the Mac |
 | 3 | mailbox mutex size | fixed: 8 words for the mutex (Darwin's `pthread_mutex_t` is 64 bytes, glibc's 40) and 8 per condition variable; the old layout overlapped the mutex's last words with the first condition variable on Darwin. Ran on the Mac: `lairf cases cases/lir/instr` 25 of 26 |
 | 4 | JIT `-O 0` crash on 6223 | fixed, root cause in 2.3 (a LLVM FastISel/RegAllocFast bug with callee-pop `tailcc` calls, JIT and AOT) |

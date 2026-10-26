@@ -48,7 +48,7 @@ mk_root() {
 }
 P=$S/plant; mk_root "$P"
 echo 'cargo build --release' >> "$P/scripts/gate.sh"                                                      # 0002
-echo '    (call @fib.fail-task t b n)' >> "$P/rt/str.lir"                                                  # 0001
+echo '    (CALL (GLOBAL fib.fail-task) t b n)' >> "$P/rt/str.lir"                                                  # 0001
 printf '(ns zz)\n(defun splat (x: i64) -> i64 x)\n' > "$P/compiler/emit/zz.fib"                            # 0003
 printf '\n(defun zz (a: f64) -> f64 (if (> (native-lanes f64) 2) (simd/fma a a a) a))\n' >> "$P/lib/fib/tensor/linalg.fib"   # 0004
 printf '#!/bin/bash\n' > "$P/scripts/compare-interp.sh"                                                    # 0005

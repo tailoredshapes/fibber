@@ -37,9 +37,9 @@ mut() {
   rm "$f.orig"
 }
 case $MODE in
-  floor-128k)  mut compiler/emit/os.fib 's/\(i64 4096\)\)"\)/(i64 131072))")/' ;;
-  class-up)    mut rt/alloc.lir 's/\(sub k \(i64 5\)\)/(sub k (i64 4))/' ;;
-  no-floor-op) mut rt/alloc.lir 's/\(block floor \(ret \(load i64 \@fib\.lc-floor\)\)\)/(block floor (ret (i64 131072)))/' ;;
+  floor-128k)  mut compiler/emit/os.fib 's/\(I64 4096\)\)"\)/(I64 131072))")/' ;;
+  class-up)    mut rt/alloc.lir 's/\(SUB k \(I64 5\)\)/(SUB k (I64 4))/' ;;
+  no-floor-op) mut rt/alloc.lir 's/\(BLOCK floor \(RET \(LOAD I64 \(GLOBAL fib\.lc-floor\)\)\)\)/(BLOCK floor (RET (I64 131072)))/' ;;
 esac
 
 cd "$OUT/tree" || exit 2

@@ -14,7 +14,7 @@ it constantly and got no useful failure.
 
 ## Decision
 
-A function of a catching program tests its stack before it uses it. On entry it compares the stack pointer (`(stack-addr)`, spec/lir.md 6.6b) with the word of a global table for
+A function of a catching program tests its stack before it uses it. On entry it compares the stack pointer (`(STACK-ADDR)`, spec/lir.md 6.6b) with the word of a global table for
 its 2 MiB block; outside the range the word vouches for, `fib.stack-slow` finds the thread's limit (kept per thread, built from `pthread_getattr_np` for a thread the runtime did
 not start) and either registers the block or answers overflow. The overflow is the trap `stack overflow`, taken through the existing catching return with the releases the
 ownership plan records for the entry (`unwind-entry-key`): frames unwind normally, the audit stays exact. The limit is the lowest usable address plus a margin of 256 KiB. The
@@ -44,7 +44,7 @@ Nothing recovers from the signal handler; the reasons of ADR 0009 stand for it.
   (plant-file "compiler/own/walk/lit.fib" ""))
 
 (rule "the slow path answers overflow below the thread's limit"
-  (must-contain repo "rt/thread.lir" "(define internal noinline preservemost (fib.stack-slow i1) ((i64 sp))")
+  (must-contain repo "rt/thread.lir" "(DEFINE INTERNAL NOINLINE PRESERVE_MOSTCC (fib.stack-slow I1) ((I64 sp))")
   (plant-file "rt/thread.lir" ""))
 
 (rule "a library's exports catch and leave the failure for the host"

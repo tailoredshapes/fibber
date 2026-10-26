@@ -19,7 +19,7 @@
 ;; - the methods of `FnBuilder` are `fb-NAME`; `targets` is `ir-targets`.
 ;; - the live labels are a `(Set str)`, as Rust's `HashSet`: it is only asked
 ;;   `contains?`, so no iteration order reaches the text.
-(ns emit.ir (:require [fib.string :as s] [emit.node :as n]) (:use emit.value lir.ast lir.types lir.lit))
+(ns emit.ir (:require [fib.string :as s] [emit.node :as n] [lir.print :as print]) (:use emit.value lir.ast lir.types lir.lit))
 
 ;; One instruction of a block, as it will be printed: a value bound to a fresh
 ;; name, or a void instruction or the terminator.
@@ -171,9 +171,9 @@
     (do (cell-update! (. f allocas) (fn (allocas: (Vec Alloca)) (conj allocas (Alloca name (n/alloca ty) size))))
         (n/local name))))
 
-;; The `(let (..) s)` of the pending bindings around the statement s.
+;; The `(LET (..) s)` of the pending bindings around the statement s.
 (defun let-text :private (binds: (Vec (Pair str LExpr)) s: LExpr) -> str
-  (str-join ["    (let ("
+  (str-join ["    (LET ("
              (str-join (mapv (fn (i: i64)
                                (let ((b (nth binds i)))
                                  (str-join [(if (= i 0) "" "\n          ")
@@ -184,9 +184,9 @@
 ;; Bindings no statement follows: an unterminated block, which lIR's checker
 ;; reports; they are printed so that the diagnostic names the function.
 (defun dangling-text :private (binds: (Vec (Pair str LExpr))) -> str
-  (str-join ["    (let ("
+  (str-join ["    (LET ("
              (str-join (mapv (fn (b: (Pair str LExpr)) (str-join ["(" (. b fst) " " (n/text (. b snd)) ") "])) binds))
-             ") (unreachable))\n"]))
+             ") (UNREACHABLE))\n"]))
 
 ;; Prints a block's items: bindings accumulate into one `let` whose body is the
 ;; next void instruction, so a `let` never nests in a `let` and the block stays
@@ -210,21 +210,18 @@
         (all (if (= i 0)
                  (into binds (mapv (fn (a: Alloca) (Pair (. a name) (. a expr))) @(. f allocas)))
                  binds)))
-    (into (into [(str-join ["  (block " (. b label) "\n"])] (render-items all @(. b items)))
+    (into (into [(str-join ["  (BLOCK " (. b label) "\n"])] (render-items all @(. b items)))
           ["  )\n"])))
 
 ;; The function's text. Rust: ir.rs:185 render
-;; The text of the function's result type: `{ T ptr }` or `ptr` for one that passes failures on.
-(defun fb-ret-text (f: FnBuilder) -> str
-  (match @(. f ret)
-    ((some t) (if (and @(. f unwind) (not (lir-aggregate? t))) (str-join ["{ " (lir-ty-text t) " ptr }"]) (lir-ty-text t)))
-    (nil (if @(. f unwind) "ptr" "void"))))
+;; The text of the function's result type: `(LITERAL-STRUCT T PTR)` or `PTR` for one that passes failures on.
+(defun fb-ret-text (f: FnBuilder) -> str (print/ret-text (fb-ret-type f)))
 
 (defun fb-render (f: FnBuilder) -> str
-  (let ((cc (if (. f tailcc) "tailcc " ""))
+  (let ((cc (if (. f tailcc) "TAILCC " ""))
         (ret (fb-ret-text f))
-        (params (into (mapv (fn (p: LirParam) (str-join ["(" (lir-ty-text (. p ty)) " " (. p name) ")"])) (. f params))
-                      (if (fb-slot? f) ["(ptr exs)"] [])))
+        (params (into (mapv (fn (p: LirParam) (str-join ["(" (print/type-text (lir-type (. p ty))) " " (. p name) ")"])) (. f params))
+                      (if (fb-slot? f) ["(PTR exs)"] [])))
         (body (cell [])))
     (do (doseq [i (range (count @(. f blocks)))]
           (let ((b (nth @(. f blocks) i)))
@@ -232,7 +229,7 @@
               (set! body (into @body (render-block f i b))))))
         ;; The define's closing paren: the last line becomes `  ))`.
         (let ((text (str-join @body)))
-          (str-join ["(define internal " cc "(" (. f name) " " ret ") (" (str-join (vec (interpose " " params))) ")\n"
+          (str-join ["(DEFINE INTERNAL " cc "(" (. f name) " " ret ") (" (str-join (vec (interpose " " params))) ")\n"
                      (str-slice text 0 (- (str-len text) 1)) ")\n"])))))
 
 ;; ---- the labels a terminator names

@@ -50,7 +50,7 @@ The positions, each with the code that makes it work:
 - **return, argument, let-bound local, `phi`, loop variable**: a value of type `(LirOpt t)`; nothing but the type changed.
 - **`match`, `if-some`, `when-some`, `unwrap`, `nil?`** (the library's are `match`es over `Option`): `value-option` in
   `emit/lower/pattern.fib` reads the tag with `extractvalue 0` and a `(some p)` sub-pattern binds `extractvalue 1`.
-- **`(some x)`, `nil`**: `construct-value-option` in `emit/lower/objects.fib`: `{ (i1 1) x }` and the zero constant. The
+- **`(some x)`, `nil`**: `construct-value-option` in `emit/lower/objects.fib`: `(LITERAL-STRUCT (I1 1) x)` and the zero constant. The
   site's plan (`AlHeap`) is ignored: nothing is allocated.
 - **struct field, enum variant field, `Vec`/`Array` element, `Cell`, `Atom`, closure capture, task capture, task result,
   frame slot of a task live across an `await`, protocol method result and argument, vtable function**: the lIR type of the

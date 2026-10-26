@@ -82,7 +82,7 @@ run under; a program for which it is wrong sets the variable.
   cap in force); `(configure! decay-ms cap)` sets both (0 ms empties and disables the cache); `(configure-from-env!)` reads the two
   variables again, as start-up does; `(rss-bytes)` is `VmRSS` from `/proc/self/status`, `nil` where there is none (Darwin).
 - How the library reaches the runtime: the runtime marks one function, `fib_alloc_ctl (op a b) -> i64`, with a comment line
-  `;; extern: (declare ...)`; `emit.rt`'s `runtime-declaration` reads that line, so the library's `extern` of the name binds to the
+  `;; extern: (DECLARE ...)`; `emit.rt`'s `runtime-declaration` reads that line, so the library's `extern` of the name binds to the
   runtime's definition and is not declared again (no new builtin or core name, nothing in the language server's lists).
 
 ## 5. Tests (cases/stdlib 7790-7809, stage 2)

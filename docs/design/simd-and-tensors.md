@@ -66,7 +66,7 @@ finds no definition; `spec/stdlib.md:3035` records "no transpose, needs a typed 
 - Instructions that take vectors today (`spec/lir.md` 6.1 to 6.5): `add sub mul`, `fadd fsub fmul fdiv frem fneg`, `and or xor
   shl lshr ashr`, `ctpop`, `sadd-overflow` and kin (`{ <N x iK>, <N x i1> }`), `icmp`/`fcmp` giving `<N x i1>`, `select` with a
   `<N x i1>` condition, `extractelement`, `insertelement`, `shufflevector` with a literal mask, `bitcast`, and `load`/`store` of any
-  first-class type with `(align N)`. A vector literal is `(<4 x i32> 1 2 3 4)`; the L2 lowering test covers it
+  first-class type with `(ALIGN N)`. A vector literal is `((VECTOR 4 I32) 1 2 3 4)`; the L2 lowering test covers it
   (`cases/lir/instr/vector.lir`, `cases/lir/audit/t-vecmem.lir`).
 - The AST has `KVector`, `KShuffle`, `KExtractElement`, `KInsertElement` (`compiler/lir/ast.fib:97,109-111`), the lowering
   of intrinsics goes through `fx-intrinsic` (`compiler/native/lower/arith.fib:88`, used for `llvm.ctpop` and the saturating
@@ -79,12 +79,12 @@ finds no definition; `spec/stdlib.md:3035` records "no transpose, needs a typed 
 | fused multiply-add, `fmuladd` | no | `spec/lir.md` 6.1 lists `fadd fsub fmul fdiv frem fneg ctpop` and the overflow ops only; section 4.1 reserves `llvm.` names ("intrinsics are instructions, not names", 14 item 5) |
 | fast-math or `reassoc`/`contract` flags | no | 6.1: "No `nsw`, `nuw` or `exact` flags exist" (the same holds for FP flags: none is in the grammar) |
 | `sqrt`, `fabs`, `floor`, `ceil`, `trunc`, `rint`, `min`/`max` | no | not in 6.1; the n-body gap is exactly this (`docs/shootout/gaps.md` "sqrt is not a builtin", `lib/fib/math.fib` goes through libm) |
-| vector conversions (`sitofp <4 x i64> -> <4 x double>`) | no | 6.3: conversions are over "integer scalars", "float scalar" |
+| vector conversions (`sitofp (VECTOR 4 I64) -> (VECTOR 4 DOUBLE)`) | no | 6.3: conversions are over "integer scalars", "float scalar" |
 | masked load/store, gather, scatter | no | not in 6.5 |
 | horizontal reductions (`llvm.vector.reduce.*`) | no | not in 6.4 (expressible with `shufflevector` and the lane ops, which is what a library can do) |
 | target features, per module or per function | no | module forms carry no target; the target machine is built from the host in `compiler/llvm/target.fib:92-105` |
 
-Measured consequence: a hand-written lIR dot product on four `<4 x double>` accumulators (`~/.cache/fibber-scratch/SIMD-D/dot.lir`,
+Measured consequence: a hand-written lIR dot product on four `(VECTOR 4 DOUBLE)` accumulators (`~/.cache/fibber-scratch/SIMD-D/dot.lir`,
 built with the lairf built from `compiler/lairf.fib`, `-O 2`, host CPU) compiles to `vmulpd`/`vaddpd` on `ymm` registers, and
 **zero `vfmadd`** instructions (counts in the `--emit asm` output: `vfmadd` 0, `vmulpd` 12, `vaddpd` 18), because `fmul` then `fadd`
 without a `contract` flag is not fused. 4096 elements, 10^6 calls:
@@ -92,16 +92,16 @@ without a `contract` flag is not fused. 4096 elements, 10^6 calls:
 | Version | Time |
 |---|---|
 | scalar loop, one accumulator, as fibber compiles a `loop` today (`dots`) | 1.67 s |
-| four `<4 x double>` accumulators (`dotv`) | 0.42 s (*measured*, 4.0x) |
+| four `(VECTOR 4 DOUBLE)` accumulators (`dotv`) | 0.42 s (*measured*, 4.0x) |
 
 So the vector path of the backend works end to end today; what is missing is a way to *write* it from fibber, and the
 instructions of 0.3.
 
 ### 0.4 LLVM already legalises odd vector lengths (measured)
 
-`<5 x double>` `fadd` (`~/.cache/fibber-scratch/SIMD-D/v5.lir`, `lairf build ... --emit asm -O 2`):
+`(VECTOR 5 DOUBLE)` `fadd` (`~/.cache/fibber-scratch/SIMD-D/v5.lir`, `lairf build ... --emit asm -O 2`):
 
-| Target | Code for `(fadd a b)` on `<5 x double>` |
+| Target | Code for `(FADD a b)` on `(VECTOR 5 DOUBLE)` |
 |---|---|
 | host (AVX2) | one `vaddpd %ymm1, %ymm0, %ymm0` for lanes 0-3 and one `vaddsd` for lane 4 |
 | `FIB_TARGET_CPU=x86-64-v2` (SSE4.2, no AVX) | two `addpd` (lanes 0-1, 2-3) and one `addsd` (lane 4) |
@@ -208,7 +208,7 @@ syntax. This design therefore has to *specify* operators, broadcast and typed li
 | First-class or library? | Both, layered. **In the language:** the type `(Simd T n)`, the literal `<<...>>`, `+ - * /` and `neg`, `bit-*`, shifts, `=`/`!=` on it, scalar broadcast. **In the library `fib.simd`:** everything else (loads and stores, masks, reductions, shuffles, conversions, `native-lanes`) |
 | Named lane types or parametric? | One parametric constructor `(Simd T n)`, with names `f64x4`, `i32x8`, ... as reader-level sugar for it (a regular pattern, not a table), and `<elem>xn` for the target's native lane count |
 | Lane count | any `n` from 1 to 64 (not only powers of two): LLVM legalises (0.4). Loops over arrays use `native-lanes` |
-| Masks | `(Simd bool n)` = lIR `<n x i1>`, spelled `(Mask n)` |
+| Masks | `(Simd bool n)` = lIR `(VECTOR n I1)`, spelled `(Mask n)` |
 | Operators | `+ - * /` (floats), checked `+ - *` and `neg` (integers), `bit-and bit-or bit-xor bit-not shl shr sar popcount`; comparisons by name (`simd/lt` ...) because `Ord` returns `bool`. A scalar **literal** operand broadcasts; a variable needs `(splat x)` (decision 2, 2.4) |
 | Integer overflow | the scalar rule: lanewise check, trap on any lane; `unchecked-*` and the `wrapping` macro wrap |
 | Floats | IEEE lanewise, never trap, the same NaN, infinity and `-0.0` results as the scalar op |
@@ -218,7 +218,7 @@ syntax. This design therefore has to *specify* operators, broadcast and typed li
 
 ### 2.2 The layering: what must be a builtin and what is library code
 
-A lane vector is a **scalar-class value**: it lives in a register (`<n x T>`), is copied, has no count and no mode
+A lane vector is a **scalar-class value**: it lives in a register (`(VECTOR n T)`), is copied, has no count and no mode
 (`spec/types.md` 1.1: "Scalars are copied and have no identity, no count and no mode"). It cannot be a library struct: a
 struct is a counted heap object, one `ptr` (`spec/types.md` 8.1), and a vector inside a struct would be an allocation and
 a load per use. So the **type has to be known to the checker and the emitter**; that is the one unavoidable core change.
@@ -226,13 +226,13 @@ Everything that can be written as a function over that type and a few primitives
 
 | Piece | Where | Needs |
 |---|---|---|
-| Type `(Simd T n)`, sugar names, layout class `vec` (`<n x T>` in the table of `spec/types.md` 8.1) | checker + emitter (`compiler/types/`, `compiler/emit/`) | new type constructor; a nat (literal number) argument in type position, checked like a colour argument (`spec/types.md` 1.3: a parameter that is not a type is already a precedent, and monomorphisation keys by type arguments, 4.3) |
+| Type `(Simd T n)`, sugar names, layout class `vec` (`(VECTOR n T)` in the table of `spec/types.md` 8.1) | checker + emitter (`compiler/types/`, `compiler/emit/`) | new type constructor; a nat (literal number) argument in type position, checked like a colour argument (`spec/types.md` 1.3: a parameter that is not a type is already a precedent, and monomorphisation keys by type arguments, 4.3) |
 | Literal `<<...>>` | reader (`compiler/syntax/lexer.fib`) and a core form `(simd ...)` | 2.3 |
 | `+ - * /`, `neg`, bit ops, `=` on vectors | the built-in `Num`, `Float`, `Bits`, `Eq` instances (`spec/types.md` 2.12) | rows keyed by vector type in the arithmetic lowering (`spec/types.md` 8.12 table; `compiler/native/lower/arith.fib`, emitter side `compiler/emit/lower/`) |
 | Scalar broadcast of a literal | checker: the literal adopts the vector's element type (2.4) | the L19 rule, no new constraint |
 | lane access, insert, constant shuffle, splat, compare, select, bitcast | `fib.simd` functions that are one-instruction **primitives** (`simd/lane`, `simd/with-lane`, `simd/shuffle`, `simd/splat`, `simd/lt`..., `simd/blend`, `simd/reinterpret`) | rows in `compiler/types/builtins.fib` (the `BuiltinSig` table, e.g. line 50) and the emitter; every one maps to an **existing** lIR instruction (0.2) |
 | `fma`, `sqrt`, `abs`, `floor`/`ceil`/`trunc`/`round`, `min`/`max`, vector conversions, masked load/store, gather/scatter, fast flags | primitives that need **new lIR instructions** (2.10) | lIR spec 6.1/6.3/6.5, parser, checker, printer, `compiler/native/lower/*`, `crates/lair` (Rust, with its unit tests) and lairf |
-| `hsum`, `hmin`, `hmax` (aliases `reduce-add/min/max`), `any`, `all`, `iota`, `lanes`, `lo`/`hi`/`concat`, `reverse`, `tail-mask`, `load-tail`, `store-tail!`, `dot`, `sum`, `axpy` | plain **library code** over the primitives | none (halving shuffles and lane ops; `any`/`all` through `bitcast <n x i1>` to `iN`, which lIR allows for N up to 64) |
+| `hsum`, `hmin`, `hmax` (aliases `reduce-add/min/max`), `any`, `all`, `iota`, `lanes`, `lo`/`hi`/`concat`, `reverse`, `tail-mask`, `load-tail`, `store-tail!`, `dot`, `sum`, `axpy` | plain **library code** over the primitives | none (halving shuffles and lane ops; `any`/`all` through `bitcast (VECTOR n I1)` to `iN`, which lIR allows for N up to 64) |
 | `native-lanes`, `native-has-fma?` | compile-time constants of the target (2.9) | emitter receives a `Target` |
 
 ### 2.3 Types, literals, reader
@@ -332,16 +332,16 @@ vectors or splats a scalar. Writing `(splat x)` costs one word and says what hap
 ### 2.5 Hardware width: the compiler does not chunk, LLVM legalises
 
 ADR 016: "the programmer specifies the element count, the compiler maps it to hardware, chunking and cleaning up". The
-question set to this design was whether lowering `(Simd T n)` straight to `<n x T>` gives that for free. **Yes, measured**
-(0.4): `<5 x double>` `fadd` is one 256-bit add plus one scalar add on the AVX2 host and two 128-bit adds plus one scalar
-add on `x86-64-v2`. No chunking pass is written in fibber; the emitter writes `<n x T>` and `lair` (LLVM) splits it.
+question set to this design was whether lowering `(Simd T n)` straight to `(VECTOR n T)` gives that for free. **Yes, measured**
+(0.4): `(VECTOR 5 DOUBLE)` `fadd` is one 256-bit add plus one scalar add on the AVX2 host and two 128-bit adds plus one scalar
+add on `x86-64-v2`. No chunking pass is written in fibber; the emitter writes `(VECTOR n T)` and `lair` (LLVM) splits it.
 
 What this means in practice (**Proposed**):
 
 - `n` is arbitrary in 1..64 for a *fixed small vector*, as in `<<1 2 3 4 5>>`. Power-of-two is only a performance advice
   (shuffles and reductions on `n=5` or `n=3` cost more than on `n=4`; a 3-vector `[x y z]` is the physics case and is
   better as `f64x4` with a dummy lane).
-- 1..64 and 512 bits is a *cap*, not an LLVM limit (lIR allows 1024 lanes, `spec/lir.md` 3): a `<1024 x double>` would be 256
+- 1..64 and 512 bits is a *cap*, not an LLVM limit (lIR allows 1024 lanes, `spec/lir.md` 3): a `(VECTOR 1024 DOUBLE)` would be 256
   unrolled `ymm` operations, which is a compile-time and code-size trap; large data belongs in arrays and tensors.
 - An odd or wide vector across a **non-inlined call** goes through memory or split registers (0.4). The emitter should keep
   small vector helpers inlinable; `compiler/native/passes.fib` runs `default<On>` (the inliner), nothing to add. Passing a
@@ -370,10 +370,10 @@ literal lane index is checked at compile time, a dynamic one traps.
 | `(simd/with-lane v i x)` | replace lane `i` | `insertelement`, checked the same way |
 | `(simd/shuffle a b [i0 i1 ..])` | lanes `i` of the concatenation of `a` and `b`; indices a vector literal of constants `< 2n`; result length is the index count | `shufflevector` with a literal mask |
 | `(simd/lt a b)` `le gt ge eq ne` | lanewise compare, a `(Mask n)` | `fcmp olt ole ogt oge oeq` and `une` for floats (ordered, as the scalar `<` is, `spec/types.md` 8.12: false on NaN, `ne` true on NaN); `icmp slt ..` for integers |
-| `(simd/blend m a b)` | lane from `a` where `m` else `b` | `select` with a `<n x i1>` condition |
-| `(simd/and m1 m2)` `or` `xor` `not` | mask logic | `and or xor` on `<n x i1>` |
+| `(simd/blend m a b)` | lane from `a` where `m` else `b` | `select` with a `(VECTOR n I1)` condition |
+| `(simd/and m1 m2)` `or` `xor` `not` | mask logic | `and or xor` on `(VECTOR n I1)` |
 | `(simd/reinterpret V v)` | same bits, other lane type of the same total size (`f64x4` to `i64x4`) | `bitcast` (non-aggregate, same size, `spec/lir.md` 6.3) |
-| `(simd/mask-bits m)` | `i64` with bit `k` set when lane `k` is true (`n` at most 64) | `bitcast <n x i1> to iN`, `zext` |
+| `(simd/mask-bits m)` | `i64` with bit `k` set when lane `k` is true (`n` at most 64) | `bitcast (VECTOR n I1) to iN`, `zext` |
 | `(simd/any m)` `(simd/all m)` | `bool` | the same, compared with 0 / all ones |
 
 **Primitives that need a new lIR instruction (2.10)**
@@ -407,7 +407,7 @@ mask with the first `k` lanes true: `(simd/lt (simd/iota I) (simd/splat I k))`),
   `reassoc`, or the shuffle loop). `(reduce + xs)` over a `Vec` of floats stays the Clojure left fold; **`simd/sum` is not
   `(reduce + ...)`** and the docstring says so. For integers `reduce-add` is the checked tree: `+` on vectors, so any lane
   overflow traps (the scalar rule); `unchecked-reduce-add` wraps. `reduce-min/max` use `min`/`max` above (NaN-propagating).
-- `any`/`all` need no instruction: `bitcast` of `<n x i1>` to `iN` is valid for `n` up to 64 in lIR (`spec/lir.md` 3: `i1 .. i64`).
+- `any`/`all` need no instruction: `bitcast` of `(VECTOR n I1)` to `iN` is valid for `n` up to 64 in lIR (`spec/lir.md` 3: `i1 .. i64`).
 
 `(= a b)` on vectors is *all lanes equal* as scalars are (a NaN lane makes it false, `0.0` equals `-0.0`) and returns `bool`.
 `Show` prints as the literal with the element type visible: `<<1.0 2.0 3.0 4.0>>`, and for non-default element types
@@ -492,7 +492,7 @@ count when the *front end* lowers. **Proposed:**
 3. `(native-lanes T)` is `vector-bits / bits(T)` as a literal at expansion; `(native-has-fma?)` a boolean literal. Both are
    *constants of the module*, so `(if (native-has-fma?) ... ...)` folds and dead code is removed before the lowering.
 
-**Scalar fallback.** Not needed for correctness: every `<n x T>` op legalises on every LLVM x86 target, down to SSE2 (0.4
+**Scalar fallback.** Not needed for correctness: every `(VECTOR n T)` op legalises on every LLVM x86 target, down to SSE2 (0.4
 shows `x86-64-v2`), and scalarises where there is no vector unit. What differs is speed, and the *exact* semantics are
 fixed by the lIR instructions, so results are bit-identical across targets for everything except `fma`-contraction
 choices made by the *library* (3.8) and the lane-count-dependent order of a reduction written with `native-lanes`.
@@ -501,7 +501,7 @@ choices made by the *library* (3.8) and the lane-count-dependent order of a redu
 machines, but a *user program* is compiled by `create-machine` for the host (or `FIB_TARGET_CPU`), so user code that asks for
 `native-lanes f64` gets 4 on this machine, with nothing else to do. The baseline only bites if a **prebuilt binary** is to
 use SIMD for speed (the library's own kernels inside `fibc`, a shipped tensor tool). That needs *multiversioning*:
-(a) a per-function target attribute in lIR (`(define ... (target "+avx2,+fma"))`), (b) the emitter building the function
+(a) a per-function target attribute in lIR (`(DEFINE ... (TARGET "+avx2,+fma"))`), (b) the emitter building the function
 twice (`native-lanes` is then a per-function constant), (c) a startup dispatch: a table of function pointers filled by a
 runtime check of the CPU features (x86 `cpuid` has no lIR form; libgcc/compiler-rt export the `__cpu_model` data that
 `__builtin_cpu_supports` reads, linkable as a global), (d) a call through that pointer once per *kernel call*, not per
@@ -517,15 +517,15 @@ check, per CLAUDE.md), so the lairf/lair compare scripts (`compiler/tests/native
 
 | New lIR form | Rule | LLVM |
 |---|---|---|
-| `(fma a b c)` | same float or float-vector `T` | `llvm.fma` |
-| `(fsqrt a)` `(fabs a)` `(ffloor a)` `(fceil a)` `(ftrunc a)` `(froundeven a)` | float or vector | `llvm.sqrt fabs floor ceil trunc roundeven` |
-| `(fmin a b)` `(fmax a b)` `(fminnum a b)` `(fmaxnum a b)` | same float `T` | `llvm.minimum maximum minnum maxnum` |
-| `(smin a b)` `(smax a b)` `(umin ..)` `(umax ..)` `(abs a)` | integer or vector | `llvm.smin ...` |
+| `(FMA a b c)` | same float or float-vector `T` | `llvm.fma` |
+| `(FSQRT a)` `(FABS a)` `(FFLOOR a)` `(FCEIL a)` `(FTRUNC a)` `(FROUNDEVEN a)` | float or vector | `llvm.sqrt fabs floor ceil trunc roundeven` |
+| `(FMIN a b)` `(FMAX a b)` `(FMINNUM a b)` `(FMAXNUM a b)` | same float `T` | `llvm.minimum maximum minnum maxnum` |
+| `(SMIN a b)` `(SMAX a b)` `(UMIN ..)` `(UMAX ..)` `(ABS a)` | integer or vector | `llvm.smin ...` |
 | casts on vectors | 6.3 rows extended: element-wise, same lane count | existing cast instructions |
-| `(masked-load T p mask passthru (align N))` / `(masked-store v p mask (align N))` | `mask : <n x i1>`; `T` a vector | `llvm.masked.load/store` |
-| `(gather T ptrs mask passthru)` / `(scatter v ptrs mask)` | `ptrs : <n x ptr>` | `llvm.masked.gather/scatter` |
-| fast-math flags on `fadd fsub fmul fdiv`: `(fadd reassoc a b)`, `contract` | opt-in flags **never** `nnan ninf nsz` (those make poison) | `reassoc`, `contract` fast-math flags |
-| module `(target (cpu "..") (features ".."))` | 2.9 | `TargetMachine` CPU and feature strings |
+| `(MASKED-LOAD T p mask passthru (ALIGN N))` / `(MASKED-STORE v p mask (ALIGN N))` | `mask : (VECTOR n I1)`; `T` a vector | `llvm.masked.load/store` |
+| `(GATHER T ptrs mask passthru)` / `(SCATTER v ptrs mask)` | `ptrs : (VECTOR n PTR)` | `llvm.masked.gather/scatter` |
+| fast-math flags on `fadd fsub fmul fdiv`: `(FADD REASSOC a b)`, `contract` | opt-in flags **never** `nnan ninf nsz` (those make poison) | `reassoc`, `contract` fast-math flags |
+| module `(TARGET (CPU "..") (FEATURES ".."))` | 2.9 | `TargetMachine` CPU and feature strings |
 
 Why no `nnan`/`ninf`: a value that violates such a flag is *poison*, which is undefined behaviour in the spec's sense;
 `reassoc` and `contract` only license reordering and fusing, never poison. `reassoc` is the lever of the V agent's item (c)
@@ -558,7 +558,7 @@ show no count operation in `fibc explain`, as the batch-4 cases do for options).
 
 ### 2.12 The ADR's open questions, answered with evidence
 
-1. **Power-of-two widths or arbitrary?** Arbitrary, 1 to 64 lanes and 512 bits: LLVM legalises (0.4: `<5 x double>` is a
+1. **Power-of-two widths or arbitrary?** Arbitrary, 1 to 64 lanes and 512 bits: LLVM legalises (0.4: `(VECTOR 5 DOUBLE)` is a
    ymm add and a scalar add on AVX2, two xmm adds and a scalar add on `x86-64-v2`). Performance, not correctness, prefers powers
    of two; loops over arrays use `native-lanes`, which is a power of two by construction.
 2. **Alignment syntax?** None (2.7): element alignment is always promised and kept; x86 handles unaligned vector access at
@@ -992,7 +992,7 @@ All cases are `cases/stdlib`-style programs with verdicts in the header (`spec/m
 a fibber interpreter will be written (package INT0) and becomes the second tool then. Until it exists, each SIMD operation is
 tested against a **scalar reference written in the case itself**, with the ordinary scalar operators and loops, and the case compares
 the vector result with it. The lIR scenarios of liar's `cert/features/vector_types.feature` (integer and float vector literals of the
-widths `<4 x i32> <2 x i64> <8 x i8> <16 x i8> <4 x float> <2 x double> <8 x i16>`, negative lanes, `<N x i1>` literals, lanewise
+widths `(VECTOR 4 I32) (VECTOR 2 I64) (VECTOR 8 I8) (VECTOR 16 I8) (VECTOR 4 FLOAT) (VECTOR 2 DOUBLE) (VECTOR 8 I16)`, negative lanes, `(VECTOR N I1)` literals, lanewise
 `add fadd mul`, `icmp eq` and `fcmp olt` giving `<N x i1>`, a splat written as a literal) are reused as inputs: P0 turns each
 scenario into a `cases/lir` case with the expected value from the feature file, and P4 repeats the same inputs through `<<..>>`.
 
@@ -1121,7 +1121,7 @@ the compiler's own source uses no vectors, so the check is that `fibc emit compi
 7. **`SHARED` after a task** kills in-place updates (3.8).
 8. **The interpreter and the Rust tools are frozen** and rule 6 no longer judges new features (decision 5); the in-case scalar references are the
    substitute and they are weaker (same compiler on both sides) until INT0 gives an independent second implementation.
-9. **Compile time.** Many monomorphised vector types and unrolled legalisation (`<64 x f64>`) can blow up code size; the 64-lane cap and
+9. **Compile time.** Many monomorphised vector types and unrolled legalisation (`(VECTOR 64 DOUBLE)`) can blow up code size; the 64-lane cap and
    512-bit cap are the guard; measure `compile-time.sh` (`scripts/bench/compile-time.sh`) after P1.
 10. **Target table** for CPU features is a maintained list; a wrong entry gives wrong lane counts but never wrong results.
 11. **No AVX-512 hardware here**: the 512-bit paths compile but cannot be run on this machine.

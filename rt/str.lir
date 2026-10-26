@@ -2,67 +2,67 @@
 ;; then the UTF-8 bytes and a NUL in the same allocation. Every
 ;; function allocates exactly where the interpreter's string natives do
 ;; (eval/strings.rs).
-(define internal (fib.str-len i64) ((ptr s))
-  (block entry (ret (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))))
+(DEFINE INTERNAL (fib.str-len I64) ((PTR s))
+  (BLOCK entry (RET (LOAD I64 (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3))))))
 
-(define internal (fib.str-bytes-ptr ptr) ((ptr s))
-  (block entry (ret (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0)))))
+(DEFINE INTERNAL (fib.str-bytes-ptr PTR) ((PTR s))
+  (BLOCK entry (RET (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) (I64 0)))))
 
 ;; A fresh str of n bytes (type id 0), NUL-terminated; the bytes are
 ;; the caller's to fill.
-(define internal (fib.str-new ptr) ((i64 n))
-  (block entry
-    (let ((s (call @fib.alloc (add n (i64 25)) (i32 0))))
-      (store n (getelementptr %struct.fib.str s (i32 0) (i32 3)))
-      (store (i8 0) (getelementptr %struct.fib.str s (i32 0) (i32 4) n))
-      (ret s))))
+(DEFINE INTERNAL (fib.str-new PTR) ((I64 n))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.alloc) (ADD n (I64 25)) (I32 0))))
+      (STORE n (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 3)))
+      (STORE (I8 0) (GETELEMENTPTR (STRUCT fib.str) s (I32 0) (I32 4) n))
+      (RET s))))
 
 ;; A fresh str of the n bytes at p.
-(define internal (fib.str-from-bytes ptr) ((ptr p) (i64 n))
-  (block entry
-    (let ((s (call @fib.str-new n)))
-      (call @memcpy (call @fib.str-bytes-ptr s) p n)
-      (ret s))))
+(DEFINE INTERNAL (fib.str-from-bytes PTR) ((PTR p) (I64 n))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.str-new) n)))
+      (CALL (GLOBAL memcpy) (CALL (GLOBAL fib.str-bytes-ptr) s) p n)
+      (RET s))))
 
-(define internal (fib.str-copy ptr) ((ptr s))
-  (block entry
-    (ret (call @fib.str-from-bytes (call @fib.str-bytes-ptr s) (call @fib.str-len s)))))
+(DEFINE INTERNAL (fib.str-copy PTR) ((PTR s))
+  (BLOCK entry
+    (RET (CALL (GLOBAL fib.str-from-bytes) (CALL (GLOBAL fib.str-bytes-ptr) s) (CALL (GLOBAL fib.str-len) s)))))
 
 ;; (hash s) on a str: 64-bit FNV-1a over the bytes (eval/arith.rs fnv).
-(define internal (fib.str-hash i64) ((ptr s))
-  (block entry
-    (let ((p (call @fib.str-bytes-ptr s))
-          (n (call @fib.str-len s)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (body i2)))
-          (h (phi i64 (entry (i64 -3750763034362895579)) (body h2))))
-      (br (icmp slt i n) body done)))
-  (block body
-    (let ((b (zext i64 (load i8 (getelementptr i8 p i))))
-          (h2 (mul (xor h b) (i64 1099511628211)))
-          (i2 (add i (i64 1))))
-      (br loop)))
-  (block done (ret h)))
+(DEFINE INTERNAL (fib.str-hash I64) ((PTR s))
+  (BLOCK entry
+    (LET ((p (CALL (GLOBAL fib.str-bytes-ptr) s))
+          (n (CALL (GLOBAL fib.str-len) s)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (body i2)))
+          (h (PHI I64 (entry (I64 -3750763034362895579)) (body h2))))
+      (BR (ICMP SLT i n) body done)))
+  (BLOCK body
+    (LET ((b (ZEXT I64 (LOAD I8 (GETELEMENTPTR I8 p i))))
+          (h2 (MUL (XOR h b) (I64 1099511628211)))
+          (i2 (ADD i (I64 1))))
+      (BR loop)))
+  (BLOCK done (RET h)))
 
 ;; The native Show instances (types §2.12), each a fresh str with the
 ;; interpreter's text (eval/arith.rs show).
-(define internal (fib.show-int ptr) ((i64 n))
-  (block entry
-    (let ((buf (alloca i8 (i32 24)))
-          (len (call @snprintf buf (i64 24) (string "%lld") n)))
-      (ret (call @fib.str-from-bytes buf (sext i64 len))))))
+(DEFINE INTERNAL (fib.show-int PTR) ((I64 n))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 24)))
+          (len (CALL (GLOBAL snprintf) buf (I64 24) (STRING "%lld") n)))
+      (RET (CALL (GLOBAL fib.str-from-bytes) buf (SEXT I64 len))))))
 
-(define internal (fib.show-ptr ptr) ((ptr p))
-  (block entry
-    (let ((buf (alloca i8 (i32 24)))
-          (len (call @snprintf buf (i64 24) (string "#ptr%llx") (ptrtoint i64 p))))
-      (ret (call @fib.str-from-bytes buf (sext i64 len))))))
+(DEFINE INTERNAL (fib.show-ptr PTR) ((PTR p))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 24)))
+          (len (CALL (GLOBAL snprintf) buf (I64 24) (STRING "#ptr%llx") (PTRTOINT I64 p))))
+      (RET (CALL (GLOBAL fib.str-from-bytes) buf (SEXT I64 len))))))
 
-(define internal (fib.show-bool ptr) ((i1 b))
-  (block entry (br b yes no))
-  (block yes (ret (call @fib.str-from-bytes (string "true") (i64 4))))
-  (block no (ret (call @fib.str-from-bytes (string "false") (i64 5)))))
+(DEFINE INTERNAL (fib.show-bool PTR) ((I1 b))
+  (BLOCK entry (BR b yes no))
+  (BLOCK yes (RET (CALL (GLOBAL fib.str-from-bytes) (STRING "true") (I64 4))))
+  (BLOCK no (RET (CALL (GLOBAL fib.str-from-bytes) (STRING "false") (I64 5)))))
 
 ;; show of a float (types §2.12, Decided 2026-10-01, stdlib design C12):
 ;; Clojure's text, which is Java's Double.toString (Float.toString at
@@ -95,484 +95,484 @@
 ;; - the first n where one reads back wins; when both do, the nearer:
 ;;   D plus a unit is nearer when the next digit of the expansion is 5
 ;;   or more (a tie, 5 then zeros, goes up).
-(declare strtod double (ptr ptr))
-(declare strtof float (ptr ptr))
-(declare memset ptr (ptr i32 i64))
+(DECLARE strtod DOUBLE (PTR PTR))
+(DECLARE strtof FLOAT (PTR PTR))
+(DECLARE memset PTR (PTR I32 I64))
 
 ;; Whether the %e text in buf reads back to x, at single precision or
 ;; double.
-(define internal (fib.fp-exact i1) ((ptr buf) (double x) (i1 single))
-  (block entry (br single narrow wide))
-  (block wide
-    (ret (icmp eq (bitcast i64 (call @strtod buf (ptr null))) (bitcast i64 x))))
-  (block narrow
-    (ret (icmp eq (bitcast i32 (call @strtof buf (ptr null))) (bitcast i32 (fptrunc float x))))))
+(DEFINE INTERNAL (fib.fp-exact I1) ((PTR buf) (DOUBLE x) (I1 single))
+  (BLOCK entry (BR single narrow wide))
+  (BLOCK wide
+    (RET (ICMP EQ (BITCAST I64 (CALL (GLOBAL strtod) buf (PTR NULL))) (BITCAST I64 x))))
+  (BLOCK narrow
+    (RET (ICMP EQ (BITCAST I32 (CALL (GLOBAL strtof) buf (PTR NULL))) (BITCAST I32 (FPTRUNC FLOAT x))))))
 
 ;; The digits of a %e text (no sign, no point) into digits, its
 ;; exponent into exp; returns the count of digits.
-(define internal (fib.fp-parse i64) ((ptr buf) (ptr digits) (ptr exp))
-  (block entry
-    (let ((neg (icmp eq (load i8 buf) (i8 45)))
-          (start (select neg (i64 1) (i64 0))))
-      (br scan)))
-  (block scan
-    (let ((i (phi i64 (entry start) (skip i2) (keep i2)))
-          (n (phi i64 (entry (i64 0)) (skip n) (keep n2)))
-          (c (load i8 (getelementptr i8 buf i)))
-          (i2 (add i (i64 1))))
-      (br (icmp eq c (i8 101)) expo point?)))
-  (block point? (br (icmp eq c (i8 46)) skip keep))
-  (block keep
-    (store c (getelementptr i8 digits n))
-    (let ((n2 (add n (i64 1)))) (br scan)))
-  (block skip (br scan))
-  (block expo
-    (let ((s (load i8 (getelementptr i8 buf i2)))
-          (eneg (icmp eq s (i8 45)))
-          (j0 (add i2 (i64 1))))
-      (br eloop)))
-  (block eloop
-    (let ((j (phi i64 (expo j0) (edigit j2)))
-          (e (phi i64 (expo (i64 0)) (edigit e2)))
-          (d (load i8 (getelementptr i8 buf j))))
-      (br (icmp eq d (i8 0)) edone edigit)))
-  (block edigit
-    (let ((e2 (add (mul e (i64 10)) (sext i64 (sub d (i8 48)))))
-          (j2 (add j (i64 1))))
-      (br eloop)))
-  (block edone
-    (store (select eneg (sub (i64 0) e) e) exp)
-    (ret n)))
+(DEFINE INTERNAL (fib.fp-parse I64) ((PTR buf) (PTR digits) (PTR exp))
+  (BLOCK entry
+    (LET ((neg (ICMP EQ (LOAD I8 buf) (I8 45)))
+          (start (SELECT neg (I64 1) (I64 0))))
+      (BR scan)))
+  (BLOCK scan
+    (LET ((i (PHI I64 (entry start) (skip i2) (keep i2)))
+          (n (PHI I64 (entry (I64 0)) (skip n) (keep n2)))
+          (c (LOAD I8 (GETELEMENTPTR I8 buf i)))
+          (i2 (ADD i (I64 1))))
+      (BR (ICMP EQ c (I8 101)) expo point?)))
+  (BLOCK point? (BR (ICMP EQ c (I8 46)) skip keep))
+  (BLOCK keep
+    (STORE c (GETELEMENTPTR I8 digits n))
+    (LET ((n2 (ADD n (I64 1)))) (BR scan)))
+  (BLOCK skip (BR scan))
+  (BLOCK expo
+    (LET ((s (LOAD I8 (GETELEMENTPTR I8 buf i2)))
+          (eneg (ICMP EQ s (I8 45)))
+          (j0 (ADD i2 (I64 1))))
+      (BR eloop)))
+  (BLOCK eloop
+    (LET ((j (PHI I64 (expo j0) (edigit j2)))
+          (e (PHI I64 (expo (I64 0)) (edigit e2)))
+          (d (LOAD I8 (GETELEMENTPTR I8 buf j))))
+      (BR (ICMP EQ d (I8 0)) edone edigit)))
+  (BLOCK edigit
+    (LET ((e2 (ADD (MUL e (I64 10)) (SEXT I64 (SUB d (I8 48)))))
+          (j2 (ADD j (I64 1))))
+      (BR eloop)))
+  (BLOCK edone
+    (STORE (SELECT eneg (SUB (I64 0) e) e) exp)
+    (RET n)))
 
 ;; The positional text of the value d1.d2..dn x 10^e into out, with a
 ;; leading - when neg and .0 when integral; returns its length. Used for
 ;; -3 <= e <= 6 (fib.fp-text), where the text is at most 17 digits, the
 ;; point and the zeros that pad to it.
-(define internal (fib.fp-layout i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
-  (block entry
-    (store (i8 45) out)
-    (let ((o0 (select neg (i64 1) (i64 0)))
-          (ef (add e (i64 1))))
-      (br (icmp slt e (i64 0)) small big)))
-  (block big
-    (let ((ni (select (icmp slt n ef) n ef))
-          (pad (sub ef ni))
-          (o1 (add o0 ef)))
-      (call @memcpy (getelementptr i8 out o0) digits ni)
-      (call @memset (getelementptr i8 out (add o0 ni)) (i32 48) pad)
-      (br (icmp sgt n ef) frac intg)))
-  (block frac
-    (let ((nf (sub n ef)))
-      (store (i8 46) (getelementptr i8 out o1))
-      (call @memcpy (getelementptr i8 out (add o1 (i64 1))) (getelementptr i8 digits ef) nf)
-      (ret (add (add o1 (i64 1)) nf))))
-  (block intg
-    (store (i8 46) (getelementptr i8 out o1))
-    (store (i8 48) (getelementptr i8 out (add o1 (i64 1))))
-    (ret (add o1 (i64 2))))
-  (block small
-    (let ((z (sub (i64 -1) e))
-          (o2 (add o0 (i64 2))))
-      (store (i8 48) (getelementptr i8 out o0))
-      (store (i8 46) (getelementptr i8 out (add o0 (i64 1))))
-      (call @memset (getelementptr i8 out o2) (i32 48) z)
-      (call @memcpy (getelementptr i8 out (add o2 z)) digits n)
-      (ret (add (add o2 z) n)))))
+(DEFINE INTERNAL (fib.fp-layout I64) ((PTR out) (PTR digits) (I64 n) (I64 e) (I1 neg))
+  (BLOCK entry
+    (STORE (I8 45) out)
+    (LET ((o0 (SELECT neg (I64 1) (I64 0)))
+          (ef (ADD e (I64 1))))
+      (BR (ICMP SLT e (I64 0)) small big)))
+  (BLOCK big
+    (LET ((ni (SELECT (ICMP SLT n ef) n ef))
+          (pad (SUB ef ni))
+          (o1 (ADD o0 ef)))
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 out o0) digits ni)
+      (CALL (GLOBAL memset) (GETELEMENTPTR I8 out (ADD o0 ni)) (I32 48) pad)
+      (BR (ICMP SGT n ef) frac intg)))
+  (BLOCK frac
+    (LET ((nf (SUB n ef)))
+      (STORE (I8 46) (GETELEMENTPTR I8 out o1))
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 out (ADD o1 (I64 1))) (GETELEMENTPTR I8 digits ef) nf)
+      (RET (ADD (ADD o1 (I64 1)) nf))))
+  (BLOCK intg
+    (STORE (I8 46) (GETELEMENTPTR I8 out o1))
+    (STORE (I8 48) (GETELEMENTPTR I8 out (ADD o1 (I64 1))))
+    (RET (ADD o1 (I64 2))))
+  (BLOCK small
+    (LET ((z (SUB (I64 -1) e))
+          (o2 (ADD o0 (I64 2))))
+      (STORE (I8 48) (GETELEMENTPTR I8 out o0))
+      (STORE (I8 46) (GETELEMENTPTR I8 out (ADD o0 (I64 1))))
+      (CALL (GLOBAL memset) (GETELEMENTPTR I8 out o2) (I32 48) z)
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 out (ADD o2 z)) digits n)
+      (RET (ADD (ADD o2 z) n)))))
 
 ;; The scientific text of the value d1.d2..dn x 10^e into out, as Java
 ;; writes it: d1, a point, the other digits or a 0, E, the exponent with
 ;; a - when it is negative; with a leading - when neg. Returns its length.
-(define internal (fib.fp-sci i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
-  (block entry
-    (store (i8 45) out)
-    (let ((o0 (select neg (i64 1) (i64 0)))
-          (more (icmp sgt n (i64 1)))
-          (nf (select more (sub n (i64 1)) (i64 1)))
-          (end (add (add o0 (i64 2)) nf)))
-      (store (load i8 digits) (getelementptr i8 out o0))
-      (store (i8 46) (getelementptr i8 out (add o0 (i64 1))))
-      (br more fraction zero)))
-  (block fraction
-    (call @memcpy (getelementptr i8 out (add o0 (i64 2))) (getelementptr i8 digits (i64 1)) nf)
-    (br tail))
-  (block zero
-    (store (i8 48) (getelementptr i8 out (add o0 (i64 2))))
-    (br tail))
-  (block tail
-    (let ((k (call @snprintf (getelementptr i8 out end) (i64 16) (string "E%d") (trunc i32 e))))
-      (ret (add end (sext i64 k))))))
+(DEFINE INTERNAL (fib.fp-sci I64) ((PTR out) (PTR digits) (I64 n) (I64 e) (I1 neg))
+  (BLOCK entry
+    (STORE (I8 45) out)
+    (LET ((o0 (SELECT neg (I64 1) (I64 0)))
+          (more (ICMP SGT n (I64 1)))
+          (nf (SELECT more (SUB n (I64 1)) (I64 1)))
+          (end (ADD (ADD o0 (I64 2)) nf)))
+      (STORE (LOAD I8 digits) (GETELEMENTPTR I8 out o0))
+      (STORE (I8 46) (GETELEMENTPTR I8 out (ADD o0 (I64 1))))
+      (BR more fraction zero)))
+  (BLOCK fraction
+    (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 out (ADD o0 (I64 2))) (GETELEMENTPTR I8 digits (I64 1)) nf)
+    (BR tail))
+  (BLOCK zero
+    (STORE (I8 48) (GETELEMENTPTR I8 out (ADD o0 (I64 2))))
+    (BR tail))
+  (BLOCK tail
+    (LET ((k (CALL (GLOBAL snprintf) (GETELEMENTPTR I8 out end) (I64 16) (STRING "E%d") (TRUNC I32 e))))
+      (RET (ADD end (SEXT I64 k))))))
 
 ;; The Java text of the value d1.d2..dn x 10^e into out (n digits, the
 ;; last of which may be a 0, and then dropped), with a leading - when
 ;; neg; returns its length: positional for -3 <= e <= 6, else scientific.
-(define internal (fib.fp-text i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
-  (block entry (br trim))
-  (block trim
-    (let ((k (phi i64 (entry n) (drop k2)))
-          (last (load i8 (getelementptr i8 digits (sub k (i64 1))))))
-      (br (and (icmp sgt k (i64 1)) (icmp eq last (i8 48))) drop done)))
-  (block drop
-    (let ((k2 (sub k (i64 1))))
-      (br trim)))
-  (block done
-    (br (or (icmp slt e (i64 -3)) (icmp sgt e (i64 6))) sci pos))
-  (block sci (ret (call @fib.fp-sci out digits k e neg)))
-  (block pos (ret (call @fib.fp-layout out digits k e neg))))
+(DEFINE INTERNAL (fib.fp-text I64) ((PTR out) (PTR digits) (I64 n) (I64 e) (I1 neg))
+  (BLOCK entry (BR trim))
+  (BLOCK trim
+    (LET ((k (PHI I64 (entry n) (drop k2)))
+          (last (LOAD I8 (GETELEMENTPTR I8 digits (SUB k (I64 1))))))
+      (BR (AND (ICMP SGT k (I64 1)) (ICMP EQ last (I8 48))) drop done)))
+  (BLOCK drop
+    (LET ((k2 (SUB k (I64 1))))
+      (BR trim)))
+  (BLOCK done
+    (BR (OR (ICMP SLT e (I64 -3)) (ICMP SGT e (I64 6))) sci pos))
+  (BLOCK sci (RET (CALL (GLOBAL fib.fp-sci) out digits k e neg)))
+  (BLOCK pos (RET (CALL (GLOBAL fib.fp-layout) out digits k e neg))))
 
 ;; Whether the decimal d.ddd e<e> of the n digits, with a leading - when
 ;; neg, reads back to x: it is written into buf (at least 40 bytes) and
 ;; read with strtod or strtof.
-(define internal (fib.fp-reads i1) ((ptr buf) (ptr digits) (i64 n) (i64 e) (i1 neg) (double x) (i1 single))
-  (block entry
-    (store (i8 45) buf)
-    (let ((at (getelementptr i8 buf (select neg (i64 1) (i64 0))))
-          (first (zext i32 (load i8 digits)))
-          (prec (trunc i32 (sub n (i64 1))))
-          (rest (getelementptr i8 digits (i64 1))))
-      (call @snprintf at (i64 40) (string "%c.%.*se%d") first prec rest (trunc i32 e))
-      (ret (call @fib.fp-exact buf x single)))))
+(DEFINE INTERNAL (fib.fp-reads I1) ((PTR buf) (PTR digits) (I64 n) (I64 e) (I1 neg) (DOUBLE x) (I1 single))
+  (BLOCK entry
+    (STORE (I8 45) buf)
+    (LET ((at (GETELEMENTPTR I8 buf (SELECT neg (I64 1) (I64 0))))
+          (first (ZEXT I32 (LOAD I8 digits)))
+          (prec (TRUNC I32 (SUB n (I64 1))))
+          (rest (GETELEMENTPTR I8 digits (I64 1))))
+      (CALL (GLOBAL snprintf) at (I64 40) (STRING "%c.%.*se%d") first prec rest (TRUNC I32 e))
+      (RET (CALL (GLOBAL fib.fp-exact) buf x single)))))
 
 ;; Adds one to the n-digit decimal at d, in place. Returns whether it
 ;; was all nines: then it is now 1 then zeros, and the caller adds one
 ;; to the exponent.
-(define internal (fib.fp-bump i1) ((ptr d) (i64 n))
-  (block entry (br loop))
-  (block loop
-    (let ((i (phi i64 (entry n) (nine k))))
-      (br (icmp eq i (i64 0)) carry step)))
-  (block step
-    (let ((k (sub i (i64 1)))
-          (p (getelementptr i8 d k))
-          (c (load i8 p)))
-      (br (icmp eq c (i8 57)) nine bump)))
-  (block nine
-    (store (i8 48) p)
-    (br loop))
-  (block bump
-    (store (add c (i8 1)) p)
-    (ret (i1 0)))
-  (block carry
-    (store (i8 49) d)
-    (ret (i1 1))))
+(DEFINE INTERNAL (fib.fp-bump I1) ((PTR d) (I64 n))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry n) (nine k))))
+      (BR (ICMP EQ i (I64 0)) carry step)))
+  (BLOCK step
+    (LET ((k (SUB i (I64 1)))
+          (p (GETELEMENTPTR I8 d k))
+          (c (LOAD I8 p)))
+      (BR (ICMP EQ c (I8 57)) nine bump)))
+  (BLOCK nine
+    (STORE (I8 48) p)
+    (BR loop))
+  (BLOCK bump
+    (STORE (ADD c (I8 1)) p)
+    (RET (I1 0)))
+  (BLOCK carry
+    (STORE (I8 49) d)
+    (RET (I1 1))))
 
 ;; The n-digit decimal to show, if one reads back: ds holds the digits of
 ;; the exact expansion and e its exponent. Of the two decimals that
 ;; bracket the value, D (the first n digits) and D plus a unit, the one
 ;; that reads back is written into cand with its exponent into eout and
 ;; 1 is returned; when both read back, the nearer; when neither, 0.
-(define internal (fib.fp-at i1) ((ptr ds) (i64 n) (i64 e) (ptr cand) (ptr buf) (i1 neg) (double x) (i1 single) (ptr eout))
-  (block entry
-    (call @memcpy cand ds n)
-    (let ((down (call @fib.fp-reads buf cand n e neg x single))
-          (carry (call @fib.fp-bump cand n))
-          (e2 (add e (zext i64 carry)))
-          (up (call @fib.fp-reads buf cand n e2 neg x single))
-          (half (icmp uge (load i8 (getelementptr i8 ds n)) (i8 53)))
-          (nearer (or half (xor down (i1 1)))))
-      (br (and up nearer) take-up check-down)))
-  (block take-up
-    (store e2 eout)
-    (ret (i1 1)))
-  (block check-down (br down take-down none))
-  (block take-down
-    (call @memcpy cand ds n)
-    (store e eout)
-    (ret (i1 1)))
-  (block none (ret (i1 0))))
+(DEFINE INTERNAL (fib.fp-at I1) ((PTR ds) (I64 n) (I64 e) (PTR cand) (PTR buf) (I1 neg) (DOUBLE x) (I1 single) (PTR eout))
+  (BLOCK entry
+    (CALL (GLOBAL memcpy) cand ds n)
+    (LET ((down (CALL (GLOBAL fib.fp-reads) buf cand n e neg x single))
+          (carry (CALL (GLOBAL fib.fp-bump) cand n))
+          (e2 (ADD e (ZEXT I64 carry)))
+          (up (CALL (GLOBAL fib.fp-reads) buf cand n e2 neg x single))
+          (half (ICMP UGE (LOAD I8 (GETELEMENTPTR I8 ds n)) (I8 53)))
+          (nearer (OR half (XOR down (I1 1)))))
+      (BR (AND up nearer) take-up check-down)))
+  (BLOCK take-up
+    (STORE e2 eout)
+    (RET (I1 1)))
+  (BLOCK check-down (BR down take-down none))
+  (BLOCK take-down
+    (CALL (GLOBAL memcpy) cand ds n)
+    (STORE e eout)
+    (RET (I1 1)))
+  (BLOCK none (RET (I1 0))))
 
-(define internal (fib.show-fp ptr) ((double x) (i1 single))
-  (block entry (br (fcmp uno x x) nan finite))
-  (block nan (ret (call @fib.str-from-bytes (string "##NaN") (i64 5))))
-  (block finite
-    (let ((buf (alloca i8 (i32 832)))
-          (len0 (call @snprintf buf (i64 832) (string "%.800e") x))
-          (c0 (load i8 buf))
-          (c1 (load i8 (getelementptr i8 buf (i64 1)))))
-      (br (or (icmp eq c0 (i8 105)) (icmp eq c1 (i8 105))) inf prep)))
-  (block inf
-    (br (icmp eq c0 (i8 45)) minus plus))
-  (block minus (ret (call @fib.str-from-bytes (string "##-Inf") (i64 6))))
-  (block plus (ret (call @fib.str-from-bytes (string "##Inf") (i64 5))))
-  (block prep
-    (let ((ds (alloca i8 (i32 832)))
-          (exp (alloca i64))
-          (eout (alloca i64))
-          (cand (alloca i8 (i32 24)))
-          (cbuf (alloca i8 (i32 48)))
-          (neg (icmp eq c0 (i8 45))))
-      (call @fib.fp-parse buf ds exp)
-      (let ((e0 (load i64 exp)))
-        (br search))))
-  (block search
-    (let ((n (phi i64 (prep (i64 2)) (more n2)))
-          (hit (call @fib.fp-at ds n e0 cand cbuf neg x single eout)))
-      (br hit found more)))
-  (block more
-    (let ((n2 (add n (i64 1))))
-      (br (icmp sgt n2 (i64 17)) bad search)))
-  (block bad
-    (call @fib.trap-c (string "show: no shortest digits"))
-    (unreachable))
-  (block found
-    (let ((out (alloca i8 (i32 400)))
-          (m (call @fib.fp-text out cand n (load i64 eout) neg)))
-      (ret (call @fib.str-from-bytes out m)))))
+(DEFINE INTERNAL (fib.show-fp PTR) ((DOUBLE x) (I1 single))
+  (BLOCK entry (BR (FCMP UNO x x) nan finite))
+  (BLOCK nan (RET (CALL (GLOBAL fib.str-from-bytes) (STRING "##NaN") (I64 5))))
+  (BLOCK finite
+    (LET ((buf (ALLOCA I8 (I32 832)))
+          (len0 (CALL (GLOBAL snprintf) buf (I64 832) (STRING "%.800e") x))
+          (c0 (LOAD I8 buf))
+          (c1 (LOAD I8 (GETELEMENTPTR I8 buf (I64 1)))))
+      (BR (OR (ICMP EQ c0 (I8 105)) (ICMP EQ c1 (I8 105))) inf prep)))
+  (BLOCK inf
+    (BR (ICMP EQ c0 (I8 45)) minus plus))
+  (BLOCK minus (RET (CALL (GLOBAL fib.str-from-bytes) (STRING "##-Inf") (I64 6))))
+  (BLOCK plus (RET (CALL (GLOBAL fib.str-from-bytes) (STRING "##Inf") (I64 5))))
+  (BLOCK prep
+    (LET ((ds (ALLOCA I8 (I32 832)))
+          (exp (ALLOCA I64))
+          (eout (ALLOCA I64))
+          (cand (ALLOCA I8 (I32 24)))
+          (cbuf (ALLOCA I8 (I32 48)))
+          (neg (ICMP EQ c0 (I8 45))))
+      (CALL (GLOBAL fib.fp-parse) buf ds exp)
+      (LET ((e0 (LOAD I64 exp)))
+        (BR search))))
+  (BLOCK search
+    (LET ((n (PHI I64 (prep (I64 2)) (more n2)))
+          (hit (CALL (GLOBAL fib.fp-at) ds n e0 cand cbuf neg x single eout)))
+      (BR hit found more)))
+  (BLOCK more
+    (LET ((n2 (ADD n (I64 1))))
+      (BR (ICMP SGT n2 (I64 17)) bad search)))
+  (BLOCK bad
+    (CALL (GLOBAL fib.trap-c) (STRING "show: no shortest digits"))
+    (UNREACHABLE))
+  (BLOCK found
+    (LET ((out (ALLOCA I8 (I32 400)))
+          (m (CALL (GLOBAL fib.fp-text) out cand n (LOAD I64 eout) neg)))
+      (RET (CALL (GLOBAL fib.str-from-bytes) out m)))))
 
-(define internal (fib.show-double ptr) ((double x))
-  (block entry (ret (call @fib.show-fp x (i1 0)))))
+(DEFINE INTERNAL (fib.show-double PTR) ((DOUBLE x))
+  (BLOCK entry (RET (CALL (GLOBAL fib.show-fp) x (I1 0)))))
 
-(define internal (fib.show-float ptr) ((float x))
-  (block entry (ret (call @fib.show-fp (fpext double x) (i1 1)))))
+(DEFINE INTERNAL (fib.show-float PTR) ((FLOAT x))
+  (BLOCK entry (RET (CALL (GLOBAL fib.show-fp) (FPEXT DOUBLE x) (I1 1)))))
 
 ;; The UTF-8 encoding of the scalar value c.
-(define internal (fib.show-char ptr) ((i32 c))
-  (block entry
-    (let ((buf (alloca i8 (i32 4))))
-      (br (icmp slt c (i32 128)) one more1)))
-  (block one
-    (store (trunc i8 c) buf)
-    (ret (call @fib.str-from-bytes buf (i64 1))))
-  (block more1 (br (icmp slt c (i32 2048)) two more2))
-  (block two
-    (store (trunc i8 (or (lshr c (i32 6)) (i32 192))) buf)
-    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
-    (ret (call @fib.str-from-bytes buf (i64 2))))
-  (block more2 (br (icmp slt c (i32 65536)) three four))
-  (block three
-    (store (trunc i8 (or (lshr c (i32 12)) (i32 224))) buf)
-    (store (trunc i8 (or (and (lshr c (i32 6)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
-    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 2)))
-    (ret (call @fib.str-from-bytes buf (i64 3))))
-  (block four
-    (store (trunc i8 (or (lshr c (i32 18)) (i32 240))) buf)
-    (store (trunc i8 (or (and (lshr c (i32 12)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
-    (store (trunc i8 (or (and (lshr c (i32 6)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 2)))
-    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 3)))
-    (ret (call @fib.str-from-bytes buf (i64 4)))))
+(DEFINE INTERNAL (fib.show-char PTR) ((I32 c))
+  (BLOCK entry
+    (LET ((buf (ALLOCA I8 (I32 4))))
+      (BR (ICMP SLT c (I32 128)) one more1)))
+  (BLOCK one
+    (STORE (TRUNC I8 c) buf)
+    (RET (CALL (GLOBAL fib.str-from-bytes) buf (I64 1))))
+  (BLOCK more1 (BR (ICMP SLT c (I32 2048)) two more2))
+  (BLOCK two
+    (STORE (TRUNC I8 (OR (LSHR c (I32 6)) (I32 192))) buf)
+    (STORE (TRUNC I8 (OR (AND c (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 1)))
+    (RET (CALL (GLOBAL fib.str-from-bytes) buf (I64 2))))
+  (BLOCK more2 (BR (ICMP SLT c (I32 65536)) three four))
+  (BLOCK three
+    (STORE (TRUNC I8 (OR (LSHR c (I32 12)) (I32 224))) buf)
+    (STORE (TRUNC I8 (OR (AND (LSHR c (I32 6)) (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 1)))
+    (STORE (TRUNC I8 (OR (AND c (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 2)))
+    (RET (CALL (GLOBAL fib.str-from-bytes) buf (I64 3))))
+  (BLOCK four
+    (STORE (TRUNC I8 (OR (LSHR c (I32 18)) (I32 240))) buf)
+    (STORE (TRUNC I8 (OR (AND (LSHR c (I32 12)) (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 1)))
+    (STORE (TRUNC I8 (OR (AND (LSHR c (I32 6)) (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 2)))
+    (STORE (TRUNC I8 (OR (AND c (I32 63)) (I32 128))) (GETELEMENTPTR I8 buf (I64 3)))
+    (RET (CALL (GLOBAL fib.str-from-bytes) buf (I64 4)))))
 
-(define internal (fib.str-cmp i32) ((ptr a) (ptr b))
-  (block entry
-    (let ((na (call @fib.str-len a))
-          (nb (call @fib.str-len b))
-          (n (select (icmp slt na nb) na nb))
-          (c (call @memcmp (call @fib.str-bytes-ptr a) (call @fib.str-bytes-ptr b) n)))
-      (br (icmp ne c (i32 0)) differ prefix)))
-  (block differ (ret c))
-  (block prefix (ret (select (icmp slt na nb) (i32 -1) (select (icmp sgt na nb) (i32 1) (i32 0))))))
+(DEFINE INTERNAL (fib.str-cmp I32) ((PTR a) (PTR b))
+  (BLOCK entry
+    (LET ((na (CALL (GLOBAL fib.str-len) a))
+          (nb (CALL (GLOBAL fib.str-len) b))
+          (n (SELECT (ICMP SLT na nb) na nb))
+          (c (CALL (GLOBAL memcmp) (CALL (GLOBAL fib.str-bytes-ptr) a) (CALL (GLOBAL fib.str-bytes-ptr) b) n)))
+      (BR (ICMP NE c (I32 0)) differ prefix)))
+  (BLOCK differ (RET c))
+  (BLOCK prefix (RET (SELECT (ICMP SLT na nb) (I32 -1) (SELECT (ICMP SGT na nb) (I32 1) (I32 0))))))
 
-(define internal (fib.str-eq i1) ((ptr a) (ptr b))
-  (block entry (ret (icmp eq (call @fib.str-cmp a b) (i32 0)))))
+(DEFINE INTERNAL (fib.str-eq I1) ((PTR a) (PTR b))
+  (BLOCK entry (RET (ICMP EQ (CALL (GLOBAL fib.str-cmp) a b) (I32 0)))))
 
-(define internal (fib.str-starts-with i1) ((ptr s) (ptr prefix))
-  (block entry
-    (let ((n (call @fib.str-len s))
-          (m (call @fib.str-len prefix)))
-      (br (icmp sgt m n) no cmp)))
-  (block no (ret (i1 0)))
-  (block cmp (ret (icmp eq (call @memcmp (call @fib.str-bytes-ptr s) (call @fib.str-bytes-ptr prefix) m) (i32 0)))))
+(DEFINE INTERNAL (fib.str-starts-with I1) ((PTR s) (PTR prefix))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.str-len) s))
+          (m (CALL (GLOBAL fib.str-len) prefix)))
+      (BR (ICMP SGT m n) no cmp)))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK cmp (RET (ICMP EQ (CALL (GLOBAL memcmp) (CALL (GLOBAL fib.str-bytes-ptr) s) (CALL (GLOBAL fib.str-bytes-ptr) prefix) m) (I32 0)))))
 
-(define internal (fib.str-concat ptr) ((ptr a) (ptr b))
-  (block entry
-    (let ((na (call @fib.str-len a))
-          (nb (call @fib.str-len b))
-          (s (call @fib.str-new (add na nb)))
-          (d (call @fib.str-bytes-ptr s)))
-      (call @memcpy d (call @fib.str-bytes-ptr a) na)
-      (call @memcpy (getelementptr i8 d na) (call @fib.str-bytes-ptr b) nb)
-      (ret s))))
+(DEFINE INTERNAL (fib.str-concat PTR) ((PTR a) (PTR b))
+  (BLOCK entry
+    (LET ((na (CALL (GLOBAL fib.str-len) a))
+          (nb (CALL (GLOBAL fib.str-len) b))
+          (s (CALL (GLOBAL fib.str-new) (ADD na nb)))
+          (d (CALL (GLOBAL fib.str-bytes-ptr) s)))
+      (CALL (GLOBAL memcpy) d (CALL (GLOBAL fib.str-bytes-ptr) a) na)
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 d na) (CALL (GLOBAL fib.str-bytes-ptr) b) nb)
+      (RET s))))
 
 ;; The interpreter's traps for a bad slice (eval/strings.rs).
-(define internal (fib.str-slice ptr) ((ptr s) (i64 i) (i64 j))
-  (block entry
-    (let ((n (call @fib.str-len s))
-          (bad (or (icmp slt i (i64 0)) (or (icmp sgt i j) (icmp sgt j n)))))
-      (br bad range check-i)))
-  (block range
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "str-slice [%lld, %lld) out of range 0..%lld") i j n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block check-i
-    (let ((p (call @fib.str-bytes-ptr s)))
-      (br (call @fib.splits-char p i n) split check-j)))
-  (block check-j (br (call @fib.splits-char p j n) split ok))
-  (block split
-    (let ((buf2 (alloca i8 (i32 96)))
-          (len2 (call @snprintf buf2 (i64 96) (string "str-slice [%lld, %lld) splits a character") i j)))
-      (call @fib.trap-bytes buf2 (sext i64 len2))
-      (unreachable)))
-  (block ok
-    (let ((m (sub j i))
-          (r (call @fib.str-new m)))
-      (call @memcpy (call @fib.str-bytes-ptr r) (getelementptr i8 p i) m)
-      (ret r))))
+(DEFINE INTERNAL (fib.str-slice PTR) ((PTR s) (I64 i) (I64 j))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.str-len) s))
+          (bad (OR (ICMP SLT i (I64 0)) (OR (ICMP SGT i j) (ICMP SGT j n)))))
+      (BR bad range check-i)))
+  (BLOCK range
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "str-slice [%lld, %lld) out of range 0..%lld") i j n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK check-i
+    (LET ((p (CALL (GLOBAL fib.str-bytes-ptr) s)))
+      (BR (CALL (GLOBAL fib.splits-char) p i n) split check-j)))
+  (BLOCK check-j (BR (CALL (GLOBAL fib.splits-char) p j n) split ok))
+  (BLOCK split
+    (LET ((buf2 (ALLOCA I8 (I32 96)))
+          (len2 (CALL (GLOBAL snprintf) buf2 (I64 96) (STRING "str-slice [%lld, %lld) splits a character") i j)))
+      (CALL (GLOBAL fib.trap-bytes) buf2 (SEXT I64 len2))
+      (UNREACHABLE)))
+  (BLOCK ok
+    (LET ((m (SUB j i))
+          (r (CALL (GLOBAL fib.str-new) m)))
+      (CALL (GLOBAL memcpy) (CALL (GLOBAL fib.str-bytes-ptr) r) (GETELEMENTPTR I8 p i) m)
+      (RET r))))
 
 ;; Whether byte k of a string of n bytes is a UTF-8 continuation byte
 ;; (10xxxxxx): a boundary there splits a character.
-(define internal (fib.splits-char i1) ((ptr p) (i64 k) (i64 n))
-  (block entry (br (icmp sge k n) no test))
-  (block no (ret (i1 0)))
-  (block test (ret (icmp eq (and (load i8 (getelementptr i8 p k)) (i8 -64)) (i8 -128)))))
+(DEFINE INTERNAL (fib.splits-char I1) ((PTR p) (I64 k) (I64 n))
+  (BLOCK entry (BR (ICMP SGE k n) no test))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK test (RET (ICMP EQ (AND (LOAD I8 (GETELEMENTPTR I8 p k)) (I8 -64)) (I8 -128)))))
 
 ;; (str-byte-at s i): byte i of s, with the interpreter's trap (eval/strings.rs).
 ;; An unsigned compare refuses a negative index with the rest.
-(define internal (fib.str-byte-at i8) ((ptr s) (i64 i))
-  (block entry
-    (let ((n (call @fib.str-len s)))
-      (br (icmp ult i n) ok bad)))
-  (block bad
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "str-byte-at: index %lld out of range 0..%lld") i n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block ok (ret (load i8 (getelementptr i8 (call @fib.str-bytes-ptr s) i)))))
+(DEFINE INTERNAL (fib.str-byte-at I8) ((PTR s) (I64 i))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.str-len) s)))
+      (BR (ICMP ULT i n) ok bad)))
+  (BLOCK bad
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "str-byte-at: index %lld out of range 0..%lld") i n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK ok (RET (LOAD I8 (GETELEMENTPTR I8 (CALL (GLOBAL fib.str-bytes-ptr) s) i)))))
 
 ;; (str-find s pat from): the byte offset of the first pat at or after
 ;; from, or -1; the interpreter's traps for a bad from (eval/strings.rs).
 ;; The caller makes the Option. Nothing is allocated here.
-(define internal (fib.str-find i64) ((ptr s) (ptr pat) (i64 from))
-  (block entry
-    (let ((n (call @fib.str-len s)))
-      (br (or (icmp slt from (i64 0)) (icmp sgt from n)) range check)))
-  (block range
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "str-find: from %lld out of range 0..%lld") from n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block check
-    (let ((p (call @fib.str-bytes-ptr s)))
-      (br (call @fib.splits-char p from n) split scan)))
-  (block split
-    (let ((buf2 (alloca i8 (i32 96)))
-          (len2 (call @snprintf buf2 (i64 96) (string "str-find: from %lld splits a character") from)))
-      (call @fib.trap-bytes buf2 (sext i64 len2))
-      (unreachable)))
-  (block scan
-    (let ((m (call @fib.str-len pat))
-          (q (call @fib.str-bytes-ptr pat))
-          (last (sub n m)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (scan from) (next i2))))
-      (br (icmp sgt i last) none try)))
+(DEFINE INTERNAL (fib.str-find I64) ((PTR s) (PTR pat) (I64 from))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.str-len) s)))
+      (BR (OR (ICMP SLT from (I64 0)) (ICMP SGT from n)) range check)))
+  (BLOCK range
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "str-find: from %lld out of range 0..%lld") from n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK check
+    (LET ((p (CALL (GLOBAL fib.str-bytes-ptr) s)))
+      (BR (CALL (GLOBAL fib.splits-char) p from n) split scan)))
+  (BLOCK split
+    (LET ((buf2 (ALLOCA I8 (I32 96)))
+          (len2 (CALL (GLOBAL snprintf) buf2 (I64 96) (STRING "str-find: from %lld splits a character") from)))
+      (CALL (GLOBAL fib.trap-bytes) buf2 (SEXT I64 len2))
+      (UNREACHABLE)))
+  (BLOCK scan
+    (LET ((m (CALL (GLOBAL fib.str-len) pat))
+          (q (CALL (GLOBAL fib.str-bytes-ptr) pat))
+          (last (SUB n m)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (scan from) (next i2))))
+      (BR (ICMP SGT i last) none try)))
   ;; the first byte decides almost every position: the libc call is made only where it matches (an empty pattern matches at once)
-  (block try
-    (br (icmp eq m (i64 0)) hit first))
-  (block first
-    (br (icmp eq (load i8 (getelementptr i8 p i)) (load i8 q)) full next))
-  (block full
-    (br (icmp eq (call @memcmp (getelementptr i8 p i) q m) (i32 0)) hit next))
-  (block next
-    (let ((i2 (add i (i64 1))))
-      (br loop)))
-  (block hit (ret i))
-  (block none (ret (i64 -1))))
+  (BLOCK try
+    (BR (ICMP EQ m (I64 0)) hit first))
+  (BLOCK first
+    (BR (ICMP EQ (LOAD I8 (GETELEMENTPTR I8 p i)) (LOAD I8 q)) full next))
+  (BLOCK full
+    (BR (ICMP EQ (CALL (GLOBAL memcmp) (GETELEMENTPTR I8 p i) q m) (I32 0)) hit next))
+  (BLOCK next
+    (LET ((i2 (ADD i (I64 1))))
+      (BR loop)))
+  (BLOCK hit (RET i))
+  (BLOCK none (RET (I64 -1))))
 
 ;; (str-bytes s): a fresh (Array i8) of the bytes.
-(define internal (fib.str-bytes ptr) ((ptr s) (i32 tid))
-  (block entry
-    (let ((n (call @fib.str-len s))
-          (a (call @fib.array-alloc n tid (i64 1))))
-      (call @memcpy (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (call @fib.str-bytes-ptr s) n)
-      (ret a))))
+(DEFINE INTERNAL (fib.str-bytes PTR) ((PTR s) (I32 tid))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.str-len) s))
+          (a (CALL (GLOBAL fib.array-alloc) n tid (I64 1))))
+      (CALL (GLOBAL memcpy) (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 4) (I64 0)) (CALL (GLOBAL fib.str-bytes-ptr) s) n)
+      (RET a))))
 
 ;; Whether byte j of the n at p exists and lies in lo..=hi.
-(define internal (fib.utf8-cont i1) ((ptr p) (i64 n) (i64 j) (i32 lo) (i32 hi))
-  (block entry (br (icmp sge j n) no test))
-  (block no (ret (i1 0)))
-  (block test
-    (let ((b (zext i32 (load i8 (getelementptr i8 p j)))))
-      (ret (and (icmp sge b lo) (icmp sle b hi))))))
+(DEFINE INTERNAL (fib.utf8-cont I1) ((PTR p) (I64 n) (I64 j) (I32 lo) (I32 hi))
+  (BLOCK entry (BR (ICMP SGE j n) no test))
+  (BLOCK no (RET (I1 0)))
+  (BLOCK test
+    (LET ((b (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p j)))))
+      (RET (AND (ICMP SGE b lo) (ICMP SLE b hi))))))
 
 ;; The UTF-8 sequence at byte i of the n at p, as Rust's from_utf8
 ;; reads it (the shortest encodings of the scalar values): its length,
 ;; 1 to 4, or when the bytes there are not UTF-8 minus the length of the
 ;; longest prefix of a sequence that they do begin, -1 to -3: the
 ;; "maximal subpart" that String::from_utf8_lossy replaces as one.
-(define internal (fib.utf8-step i64) ((ptr p) (i64 n) (i64 i))
-  (block entry
-    (let ((b (zext i32 (load i8 (getelementptr i8 p i)))))
-      (br (icmp slt b (i32 128)) one two?)))
-  (block one (ret (i64 1)))
-  (block two? (br (and (icmp sge b (i32 194)) (icmp sle b (i32 223))) two three?))
-  (block two
-    (ret (select (call @fib.utf8-cont p n (add i (i64 1)) (i32 128) (i32 191)) (i64 2) (i64 -1))))
-  (block three? (br (and (icmp sge b (i32 224)) (icmp sle b (i32 239))) three four?))
-  (block three
-    (let ((lo3 (select (icmp eq b (i32 224)) (i32 160) (i32 128)))
-          (hi3 (select (icmp eq b (i32 237)) (i32 159) (i32 191)))
-          (c31 (call @fib.utf8-cont p n (add i (i64 1)) lo3 hi3))
-          (c32 (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191))))
-      (ret (select c31 (select c32 (i64 3) (i64 -2)) (i64 -1)))))
-  (block four? (br (and (icmp sge b (i32 240)) (icmp sle b (i32 244))) four bad))
-  (block four
-    (let ((lo4 (select (icmp eq b (i32 240)) (i32 144) (i32 128)))
-          (hi4 (select (icmp eq b (i32 244)) (i32 143) (i32 191)))
-          (c41 (call @fib.utf8-cont p n (add i (i64 1)) lo4 hi4))
-          (c42 (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191)))
-          (c43 (call @fib.utf8-cont p n (add i (i64 3)) (i32 128) (i32 191))))
-      (ret (select c41 (select c42 (select c43 (i64 4) (i64 -3)) (i64 -2)) (i64 -1)))))
-  (block bad (ret (i64 -1))))
+(DEFINE INTERNAL (fib.utf8-step I64) ((PTR p) (I64 n) (I64 i))
+  (BLOCK entry
+    (LET ((b (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p i)))))
+      (BR (ICMP SLT b (I32 128)) one two?)))
+  (BLOCK one (RET (I64 1)))
+  (BLOCK two? (BR (AND (ICMP SGE b (I32 194)) (ICMP SLE b (I32 223))) two three?))
+  (BLOCK two
+    (RET (SELECT (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 1)) (I32 128) (I32 191)) (I64 2) (I64 -1))))
+  (BLOCK three? (BR (AND (ICMP SGE b (I32 224)) (ICMP SLE b (I32 239))) three four?))
+  (BLOCK three
+    (LET ((lo3 (SELECT (ICMP EQ b (I32 224)) (I32 160) (I32 128)))
+          (hi3 (SELECT (ICMP EQ b (I32 237)) (I32 159) (I32 191)))
+          (c31 (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 1)) lo3 hi3))
+          (c32 (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 2)) (I32 128) (I32 191))))
+      (RET (SELECT c31 (SELECT c32 (I64 3) (I64 -2)) (I64 -1)))))
+  (BLOCK four? (BR (AND (ICMP SGE b (I32 240)) (ICMP SLE b (I32 244))) four bad))
+  (BLOCK four
+    (LET ((lo4 (SELECT (ICMP EQ b (I32 240)) (I32 144) (I32 128)))
+          (hi4 (SELECT (ICMP EQ b (I32 244)) (I32 143) (I32 191)))
+          (c41 (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 1)) lo4 hi4))
+          (c42 (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 2)) (I32 128) (I32 191)))
+          (c43 (CALL (GLOBAL fib.utf8-cont) p n (ADD i (I64 3)) (I32 128) (I32 191))))
+      (RET (SELECT c41 (SELECT c42 (SELECT c43 (I64 4) (I64 -3)) (I64 -2)) (I64 -1)))))
+  (BLOCK bad (RET (I64 -1))))
 
 ;; Whether the n bytes at p are UTF-8 (the interpreter's rule for
 ;; str-from-bytes: Rust's from_utf8).
-(define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
-  (block entry (br loop))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (adv inext) (wadv iw) (adv2 j2) (adv3 j3))))
-      (br (icmp sge i n) ok wide)))
+(DEFINE INTERNAL (fib.utf8-valid I1) ((PTR p) (I64 n))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (adv inext) (wadv iw) (adv2 j2) (adv3 j3))))
+      (BR (ICMP SGE i n) ok wide)))
   ;; JSON-3: eight ASCII bytes at a time (a word with no byte of 0x80 or more is eight one-byte sequences); the common two- and three-byte sequences (C2..DF, E1..EC and EE..EF
   ;; with their continuation bytes in 80..BF) inline; the step for everything else (E0, ED, F0..F4, and every error), which decides exactly as before.
-  (block wide
-    (br (icmp sle (add i (i64 8)) n) word head))
-  (block word
-    (let ((w (load i64 (getelementptr i8 p i)))
-          (iw (add i (i64 8))))
-      (br (icmp eq (and w (i64 -9187201950435737472)) (i64 0)) wadv head)))
-  (block wadv (br loop))
-  (block head
-    (let ((b0 (zext i32 (load i8 (getelementptr i8 p i))))
-          (ia (add i (i64 1)))
-          (ib (add i (i64 2))))
-      (br (and (icmp uge b0 (i32 194)) (icmp ule b0 (i32 223))) two chk3)))
-  (block two
-    (br (icmp slt ia n) two2 slow))
-  (block two2
-    (let ((c1 (zext i32 (load i8 (getelementptr i8 p ia)))))
-      (br (icmp eq (and c1 (i32 192)) (i32 128)) adv2 slow)))
-  (block adv2 (let ((j2 (add i (i64 2)))) (br loop)))
-  (block chk3
-    (br (and (icmp uge b0 (i32 225)) (and (icmp ule b0 (i32 239)) (icmp ne b0 (i32 237)))) three slow))
-  (block three
-    (br (icmp slt ib n) three2 slow))
-  (block three2
-    (let ((d1 (zext i32 (load i8 (getelementptr i8 p ia))))
-          (d2 (zext i32 (load i8 (getelementptr i8 p ib)))))
-      (br (and (icmp eq (and d1 (i32 192)) (i32 128)) (icmp eq (and d2 (i32 192)) (i32 128))) adv3 slow)))
-  (block adv3 (let ((j3 (add i (i64 3)))) (br loop)))
-  (block slow
-    (let ((k (call @fib.utf8-step p n i)))
-      (br (icmp sgt k (i64 0)) adv bad)))
-  (block adv (let ((inext (add i k))) (br loop)))
-  (block ok (ret (i1 1)))
-  (block bad (ret (i1 0))))
+  (BLOCK wide
+    (BR (ICMP SLE (ADD i (I64 8)) n) word head))
+  (BLOCK word
+    (LET ((w (LOAD I64 (GETELEMENTPTR I8 p i)))
+          (iw (ADD i (I64 8))))
+      (BR (ICMP EQ (AND w (I64 -9187201950435737472)) (I64 0)) wadv head)))
+  (BLOCK wadv (BR loop))
+  (BLOCK head
+    (LET ((b0 (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p i))))
+          (ia (ADD i (I64 1)))
+          (ib (ADD i (I64 2))))
+      (BR (AND (ICMP UGE b0 (I32 194)) (ICMP ULE b0 (I32 223))) two chk3)))
+  (BLOCK two
+    (BR (ICMP SLT ia n) two2 slow))
+  (BLOCK two2
+    (LET ((c1 (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p ia)))))
+      (BR (ICMP EQ (AND c1 (I32 192)) (I32 128)) adv2 slow)))
+  (BLOCK adv2 (LET ((j2 (ADD i (I64 2)))) (BR loop)))
+  (BLOCK chk3
+    (BR (AND (ICMP UGE b0 (I32 225)) (AND (ICMP ULE b0 (I32 239)) (ICMP NE b0 (I32 237)))) three slow))
+  (BLOCK three
+    (BR (ICMP SLT ib n) three2 slow))
+  (BLOCK three2
+    (LET ((d1 (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p ia))))
+          (d2 (ZEXT I32 (LOAD I8 (GETELEMENTPTR I8 p ib)))))
+      (BR (AND (ICMP EQ (AND d1 (I32 192)) (I32 128)) (ICMP EQ (AND d2 (I32 192)) (I32 128))) adv3 slow)))
+  (BLOCK adv3 (LET ((j3 (ADD i (I64 3)))) (BR loop)))
+  (BLOCK slow
+    (LET ((k (CALL (GLOBAL fib.utf8-step) p n i)))
+      (BR (ICMP SGT k (I64 0)) adv bad)))
+  (BLOCK adv (LET ((inext (ADD i k))) (BR loop)))
+  (BLOCK ok (RET (I1 1)))
+  (BLOCK bad (RET (I1 0))))
 
 ;; The length of the lossy conversion of the n bytes at p: a valid
 ;; sequence stays as it is, each maximal invalid prefix is the 3 bytes
 ;; of U+FFFD.
-(define internal (fib.lossy-len i64) ((ptr p) (i64 n))
-  (block entry (br loop))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (step i2)))
-          (len (phi i64 (entry (i64 0)) (step len2))))
-      (br (icmp slt i n) step done)))
-  (block step
-    (let ((k (call @fib.utf8-step p n i))
-          (ok (icmp sgt k (i64 0)))
-          (i2 (add i (select ok k (sub (i64 0) k))))
-          (len2 (add len (select ok k (i64 3)))))
-      (br loop)))
-  (block done (ret len)))
+(DEFINE INTERNAL (fib.lossy-len I64) ((PTR p) (I64 n))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (step i2)))
+          (len (PHI I64 (entry (I64 0)) (step len2))))
+      (BR (ICMP SLT i n) step done)))
+  (BLOCK step
+    (LET ((k (CALL (GLOBAL fib.utf8-step) p n i))
+          (ok (ICMP SGT k (I64 0)))
+          (i2 (ADD i (SELECT ok k (SUB (I64 0) k))))
+          (len2 (ADD len (SELECT ok k (I64 3)))))
+      (BR loop)))
+  (BLOCK done (RET len)))
 
 ;; A fresh str of the n bytes at p, which need not be UTF-8: each
 ;; invalid sequence is replaced by U+FFFD (EF BF BD) exactly as Rust's
@@ -582,116 +582,116 @@
 ;; The command line of a built executable is read through it (syntax
 ;; §4.3, `(args)`); `fibc run` and `fibref run` make the same strings
 ;; in Rust, in fibref::cmdline, before the program starts.
-(define internal (fib.str-from-lossy ptr) ((ptr p) (i64 n))
-  (block entry
-    (let ((s (call @fib.str-new (call @fib.lossy-len p n)))
-          (dst (call @fib.str-bytes-ptr s)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (next i2)))
-          (o (phi i64 (entry (i64 0)) (next o2))))
-      (br (icmp slt i n) step done)))
-  (block step
-    (let ((k (call @fib.utf8-step p n i))
-          (ok (icmp sgt k (i64 0))))
-      (br ok copy replace)))
-  (block copy
-    (call @memcpy (getelementptr i8 dst o) (getelementptr i8 p i) k)
-    (br next))
-  (block replace
-    (store (i8 -17) (getelementptr i8 dst o))
-    (store (i8 -65) (getelementptr i8 dst (add o (i64 1))))
-    (store (i8 -67) (getelementptr i8 dst (add o (i64 2))))
-    (br next))
-  (block next
-    (let ((i2 (add i (select ok k (sub (i64 0) k))))
-          (o2 (add o (select ok k (i64 3)))))
-      (br loop)))
-  (block done (ret s)))
+(DEFINE INTERNAL (fib.str-from-lossy PTR) ((PTR p) (I64 n))
+  (BLOCK entry
+    (LET ((s (CALL (GLOBAL fib.str-new) (CALL (GLOBAL fib.lossy-len) p n)))
+          (dst (CALL (GLOBAL fib.str-bytes-ptr) s)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (next i2)))
+          (o (PHI I64 (entry (I64 0)) (next o2))))
+      (BR (ICMP SLT i n) step done)))
+  (BLOCK step
+    (LET ((k (CALL (GLOBAL fib.utf8-step) p n i))
+          (ok (ICMP SGT k (I64 0))))
+      (BR ok copy replace)))
+  (BLOCK copy
+    (CALL (GLOBAL memcpy) (GETELEMENTPTR I8 dst o) (GETELEMENTPTR I8 p i) k)
+    (BR next))
+  (BLOCK replace
+    (STORE (I8 -17) (GETELEMENTPTR I8 dst o))
+    (STORE (I8 -65) (GETELEMENTPTR I8 dst (ADD o (I64 1))))
+    (STORE (I8 -67) (GETELEMENTPTR I8 dst (ADD o (I64 2))))
+    (BR next))
+  (BLOCK next
+    (LET ((i2 (ADD i (SELECT ok k (SUB (I64 0) k))))
+          (o2 (ADD o (SELECT ok k (I64 3)))))
+      (BR loop)))
+  (BLOCK done (RET s)))
 
 ;; (str-from-bytes a): a fresh str of the array's bytes, which must be
 ;; UTF-8 (the interpreter traps with the same message).
-(define internal (fib.str-from-array ptr) ((ptr arr))
-  (block entry
-    (let ((n (load i64 (getelementptr %struct.fib.array.i8 arr (i32 0) (i32 3))))
-          (p (getelementptr %struct.fib.array.i8 arr (i32 0) (i32 4) (i64 0))))
-      (br (call @fib.utf8-valid p n) ok bad)))
-  (block ok (ret (call @fib.str-from-bytes p n)))
-  (block bad
-    (call @fib.trap-c (string "str-from-bytes: invalid UTF-8"))
-    (unreachable)))
+(DEFINE INTERNAL (fib.str-from-array PTR) ((PTR arr))
+  (BLOCK entry
+    (LET ((n (LOAD I64 (GETELEMENTPTR (STRUCT fib.array.i8) arr (I32 0) (I32 3))))
+          (p (GETELEMENTPTR (STRUCT fib.array.i8) arr (I32 0) (I32 4) (I64 0))))
+      (BR (CALL (GLOBAL fib.utf8-valid) p n) ok bad)))
+  (BLOCK ok (RET (CALL (GLOBAL fib.str-from-bytes) p n)))
+  (BLOCK bad
+    (CALL (GLOBAL fib.trap-c) (STRING "str-from-bytes: invalid UTF-8"))
+    (UNREACHABLE)))
 
 ;; (i32->char n): traps unless n is a Unicode scalar value.
-(define internal (fib.i32-to-char i32) ((i32 n))
-  (block entry
-    (let ((neg (icmp slt n (i32 0)))
-          (surrogate (and (icmp sge n (i32 55296)) (icmp sle n (i32 57343))))
-          (big (icmp sgt n (i32 1114111))))
-      (br (or neg (or surrogate big)) bad ok)))
-  (block bad
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "i32->char of %d, not a Unicode scalar value") n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block ok (ret n)))
+(DEFINE INTERNAL (fib.i32-to-char I32) ((I32 n))
+  (BLOCK entry
+    (LET ((neg (ICMP SLT n (I32 0)))
+          (surrogate (AND (ICMP SGE n (I32 55296)) (ICMP SLE n (I32 57343))))
+          (big (ICMP SGT n (I32 1114111))))
+      (BR (OR neg (OR surrogate big)) bad ok)))
+  (BLOCK bad
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "i32->char of %d, not a Unicode scalar value") n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK ok (RET n)))
 
 ;; Keywords made at run time (`str->keyword`, LIBFIX-1, emit.kwdyn). The keywords of a program have ids 0 .. N-1 (its literals); one made from a string that is none
 ;; of them takes the id N + i, i the index of its name in this table, which grows by doubling under a spinlock (fib.lock). The name is a copy, frozen (IMMORTAL and SHARED, never freed, and a trace-mode audit sees it freed, as it does a `freeze`), so
 ;; the table owns it for good and a trace-mode audit counts no leak. Lookup is a walk: a program makes few keywords from strings, and the common
 ;; one is a literal, found by emit.kwdyn's `kw.intern` before this is called.
-(global internal fib.kwd-lock i32 (i32 0))
-(global internal fib.kwd-names ptr (ptr null))
-(global internal fib.kwd-n i64 (i64 0))
-(global internal fib.kwd-cap i64 (i64 0))
+(GLOBAL INTERNAL fib.kwd-lock I32 (I32 0))
+(GLOBAL INTERNAL fib.kwd-names PTR (PTR NULL))
+(GLOBAL INTERNAL fib.kwd-n I64 (I64 0))
+(GLOBAL INTERNAL fib.kwd-cap I64 (I64 0))
 
-(define internal (fib.kwd-count i64) ()
-  (block entry (ret (atomic-load monotonic i64 @fib.kwd-n))))
+(DEFINE INTERNAL (fib.kwd-count I64) ()
+  (BLOCK entry (RET (ATOMIC-LOAD MONOTONIC I64 (GLOBAL fib.kwd-n)))))
 
-(define internal (fib.kwd-name ptr) ((i64 i))
-  (block entry
-    (call @fib.lock @fib.kwd-lock)
-    (let ((names (load ptr @fib.kwd-names))
-          (s (load ptr (getelementptr ptr names i))))
-      (call @fib.unlock @fib.kwd-lock)
-      (ret s))))
+(DEFINE INTERNAL (fib.kwd-name PTR) ((I64 i))
+  (BLOCK entry
+    (CALL (GLOBAL fib.lock) (GLOBAL fib.kwd-lock))
+    (LET ((names (LOAD PTR (GLOBAL fib.kwd-names)))
+          (s (LOAD PTR (GETELEMENTPTR PTR names i))))
+      (CALL (GLOBAL fib.unlock) (GLOBAL fib.kwd-lock))
+      (RET s))))
 
-(define internal (fib.kwd-intern i64) ((ptr s))
-  (block entry
-    (call @fib.lock @fib.kwd-lock)
-    (br scan))
-  (block scan
-    (let ((i (phi i64 (entry (i64 0)) (next i2)))
-          (n (load i64 @fib.kwd-n)))
-      (br (icmp slt i n) test add)))
-  (block test
-    (let ((names (load ptr @fib.kwd-names))
-          (t (load ptr (getelementptr ptr names i))))
-      (br (call @fib.str-eq t s) hit next)))
-  (block next
-    (let ((i2 (add i (i64 1))))
-      (br scan)))
-  (block hit
-    (call @fib.unlock @fib.kwd-lock)
-    (ret i))
-  (block add
-    (let ((cap (load i64 @fib.kwd-cap)))
-      (br (icmp sge n cap) grow put)))
-  (block grow
-    (let ((cap2 (select (icmp eq cap (i64 0)) (i64 64) (mul cap (i64 2))))
-          (nw (call @realloc (load ptr @fib.kwd-names) (mul cap2 (i64 8)))))
-      (br (icmp eq nw (ptr null)) oom grown)))
-  (block oom
-    (call @fib.fatal-c (string "out of memory"))
-    (unreachable))
-  (block grown
-    (store nw @fib.kwd-names)
-    (store cap2 @fib.kwd-cap)
-    (br put))
-  (block put
-    (let ((c (call @fib.str-copy s))
-          (names2 (load ptr @fib.kwd-names)))
-      (call @fib.freeze c)
-      (store c (getelementptr ptr names2 n))
-      (store (add n (i64 1)) @fib.kwd-n)
-      (call @fib.unlock @fib.kwd-lock)
-      (ret n))))
+(DEFINE INTERNAL (fib.kwd-intern I64) ((PTR s))
+  (BLOCK entry
+    (CALL (GLOBAL fib.lock) (GLOBAL fib.kwd-lock))
+    (BR scan))
+  (BLOCK scan
+    (LET ((i (PHI I64 (entry (I64 0)) (next i2)))
+          (n (LOAD I64 (GLOBAL fib.kwd-n))))
+      (BR (ICMP SLT i n) test add)))
+  (BLOCK test
+    (LET ((names (LOAD PTR (GLOBAL fib.kwd-names)))
+          (t (LOAD PTR (GETELEMENTPTR PTR names i))))
+      (BR (CALL (GLOBAL fib.str-eq) t s) hit next)))
+  (BLOCK next
+    (LET ((i2 (ADD i (I64 1))))
+      (BR scan)))
+  (BLOCK hit
+    (CALL (GLOBAL fib.unlock) (GLOBAL fib.kwd-lock))
+    (RET i))
+  (BLOCK add
+    (LET ((cap (LOAD I64 (GLOBAL fib.kwd-cap))))
+      (BR (ICMP SGE n cap) grow put)))
+  (BLOCK grow
+    (LET ((cap2 (SELECT (ICMP EQ cap (I64 0)) (I64 64) (MUL cap (I64 2))))
+          (nw (CALL (GLOBAL realloc) (LOAD PTR (GLOBAL fib.kwd-names)) (MUL cap2 (I64 8)))))
+      (BR (ICMP EQ nw (PTR NULL)) oom grown)))
+  (BLOCK oom
+    (CALL (GLOBAL fib.fatal-c) (STRING "out of memory"))
+    (UNREACHABLE))
+  (BLOCK grown
+    (STORE nw (GLOBAL fib.kwd-names))
+    (STORE cap2 (GLOBAL fib.kwd-cap))
+    (BR put))
+  (BLOCK put
+    (LET ((c (CALL (GLOBAL fib.str-copy) s))
+          (names2 (LOAD PTR (GLOBAL fib.kwd-names))))
+      (CALL (GLOBAL fib.freeze) c)
+      (STORE c (GETELEMENTPTR PTR names2 n))
+      (STORE (ADD n (I64 1)) (GLOBAL fib.kwd-n))
+      (CALL (GLOBAL fib.unlock) (GLOBAL fib.kwd-lock))
+      (RET n))))

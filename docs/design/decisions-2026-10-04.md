@@ -59,7 +59,7 @@ the generator. 5 classification from the compiled run only; a compiled outcome w
 The owner: catching a trap "seems like a big one". Decisions: (1) mechanism (b), a transitively inferred "may throw" effect with a hidden
 `{T,i1}` result reusing the scope-exit release code; landing pads (a) held in reserve. (2) Stage 1 first: a trapping task is isolated at
 the thread entry and `try-join` returns the trap as a `Result`; plain `join` and `@t` keep trapping in the joiner (case 911 changes to use
-`try-join`). (3) Fatal and uncatchable: out-of-memory, stack overflow, thread-start failure, and `(trap)` in the runtime's own five sites.
+`try-join`). (3) Fatal and uncatchable: out-of-memory, stack overflow, thread-start failure, and `(TRAP)` in the runtime's own five sites.
 (4) `&` in-out cells are written back on unwind; `cell-update!` poisons the cell as Rust's `Mutex` does; an `array-take!` region must be
 provably trap-free. (5) A trap inside a `finally` that runs during unwinding is fatal. (6) `fib.spawn` never detaches finished threads (20,000
 spawns used 165 MB; ~2,000 live threads abort under a 16 GB cap): fixed first, independent of the rest.
@@ -106,5 +106,5 @@ The kernel target and `fib.gpu` are CORE, not a driver: "I think its core, we ju
 a gpu... 'Defkernel' is a smart way of making it a deliberate dev choice." So: `defkernel` is the deliberate opt-in; a program with a
 kernel built for a platform that has no kernel target is rejected with a clear message naming the kernel and the platform (never a silent
 CPU fallback); the drivers (fib-gpu-cuda, later Metal/Vulkan) stay in their own repositories per ADR 0011; the lIR forms of spec/lir.md
-§6.9a (`kernelcc`, `(sreg R)`, `(barrier)`, the align-1 rule) are accepted. Phase 1 (the `:kernel` core form, the source-level kernel
+§6.9a (`kernelcc`, `(SREG R)`, `(BARRIER)`, the align-1 rule) are accepted. Phase 1 (the `:kernel` core form, the source-level kernel
 checker, the launch ABI, the `fib.gpu` builtins and the `Device` protocol) is the next package.

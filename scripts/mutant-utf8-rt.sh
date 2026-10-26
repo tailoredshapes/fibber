@@ -17,9 +17,9 @@ for m in "${MUTANTS[@]}"; do
   rm -rf "$OUT"; mkdir -p "$OUT"; cp -r "$R/compiler" "$R/lib" "$OUT/"
   f=$OUT/compiler/emit/runtime.fib
   case $m in
-    word-mask)       perl -0pi -e 's/\(and w \(i64 -9187201950435737472\)\)/(and w (i64 36170086419038336))/' "$f" ;;
-    three-byte-cont) perl -0pi -e 's/\(icmp eq \(and d2 \(i32 192\)\) \(i32 128\)\)/(i1 1)/' "$f" ;;
-    two-byte-range)  perl -0pi -e 's/\(icmp uge b0 \(i32 194\)\)/(icmp uge b0 (i32 192))/' "$f" ;;
+    word-mask)       perl -0pi -e 's/\(AND w \(I64 -9187201950435737472\)\)/(AND w (I64 36170086419038336))/' "$f" ;;
+    three-byte-cont) perl -0pi -e 's/\(ICMP EQ \(AND d2 \(I32 192\)\) \(I32 128\)\)/(I1 1)/' "$f" ;;
+    two-byte-range)  perl -0pi -e 's/\(ICMP UGE b0 \(I32 194\)\)/(ICMP UGE b0 (I32 192))/' "$f" ;;
     *) echo "mutant-utf8-rt: unknown mutant $m" >&2; exit 2 ;;
   esac
   cmp -s "$f" "$R/compiler/emit/runtime.fib" && { echo "SETUP ERROR $m: pattern not found" >&2; exit 2; }

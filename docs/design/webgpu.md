@@ -120,9 +120,9 @@ gpu32.fib are the same kernels over i32, which both targets take (section 6: tha
 | `fmin fmax` (NaN-propagating) | **refused**: "WGSL's min/max do not promise to propagate NaN (use fminnum/fmaxnum)" |
 | the reductions, `masked-load`, `gather`, every vector form | **refused** with the SIMD value they take |
 | `exp log sin cos pow` .. | not reachable: they are libc calls in fibber, which the extractor already refuses (gpu.md 4.2); WGSL has them, a `gpu/exp` family of builtins (ADR 0014) would map one to one |
-| `(sreg tid.x/y/z)`, `(sreg ctaid.x/y/z)`, `(sreg ntid.x/y/z)`, `(sreg nctaid.x/y/z)` | `i32(fibw_lid.x)`, `i32(fibw_wid.x)`, `i32(wg_x)` (the override), `i32(fibw_nwg.x)`: `local_invocation_id`, `workgroup_id`, the workgroup size, `num_workgroups`, stored by the entry into `var<private>`s so a device function can read them (WGSL gives builtins to entry points only) |
-| `(barrier)` | `workgroupBarrier()` (3.6 on uniformity) |
-| `(trap)` | `fibw_trap()`: sets `var<private> fibw_trapped` and `atomicStore(&fibw_flag.flag, 1u)` (3.4); the function returns, and so does every caller after a call of a function that may trap (`if (fibw_trapped) { return ..; }` after the call: a fixed point over the call graph), so nothing is stored after a trap |
+| `(SREG tid.x/y/z)`, `(SREG ctaid.x/y/z)`, `(SREG ntid.x/y/z)`, `(SREG nctaid.x/y/z)` | `i32(fibw_lid.x)`, `i32(fibw_wid.x)`, `i32(wg_x)` (the override), `i32(fibw_nwg.x)`: `local_invocation_id`, `workgroup_id`, the workgroup size, `num_workgroups`, stored by the entry into `var<private>`s so a device function can read them (WGSL gives builtins to entry points only) |
+| `(BARRIER)` | `workgroupBarrier()` (3.6 on uniformity) |
+| `(TRAP)` | `fibw_trap()`: sets `var<private> fibw_trapped` and `atomicStore(&fibw_flag.flag, 1u)` (3.4); the function returns, and so does every caller after a call of a function that may trap (`if (fibw_trapped) { return ..; }` after the call: a fixed point over the call graph), so nothing is stored after a trap |
 | `unreachable` | `return` of the zero of the result type |
 | a call of a function of the module | the call; of anything else (`llvm.*`, libc) **refused** |
 
@@ -134,7 +134,7 @@ a load of f32 is `fibw_ld_f32(p)`: `bitcast<f32>(fibw_ld_u32(p))` where `fibw_ld
 over the module's buffers (every buffer is `array<u32>`; i32 and f32 are bitcasts of the word; a store is the same the other way). After
 inlining, `p.buf` is a constant for every access that starts from a parameter, and the switch is gone: the GEMM's 9.6 TFLOPS is the proof;
 a pointer that a device function receives as a parameter keeps the switch until its caller is inlined, which GPU compilers do. Accesses are
-4-byte aligned (`>> 2u`); the `(align 1)` of fibber's accessors is irrelevant here (there is no byte access to be misaligned: a byte load is
+4-byte aligned (`>> 2u`); the `(ALIGN 1)` of fibber's accessors is irrelevant here (there is no byte access to be misaligned: a byte load is
 refused). WebGPU's robust access makes an out-of-range index read 0 and write nothing: the kernel's own bound check (`(when (< i n) ..)`)
 is still the rule, as on CUDA, where the same access is undefined. An i64 offset expression (the `sext` of an i32 index times 4, as
 gpu32.fib writes it) is printed as u32 arithmetic: the one place an i64 appears, and exact for buffers under 4 GB (WebGPU's own limit is
@@ -159,7 +159,7 @@ Err naming the parameter" holds; the PTX path still lacks it.
 ### 3.4 The device assert
 
 WGSL has no trap. A fibber `trap` (and the checked `+`/`*` that overflow, the index check) reaches the kernel module as a call of the
-runtime's trap entry, which the extractor rewrites to `(trap)`. The printer makes it `fibw_trap()`: the private `fibw_trapped` is set, the
+runtime's trap entry, which the extractor rewrites to `(TRAP)`. The printer makes it `fibw_trap()`: the private `fibw_trapped` is set, the
 flag buffer's word is `atomicStore`d to 1, the function returns its type's zero, and every caller returns after a call that may trap. The
 driver zeroes the flag before every dispatch and reads it after the queue completes (`stream-sync`): a set flag is the `:device-trap` Err, the same contract as
 CUDA's `trap;` (gpu.md 3.4), with one difference that is better: the device and its buffers are intact afterwards (CUDA loses the context).
@@ -177,12 +177,12 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
 
 ### 3.6 Block-shared memory, scalar cells, and the uniformity rules (built after GPU-2's lIR forms)
 
-* **Shared memory** (`gpu/shared :f32 N`, GPU-2's `(global shared NAME [N x T] ..)`): a `var<workgroup> fibw_shK: array<u32, N>` at module scope for each
+* **Shared memory** (`gpu/shared :f32 N`, GPU-2's `(GLOBAL SHARED NAME (ARRAY N T) ..)`): a `var<workgroup> fibw_shK: array<u32, N>` at module scope for each
   shared global (WGSL zero-initialises workgroup memory, as the lIR global's `zeroinitializer` says), and a `Ptr` whose `buf` is `16 + K` (`SHARED-BASE`):
   the load/store switch gets a case for each, so a pointer passed to a device function (`load-slices as bs ..`) loads and stores like a storage buffer.
   Only 32-bit words (f32 or i32) are taken; another element type is refused by name. `examples/webgpu/kernels.fib` has GPU-2's shared-memory GEMM over
   i32 (`gemm_smem`, 64x64 tiles, 256 threads, two barriers per slice): it is `gemm`'s result bit for bit on the CPU, CUDA, wgpu-native, Dawn.
-* **Scalar cells.** A kernel may hold `(cell 0.0f32)` (a stack slot, spec/types.md 6.11): the emitter writes `alloca %struct.fib.cell.float`, the
+* **Scalar cells.** A kernel may hold `(cell 0.0f32)` (a stack slot, spec/types.md 6.11): the emitter writes `(ALLOCA (STRUCT fib.cell.float))`, the
   `fib.stack-init`/`fib.stack-end` calls and a `getelementptr` to the value. The printer makes the alloca a `var` of the element type, drops the header and the two calls
   (the functions are not printed), and a `getelementptr` of a cell struct over a cell alloca is the variable itself.
 * **The barrier and WGSL's uniformity analysis.** Dawn's Tint refuses a `workgroupBarrier()` that it cannot prove is in uniform control flow (naga does not).
@@ -191,7 +191,7 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   cannot prove uniform makes everything after the call non-uniform; (2) a function that reaches a barrier makes no early exit after a call that may trap
   (the check reads `fibw_trapped`, a private variable, which Tint takes as non-uniform): the callee's trap exits the callee, the flag is set, the caller goes on
   and the results are void; (3) a branch whose condition is a constant is not printed: the runtime guards a checked division by a constant with
-  `(icmp eq (i32 16) (i32 -1))`, a variable to Tint, and `and`-ed with a test of `local_invocation_id`, which is non-uniform. (1) holds for the
+  `(ICMP EQ (I32 16) (I32 -1))`, a variable to Tint, and `and`-ed with a test of `local_invocation_id`, which is non-uniform. (1) holds for the
   state-machine form only: since GPU-4 a function is printed structured (3.7) and returns where it returns. The rule that remains: a barrier
   in a function whose control flow before it depends on thread-varying data through a `return` or a `trap` path (a thread that leaves before the barrier) is refused by Tint
   (the error is Dawn's, `the WGSL does not compile`, with the line); gpu.md 6.2's checker rule, "a barrier is not under an index-dependent condition", is its
@@ -206,8 +206,8 @@ rounding) and compares with a tolerance, as gpu.md 2.1 derives one for sums in a
   thread left; the old value is the answer): add and sub round once per attempt, so a sum over threads is not deterministic (within n * 2^-24 * sum |x| of the left-to-right
   sum), max and min are exact and ignore a NaN. Refused by name: a 64-bit
   one, an atomic load or store, a cmpxchg whose success flag is used. Verified by naga, Tint and a run on an adapter (gpu-device.sh).
-* **Subgroups** (GPU-5, native/wgsl/subgroup.fib, the forms of spec/lir.md 6.9a): lIR's `(shfl-down v lane)` `shfl-up` `shfl-xor` `shfl-idx` are `subgroupShuffleDown`,
-  `subgroupShuffleUp`, `subgroupShuffleXor` and `subgroupShuffle`, `(ballot c)` is `bitcast<i32>(subgroupBallot(c).x)` (lanes 0 to 31), `(sreg laneid)` and `(sreg warpsize)` are the
+* **Subgroups** (GPU-5, native/wgsl/subgroup.fib, the forms of spec/lir.md 6.9a): lIR's `(SHFL-DOWN v lane)` `shfl-up` `shfl-xor` `shfl-idx` are `subgroupShuffleDown`,
+  `subgroupShuffleUp`, `subgroupShuffleXor` and `subgroupShuffle`, `(BALLOT c)` is `bitcast<i32>(subgroupBallot(c).x)` (lanes 0 to 31), `(SREG laneid)` and `(SREG warpsize)` are the
   entry builtins `subgroup_invocation_id` and `subgroup_size`, copied by the entry into two private variables (`fibw_lane`, `fibw_sgs`). A module that uses any prints `enable subgroups;`,
   `diagnostic(off, subgroup_uniformity);` (Tint takes the builtins read through a private variable as non-uniform and refuses every shuffle in a loop on `subgroup_size`; the contract
   that all lanes of the warp call together is the library's, as `shfl.sync`'s full mask is on PTX) and the header line `// fib.requires: subgroups`; a module that uses none prints none of

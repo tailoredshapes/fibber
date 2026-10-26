@@ -12,29 +12,29 @@
 
 ;; Version `tag`: x*1000 + tag after `work` dependent multiplications (so a call is long enough to be inside when a swap lands).
 (defun body-source (name: str tag: i64 work: i64) -> str
-  (str "(define (" name " i64) ((i64 x))\n"
-       "  (block entry (br loop))\n"
-       "  (block loop (let ((i (phi i64 (entry (i64 0)) (loop i2))) (acc (phi i64 (entry x) (loop acc2))))\n"
-       "    (let ((i2 (add i (i64 1))) (acc2 (add (mul acc (i64 3)) (i64 1))))\n"
-       "      (br (icmp slt i2 (i64 " work ")) loop done))))\n"
-       "  (block done (ret (add (mul x (i64 1000)) (select (icmp eq acc2 (i64 123456789)) (i64 999) (i64 " tag "))))))\n"))
+  (str "(DEFINE (" name " I64) ((I64 x))\n"
+       "  (BLOCK entry (BR loop))\n"
+       "  (BLOCK loop (LET ((i (PHI I64 (entry (I64 0)) (loop i2))) (acc (PHI I64 (entry x) (loop acc2))))\n"
+       "    (LET ((i2 (ADD i (I64 1))) (acc2 (ADD (MUL acc (I64 3)) (I64 1))))\n"
+       "      (BR (ICMP SLT i2 (I64 " work ")) loop done))))\n"
+       "  (BLOCK done (RET (ADD (MUL x (I64 1000)) (SELECT (ICMP EQ acc2 (I64 123456789)) (I64 999) (I64 " tag "))))))\n"))
 
 ;; The worker: calls `callee` with 7 until the record's word 0 is set; words 1 bad, 2 calls, 3 changes, 4 last tag.
 (defun worker-source (fname: str callee: str) -> str
-  (str "(declare " callee " i64 (i64))\n"
-       "(define (" fname " ptr) ((ptr rec))\n"
-       "  (block entry (br loop))\n"
-       "  (block loop (br (icmp ne (atomic-load seq_cst i64 rec) (i64 0)) done body))\n"
-       "  (block body\n"
-       "    (let ((r (call @" callee " (i64 7))) (tag (sub r (i64 7000))) (calls (getelementptr i64 rec (i64 2))))\n"
-       "      (store (add (load i64 calls) (i64 1)) calls)\n"
-       "      (br (or (icmp eq tag (i64 1)) (icmp eq tag (i64 2))) ok bad)))\n"
-       "  (block bad (let ((p (getelementptr i64 rec (i64 1)))) (store (add (load i64 p) (i64 1)) p) (br loop)))\n"
-       "  (block ok (let ((lastp (getelementptr i64 rec (i64 4))) (last (load i64 lastp)))\n"
-       "    (store tag lastp)\n"
-       "    (br (icmp ne last tag) changed loop)))\n"
-       "  (block changed (let ((ch (getelementptr i64 rec (i64 3)))) (store (add (load i64 ch) (i64 1)) ch) (br loop)))\n"
-       "  (block done (ret (ptr null))))\n"))
+  (str "(DECLARE " callee " I64 (I64))\n"
+       "(DEFINE (" fname " PTR) ((PTR rec))\n"
+       "  (BLOCK entry (BR loop))\n"
+       "  (BLOCK loop (BR (ICMP NE (ATOMIC-LOAD SEQ_CST I64 rec) (I64 0)) done body))\n"
+       "  (BLOCK body\n"
+       "    (LET ((r (CALL (GLOBAL " callee ") (I64 7))) (tag (SUB r (I64 7000))) (calls (GETELEMENTPTR I64 rec (I64 2))))\n"
+       "      (STORE (ADD (LOAD I64 calls) (I64 1)) calls)\n"
+       "      (BR (OR (ICMP EQ tag (I64 1)) (ICMP EQ tag (I64 2))) ok bad)))\n"
+       "  (BLOCK bad (LET ((p (GETELEMENTPTR I64 rec (I64 1)))) (STORE (ADD (LOAD I64 p) (I64 1)) p) (BR loop)))\n"
+       "  (BLOCK ok (LET ((lastp (GETELEMENTPTR I64 rec (I64 4))) (last (LOAD I64 lastp)))\n"
+       "    (STORE tag lastp)\n"
+       "    (BR (ICMP NE last tag) changed loop)))\n"
+       "  (BLOCK changed (LET ((ch (GETELEMENTPTR I64 rec (I64 3)))) (STORE (ADD (LOAD I64 ch) (I64 1)) ch) (BR loop)))\n"
+       "  (BLOCK done (RET (PTR NULL))))\n"))
 
 (defstruct Thread (tid: ptr rec: ptr))
 
@@ -58,8 +58,8 @@
 ;; y*1000 + 2, right only when the register of the missing argument happens to hold 7: an answer of x*1000 + 2 + y was right whenever
 ;; it held 0, which it does at the workers' call on arm64 (the planted fault `skip-check` was not red on a Mac).
 (defun mismatched-source (work: i64) -> str
-  (str "(define (handler i64) ((i64 x) (i64 y))\n"
-       "  (block entry (ret (add (mul y (i64 1000)) (i64 2)))))\n"))
+  (str "(DEFINE (handler I64) ((I64 x) (I64 y))\n"
+       "  (BLOCK entry (RET (ADD (MUL y (I64 1000)) (I64 2)))))\n"))
 
 ;; Swaps `handler` `swaps` times between the two bodies while `threads` workers call it; the counts. With `direct`, the workers call a
 ;; resident copy of body 1 directly (no stub), for the cost of the stub against a plain call. With `mismatch`, body 2 has another signature.

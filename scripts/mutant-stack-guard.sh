@@ -27,12 +27,12 @@ export TMPDIR=$OUT/tmp
 cp -r "$R/compiler" "$R/lib" "$OUT/tree/"; cp -r "$R/cases/stdlib" "$OUT/tree/cases/"
 f=$OUT/tree/compiler/emit/runtime.fib
 case $MODE in
-  no-handler)    perl -0pi -e 's/\(call \@sigaction \(i32 11\) sa old\)/(add (i32 0) (i32 0))/' "$f"; must="8350 8351 8352 8354" ;;
-  no-altstack)   perl -0pi -e 's/\(br \(icmp ne \(call \@sigaltstack ss \(ptr null\)\) \(i32 0\)\) undo out\)/(br out)/' "$f"; must="8350 8351 8352 8354" ;;
-  no-task-guard) perl -0pi -e 's/\(call \@fib\.guard-enter \(load i64 \@fib\.thread-stack\)\)\n    \(ret\)/(ret)/' "$f"; must="8351" ;;
-  any-fault)     perl -0pi -e 's/\(icmp ult \(sub addr \(sub lo w\)\) \(shl w \(i64 1\)\)\) overflow unknown/(icmp eq (i64 0) (i64 0)) overflow unknown/' "$f"; must="8354" ;;
-  window)        perl -0pi -e 's/\(global internal fib\.guard-window i64 \(i64 1048576\)\)/(global internal fib.guard-window i64 (i64 0))/' "$f"; must="8350 8351 8352 8354" ;;
-  no-main-stack) perl -0pi -e 's/\(block default \(ret \(i64 256\)\)\)/(block default (ret (i64 0)))/' "$f"; must="8353" ;;
+  no-handler)    perl -0pi -e 's/\(CALL \(GLOBAL sigaction\) \(I32 11\) sa old\)/(ADD (I32 0) (I32 0))/' "$f"; must="8350 8351 8352 8354" ;;
+  no-altstack)   perl -0pi -e 's/\(BR \(ICMP NE \(CALL \(GLOBAL sigaltstack\) ss \(PTR NULL\)\) \(I32 0\)\) undo out\)/(BR out)/' "$f"; must="8350 8351 8352 8354" ;;
+  no-task-guard) perl -0pi -e 's/\(CALL \(GLOBAL fib\.guard-enter\) \(LOAD I64 \(GLOBAL fib\.thread-stack\)\)\)\n    \(RET\)/(RET)/' "$f"; must="8351" ;;
+  any-fault)     perl -0pi -e 's/\(ICMP ULT \(SUB addr \(SUB lo w\)\) \(SHL w \(I64 1\)\)\) overflow unknown/(ICMP EQ (I64 0) (I64 0)) overflow unknown/' "$f"; must="8354" ;;
+  window)        perl -0pi -e 's/\(GLOBAL INTERNAL fib\.guard-window I64 \(I64 1048576\)\)/(GLOBAL INTERNAL fib.guard-window I64 (I64 0))/' "$f"; must="8350 8351 8352 8354" ;;
+  no-main-stack) perl -0pi -e 's/\(BLOCK default \(RET \(I64 256\)\)\)/(BLOCK default (RET (I64 0)))/' "$f"; must="8353" ;;
   *) echo "mutant-stack-guard: unknown MODE $MODE" >&2; exit 2 ;;
 esac
 cmp -s "$f" "$R/compiler/emit/runtime.fib" && { echo "mutant-stack-guard: the mutation changed nothing" >&2; exit 2; }

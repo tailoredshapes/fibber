@@ -84,14 +84,14 @@ emit src/main.fib plain: rc=0 8.49 s, 11537 lines        live: rc=0 8.43 s, 1293
 emit specs/contract-spec.fib plain: rc=0 18.29 s, 16152 lines   live: rc=0 18.84 s, 17756 lines   defines plain 10171, live 10973
 ```
 
-Unique slots (`@live.NAME` in the live lIR), by the module's first segment:
+Unique slots (`(GLOBAL live.NAME)` in the live lIR), by the module's first segment:
 
 | program | slots | hocon | lacewing | meshql | postgres | sqlite | gherkin | cert | `fib.*` protocol methods of program types | main, serve |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `src/main.fib` (the server) | 700 | 218 | 171 | 151 | 117 | 29 | | | 12 (`Eq` for lacewing's types, `Connection` for `sqlite`/`postgres`) | 2 |
 | `specs/contract-spec.fib` | 802 | | 171 | 133 | 117 | 29 | 297 | 42 | 12 | 1 |
 
-Of the server's 8,309 live-mode definitions, 700 are stubs (one `(global internal live.f.X ptr @f.X.g0)` and one stub body each: 8.4% of
+Of the server's 8,309 live-mode definitions, 700 are stubs (one `(GLOBAL INTERNAL live.f.X PTR (GLOBAL f.X.g0))` and one stub body each: 8.4% of
 the definitions, 12% of the lines) and 18 of them are `.owned` twins (a named function used as a value). 1,875 `f.fib.*` bodies (the
 library and fib-crypto-openssl) are plain. The lIR of plain `fibc run` is unchanged by live mode existing (LV0's golden holds that).
 
@@ -578,8 +578,8 @@ every second in the background, all 200 or 404/410, none refused). What it does 
   a call of a scenario `run` of the base's `specs`: the crash; `specs` itself swapped from a scenario of three `given` bindings to one
   of one crashed the same way, and from one to three answered `no match clause matched`. A function returning plain closures
   (`(let ((a x)) (fn () a))` swapped to three captures and back) did not reproduce it. The cause was not the closures: the `expect`
-  macro quotes its form (`(then-line (quote ..))`), and a quoted form is a constant `@q.N` numbered per program (emit.program
-  `program-fresh-quote`), like `@clo.N` and `@vt.N` and unlike `@str.N`. LV3's split of a swap's cut (serve.livesplit) exported every
+  macro quotes its form (`(then-line (quote ..))`), and a quoted form is a constant `(GLOBAL q.N)` numbered per program (emit.program
+  `program-fresh-quote`), like `(GLOBAL clo.N)` and `(GLOBAL vt.N)` and unlike `(GLOBAL str.N)`. LV3's split of a swap's cut (serve.livesplit) exported every
   global that was not the generation's code into the session's base, `q.N` among them, so the next input's cut declared its own `q.N`
   (another form, of another shape) from the base instead of copying it: the base's `specs`, pruned out of the base (`main` does not
   reach it) and first lowered by that input, read program 2's `q.8` as its own. The fix: `emit.statics/program-static?` names the

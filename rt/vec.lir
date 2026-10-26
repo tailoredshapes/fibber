@@ -7,152 +7,152 @@
 ;; level's arrays and nodes, then the VecOf. Elements are esize bytes;
 ;; counted is 0 for scalars, 1 for pointers (retained into the new
 ;; arrays), 2 for two-word dyn values (their first word retained).
-(defstruct fib.vecof (i64 i32 i32 i32 i64 i64 ptr ptr))
-(defstruct fib.vnode (i64 i32 i32 i32 ptr))
+(DEFSTRUCT fib.vecof (I64 I32 I32 I32 I64 I64 PTR PTR))
+(DEFSTRUCT fib.vnode (I64 I32 I32 I32 PTR))
 
-(define internal (fib.vec-len i64) ((ptr v))
-  (block entry (br (icmp eq (load i32 (getelementptr %struct.fib.vecof v (i32 0) (i32 3))) (i32 0)) empty of))
-  (block empty (ret (i64 0)))
-  (block of (ret (load i64 (getelementptr %struct.fib.vecof v (i32 0) (i32 4))))))
+(DEFINE INTERNAL (fib.vec-len I64) ((PTR v))
+  (BLOCK entry (BR (ICMP EQ (LOAD I32 (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 3))) (I32 0)) empty of))
+  (BLOCK empty (RET (I64 0)))
+  (BLOCK of (RET (LOAD I64 (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 4))))))
 
-(define internal (fib.array-elem ptr) ((ptr a) (i64 i) (i64 esize))
-  (block entry
-    (ret (getelementptr i8 (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (mul i esize)))))
+(DEFINE INTERNAL (fib.array-elem PTR) ((PTR a) (I64 i) (I64 esize))
+  (BLOCK entry
+    (RET (GETELEMENTPTR I8 (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 4) (I64 0)) (MUL i esize)))))
 
 ;; The address of element i of a non-empty vector, i < cnt.
-(define internal (fib.vec-elem-ptr ptr) ((ptr v) (i64 i) (i64 esize))
-  (block entry
-    (let ((cnt (load i64 (getelementptr %struct.fib.vecof v (i32 0) (i32 4))))
-          (tail (load ptr (getelementptr %struct.fib.vecof v (i32 0) (i32 7))))
-          (tailoff (sub cnt (call @fib.array-len tail))))
-      (br (icmp sge i tailoff) intail intrie)))
-  (block intail (ret (call @fib.array-elem tail (sub i tailoff) esize)))
-  (block intrie
-    (let ((root (load ptr (getelementptr %struct.fib.vecof v (i32 0) (i32 6))))
-          (shift (load i64 (getelementptr %struct.fib.vecof v (i32 0) (i32 5)))))
-      (br walk)))
-  (block walk
-    (let ((node (phi ptr (intrie root) (down kid)))
-          (level (phi i64 (intrie shift) (down level2)))
-          (arr (load ptr (getelementptr %struct.fib.vnode node (i32 0) (i32 4))))
-          (leaf (icmp eq (load i32 (getelementptr %struct.fib.vnode node (i32 0) (i32 3))) (i32 0))))
-      (br leaf atleaf down)))
-  (block atleaf (ret (call @fib.array-elem arr (and i (i64 31)) esize)))
-  (block down
-    (let ((kid (load ptr (call @fib.array-elem arr (and (lshr i level) (i64 31)) (i64 8))))
-          (level2 (sub level (i64 5))))
-      (br walk))))
+(DEFINE INTERNAL (fib.vec-elem-ptr PTR) ((PTR v) (I64 i) (I64 esize))
+  (BLOCK entry
+    (LET ((cnt (LOAD I64 (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 4))))
+          (tail (LOAD PTR (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 7))))
+          (tailoff (SUB cnt (CALL (GLOBAL fib.array-len) tail))))
+      (BR (ICMP SGE i tailoff) intail intrie)))
+  (BLOCK intail (RET (CALL (GLOBAL fib.array-elem) tail (SUB i tailoff) esize)))
+  (BLOCK intrie
+    (LET ((root (LOAD PTR (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 6))))
+          (shift (LOAD I64 (GETELEMENTPTR (STRUCT fib.vecof) v (I32 0) (I32 5)))))
+      (BR walk)))
+  (BLOCK walk
+    (LET ((node (PHI PTR (intrie root) (down kid)))
+          (level (PHI I64 (intrie shift) (down level2)))
+          (arr (LOAD PTR (GETELEMENTPTR (STRUCT fib.vnode) node (I32 0) (I32 4))))
+          (leaf (ICMP EQ (LOAD I32 (GETELEMENTPTR (STRUCT fib.vnode) node (I32 0) (I32 3))) (I32 0))))
+      (BR leaf atleaf down)))
+  (BLOCK atleaf (RET (CALL (GLOBAL fib.array-elem) arr (AND i (I64 31)) esize)))
+  (BLOCK down
+    (LET ((kid (LOAD PTR (CALL (GLOBAL fib.array-elem) arr (AND (LSHR i level) (I64 31)) (I64 8))))
+          (level2 (SUB level (I64 5))))
+      (BR walk))))
 
 ;; Retains the element at p (counted 1: a pointer; 2: a dyn's object).
-(define internal (fib.retain-elem void) ((ptr p) (i8 counted))
-  (block entry (br (icmp eq counted (i8 0)) done yes))
-  (block yes (call @fib.retain (load ptr p)) (br done))
-  (block done (ret)))
+(DEFINE INTERNAL (fib.retain-elem VOID) ((PTR p) (I8 counted))
+  (BLOCK entry (BR (ICMP EQ counted (I8 0)) done yes))
+  (BLOCK yes (CALL (GLOBAL fib.retain) (LOAD PTR p)) (BR done))
+  (BLOCK done (RET)))
 
 ;; A fresh array of the n elements of v from index from on, each
 ;; retained.
-(define internal (fib.vec-slice-array ptr) ((ptr v) (i64 from) (i64 n) (i64 esize) (i8 counted) (i32 tid))
-  (block entry
-    (let ((a (call @fib.array-alloc n tid esize)))
-      (br loop)))
-  (block loop
-    (let ((i (phi i64 (entry (i64 0)) (body i2))))
-      (br (icmp slt i n) body done)))
-  (block body
-    (let ((src (call @fib.vec-elem-ptr v (add from i) esize))
-          (dst (call @fib.array-elem a i esize))
-          (i2 (add i (i64 1))))
-      (call @memcpy dst src esize)
-      (call @fib.retain-elem dst counted)
-      (br loop)))
-  (block done (ret a)))
+(DEFINE INTERNAL (fib.vec-slice-array PTR) ((PTR v) (I64 from) (I64 n) (I64 esize) (I8 counted) (I32 tid))
+  (BLOCK entry
+    (LET ((a (CALL (GLOBAL fib.array-alloc) n tid esize)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (body i2))))
+      (BR (ICMP SLT i n) body done)))
+  (BLOCK body
+    (LET ((src (CALL (GLOBAL fib.vec-elem-ptr) v (ADD from i) esize))
+          (dst (CALL (GLOBAL fib.array-elem) a i esize))
+          (i2 (ADD i (I64 1))))
+      (CALL (GLOBAL memcpy) dst src esize)
+      (CALL (GLOBAL fib.retain-elem) dst counted)
+      (BR loop)))
+  (BLOCK done (RET a)))
 
 ;; A VNode of the variant holding arr (consumed).
-(define internal (fib.vnode-new ptr) ((i32 variant) (ptr arr) (i32 tid))
-  (block entry
-    (let ((n (call @fib.alloc (call @fib.size-of tid) tid)))
-      (store variant (getelementptr %struct.fib.vnode n (i32 0) (i32 3)))
-      (store arr (getelementptr %struct.fib.vnode n (i32 0) (i32 4)))
-      (ret n))))
+(DEFINE INTERNAL (fib.vnode-new PTR) ((I32 variant) (PTR arr) (I32 tid))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.alloc) (CALL (GLOBAL fib.size-of) tid) tid)))
+      (STORE variant (GETELEMENTPTR (STRUCT fib.vnode) n (I32 0) (I32 3)))
+      (STORE arr (GETELEMENTPTR (STRUCT fib.vnode) n (I32 0) (I32 4)))
+      (RET n))))
 
 ;; (fib.vec-drop v k ..): the vector of v's elements from k on.
-(define internal (fib.vec-drop ptr) ((ptr v) (i64 k) (i64 esize) (i8 counted) (i32 tvec) (i32 tnode) (i32 tarr) (i32 tnarr))
-  (block entry
-    (let ((len (call @fib.vec-len v))
-          (k2 (select (icmp sgt k len) len k))
-          (n (sub len k2)))
-      (br (icmp eq n (i64 0)) empty some)))
-  (block empty
-    (let ((e (call @fib.alloc (call @fib.size-of tvec) tvec)))
-      (store (i32 0) (getelementptr %struct.fib.vecof e (i32 0) (i32 3)))
-      (ret e)))
-  (block some
+(DEFINE INTERNAL (fib.vec-drop PTR) ((PTR v) (I64 k) (I64 esize) (I8 counted) (I32 tvec) (I32 tnode) (I32 tarr) (I32 tnarr))
+  (BLOCK entry
+    (LET ((len (CALL (GLOBAL fib.vec-len) v))
+          (k2 (SELECT (ICMP SGT k len) len k))
+          (n (SUB len k2)))
+      (BR (ICMP EQ n (I64 0)) empty some)))
+  (BLOCK empty
+    (LET ((e (CALL (GLOBAL fib.alloc) (CALL (GLOBAL fib.size-of) tvec) tvec)))
+      (STORE (I32 0) (GETELEMENTPTR (STRUCT fib.vecof) e (I32 0) (I32 3)))
+      (RET e)))
+  (BLOCK some
     ;; split = n - ((n - 1) % 32 + 1): the elements before the tail.
-    (let ((split (sub n (add (srem (sub n (i64 1)) (i64 32)) (i64 1))))
-          (tail (call @fib.vec-slice-array v (add k2 split) (sub n split) esize counted tarr)))
-      (br (icmp eq split (i64 0)) noroot leaves)))
-  (block noroot
-    (ret (call @fib.vecof-new n (i64 5) (ptr null) tail tvec)))
+    (LET ((split (SUB n (ADD (SREM (SUB n (I64 1)) (I64 32)) (I64 1))))
+          (tail (CALL (GLOBAL fib.vec-slice-array) v (ADD k2 split) (SUB n split) esize counted tarr)))
+      (BR (ICMP EQ split (I64 0)) noroot leaves)))
+  (BLOCK noroot
+    (RET (CALL (GLOBAL fib.vecof-new) n (I64 5) (PTR NULL) tail tvec)))
   ;; The leaves: one array and one VLeaf per 32 elements, kept in a
   ;; scratch array of node pointers.
-  (block leaves
-    (let ((nleaves (sdiv split (i64 32)))
-          (scratch (call @malloc (mul nleaves (i64 8)))))
-      (br lloop)))
-  (block lloop
-    (let ((li (phi i64 (leaves (i64 0)) (lbody li2))))
-      (br (icmp slt li nleaves) lbody levels)))
-  (block lbody
-    (let ((arr (call @fib.vec-slice-array v (add k2 (mul li (i64 32))) (i64 32) esize counted tarr))
-          (node (call @fib.vnode-new (i32 0) arr tnode))
-          (li2 (add li (i64 1))))
-      (store node (getelementptr ptr scratch li))
-      (br lloop)))
+  (BLOCK leaves
+    (LET ((nleaves (SDIV split (I64 32)))
+          (scratch (CALL (GLOBAL malloc) (MUL nleaves (I64 8)))))
+      (BR lloop)))
+  (BLOCK lloop
+    (LET ((li (PHI I64 (leaves (I64 0)) (lbody li2))))
+      (BR (ICMP SLT li nleaves) lbody levels)))
+  (BLOCK lbody
+    (LET ((arr (CALL (GLOBAL fib.vec-slice-array) v (ADD k2 (MUL li (I64 32))) (I64 32) esize counted tarr))
+          (node (CALL (GLOBAL fib.vnode-new) (I32 0) arr tnode))
+          (li2 (ADD li (I64 1))))
+      (STORE node (GETELEMENTPTR PTR scratch li))
+      (BR lloop)))
   ;; The levels: group the nodes by 32 into VBranches until one is left.
-  (block levels
-    (let ((count (phi i64 (lloop nleaves) (lnext up)))
-          (shift (phi i64 (lloop (i64 5)) (lnext shift2)))
-          (groups (sdiv (add count (i64 31)) (i64 32))))
-      (br gloop)))
-  (block gloop
-    (let ((gi (phi i64 (levels (i64 0)) (kdone gi2))))
-      (br (icmp slt gi groups) gbody lnext)))
-  (block gbody
-    (let ((start (mul gi (i64 32)))
-          (m (select (icmp slt (sub count start) (i64 32)) (sub count start) (i64 32)))
-          (karr (call @fib.array-alloc m tnarr (i64 8))))
-      (br kloop)))
-  (block kloop
-    (let ((ki (phi i64 (gbody (i64 0)) (kbody ki2))))
-      (br (icmp slt ki m) kbody kdone)))
-  (block kbody
+  (BLOCK levels
+    (LET ((count (PHI I64 (lloop nleaves) (lnext up)))
+          (shift (PHI I64 (lloop (I64 5)) (lnext shift2)))
+          (groups (SDIV (ADD count (I64 31)) (I64 32))))
+      (BR gloop)))
+  (BLOCK gloop
+    (LET ((gi (PHI I64 (levels (I64 0)) (kdone gi2))))
+      (BR (ICMP SLT gi groups) gbody lnext)))
+  (BLOCK gbody
+    (LET ((start (MUL gi (I64 32)))
+          (m (SELECT (ICMP SLT (SUB count start) (I64 32)) (SUB count start) (I64 32)))
+          (karr (CALL (GLOBAL fib.array-alloc) m tnarr (I64 8))))
+      (BR kloop)))
+  (BLOCK kloop
+    (LET ((ki (PHI I64 (gbody (I64 0)) (kbody ki2))))
+      (BR (ICMP SLT ki m) kbody kdone)))
+  (BLOCK kbody
     ;; The node moves into the array: retained by the store, released
     ;; as the interpreter's give_back does; the two cancel.
-    (let ((kid (load ptr (getelementptr ptr scratch (add start ki))))
-          (ki2 (add ki (i64 1))))
-      (store kid (call @fib.array-elem karr ki (i64 8)))
-      (br kloop)))
-  (block kdone
-    (let ((branch (call @fib.vnode-new (i32 1) karr tnode))
-          (gi2 (add gi (i64 1))))
-      (store branch (getelementptr ptr scratch gi))
-      (br gloop)))
-  (block lnext
-    (let ((up groups)
-          (shift2 (add shift (i64 5))))
-      (br (icmp eq groups (i64 1)) rooted levels)))
-  (block rooted
-    (let ((root (load ptr (getelementptr ptr scratch (i64 0)))))
-      (call @free scratch)
-      (ret (call @fib.vecof-new n shift root tail tvec)))))
+    (LET ((kid (LOAD PTR (GETELEMENTPTR PTR scratch (ADD start ki))))
+          (ki2 (ADD ki (I64 1))))
+      (STORE kid (CALL (GLOBAL fib.array-elem) karr ki (I64 8)))
+      (BR kloop)))
+  (BLOCK kdone
+    (LET ((branch (CALL (GLOBAL fib.vnode-new) (I32 1) karr tnode))
+          (gi2 (ADD gi (I64 1))))
+      (STORE branch (GETELEMENTPTR PTR scratch gi))
+      (BR gloop)))
+  (BLOCK lnext
+    (LET ((up groups)
+          (shift2 (ADD shift (I64 5))))
+      (BR (ICMP EQ groups (I64 1)) rooted levels)))
+  (BLOCK rooted
+    (LET ((root (LOAD PTR (GETELEMENTPTR PTR scratch (I64 0)))))
+      (CALL (GLOBAL free) scratch)
+      (RET (CALL (GLOBAL fib.vecof-new) n shift root tail tvec)))))
 
 ;; A VecOf (cnt shift root tail), root and tail consumed.
-(define internal (fib.vecof-new ptr) ((i64 cnt) (i64 shift) (ptr root) (ptr tail) (i32 tvec))
-  (block entry
-    (let ((o (call @fib.alloc (call @fib.size-of tvec) tvec)))
-      (store (i32 1) (getelementptr %struct.fib.vecof o (i32 0) (i32 3)))
-      (store cnt (getelementptr %struct.fib.vecof o (i32 0) (i32 4)))
-      (store shift (getelementptr %struct.fib.vecof o (i32 0) (i32 5)))
-      (store root (getelementptr %struct.fib.vecof o (i32 0) (i32 6)))
-      (store tail (getelementptr %struct.fib.vecof o (i32 0) (i32 7)))
-      (ret o))))
+(DEFINE INTERNAL (fib.vecof-new PTR) ((I64 cnt) (I64 shift) (PTR root) (PTR tail) (I32 tvec))
+  (BLOCK entry
+    (LET ((o (CALL (GLOBAL fib.alloc) (CALL (GLOBAL fib.size-of) tvec) tvec)))
+      (STORE (I32 1) (GETELEMENTPTR (STRUCT fib.vecof) o (I32 0) (I32 3)))
+      (STORE cnt (GETELEMENTPTR (STRUCT fib.vecof) o (I32 0) (I32 4)))
+      (STORE shift (GETELEMENTPTR (STRUCT fib.vecof) o (I32 0) (I32 5)))
+      (STORE root (GETELEMENTPTR (STRUCT fib.vecof) o (I32 0) (I32 6)))
+      (STORE tail (GETELEMENTPTR (STRUCT fib.vecof) o (I32 0) (I32 7)))
+      (RET o))))

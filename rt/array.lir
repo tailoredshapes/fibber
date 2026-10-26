@@ -5,60 +5,60 @@
 ;; A fresh array of n elements of esize bytes, of type id tid; the
 ;; elements are the caller's to fill. A negative n traps as the
 ;; interpreter does (eval/arrays.rs).
-(define internal (fib.array-alloc ptr) ((i64 n) (i32 tid) (i64 esize))
-  (block entry (br (icmp slt n (i64 0)) bad ok))
-  (block bad
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "array of negative length %lld") n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block ok
-    (let ((a (call @fib.alloc (add (i64 24) (mul n esize)) tid)))
-      (store n (getelementptr %struct.fib.array.i8 a (i32 0) (i32 3)))
-      (ret a))))
+(DEFINE INTERNAL (fib.array-alloc PTR) ((I64 n) (I32 tid) (I64 esize))
+  (BLOCK entry (BR (ICMP SLT n (I64 0)) bad ok))
+  (BLOCK bad
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "array of negative length %lld") n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK ok
+    (LET ((a (CALL (GLOBAL fib.alloc) (ADD (I64 24) (MUL n esize)) tid)))
+      (STORE n (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 3)))
+      (RET a))))
 
-(define internal (fib.array-len i64) ((ptr a))
-  (block entry (ret (load i64 (getelementptr %struct.fib.array.i8 a (i32 0) (i32 3))))))
+(DEFINE INTERNAL (fib.array-len I64) ((PTR a))
+  (BLOCK entry (RET (LOAD I64 (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 3))))))
 
 ;; The elements [i, j) of a as a fresh array (array-copy), not yet
 ;; retained; out of range traps with the interpreter's message.
-(define internal (fib.array-slice ptr) ((ptr a) (i64 i) (i64 j) (i32 tid) (i64 esize))
-  (block entry
-    (let ((n (call @fib.array-len a))
-          (bad (or (icmp slt i (i64 0)) (or (icmp sgt i j) (icmp sgt j n)))))
-      (br bad range ok)))
-  (block range
-    (let ((buf (alloca i8 (i32 96)))
-          (len (call @snprintf buf (i64 96) (string "array-copy [%lld, %lld) out of range 0..%lld") i j n)))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block ok
-    (let ((m (sub j i))
-          (r (call @fib.array-alloc m tid esize))
-          (src (getelementptr i8 (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (mul i esize)))
-          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0))))
-      (call @memcpy dst src (mul m esize))
-      (ret r))))
+(DEFINE INTERNAL (fib.array-slice PTR) ((PTR a) (I64 i) (I64 j) (I32 tid) (I64 esize))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.array-len) a))
+          (bad (OR (ICMP SLT i (I64 0)) (OR (ICMP SGT i j) (ICMP SGT j n)))))
+      (BR bad range ok)))
+  (BLOCK range
+    (LET ((buf (ALLOCA I8 (I32 96)))
+          (len (CALL (GLOBAL snprintf) buf (I64 96) (STRING "array-copy [%lld, %lld) out of range 0..%lld") i j n)))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK ok
+    (LET ((m (SUB j i))
+          (r (CALL (GLOBAL fib.array-alloc) m tid esize))
+          (src (GETELEMENTPTR I8 (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 4) (I64 0)) (MUL i esize)))
+          (dst (GETELEMENTPTR (STRUCT fib.array.i8) r (I32 0) (I32 4) (I64 0))))
+      (CALL (GLOBAL memcpy) dst src (MUL m esize))
+      (RET r))))
 
 ;; `array-blit!` (spec/types.md 2.13.3): n elements of src from si into dst from di, in place (dst is the unique array the compiler
 ;; made of the cell). Any index or count outside either array traps, nothing is written. memmove: src may be dst.
-(define internal (fib.array-blit void) ((ptr dst) (i64 di) (ptr src) (i64 si) (i64 n) (i64 esize))
-  (block entry
-    (let ((dn (call @fib.array-len dst)) (sn (call @fib.array-len src))
-          (bad (or (or (icmp slt di (i64 0)) (icmp slt si (i64 0)))
-                   (or (icmp slt n (i64 0)) (or (icmp sgt n (sub dn di)) (icmp sgt n (sub sn si)))))))
-      (br bad range ok)))
-  (block range
-    (let ((buf (alloca i8 (i32 128)))
-          (len (call @snprintf buf (i64 128) (string "array-blit! of %lld elements at dst %lld (of %lld) from src %lld (of %lld) is out of range")
-                     n di (call @fib.array-len dst) si (call @fib.array-len src))))
-      (call @fib.trap-bytes buf (sext i64 len))
-      (unreachable)))
-  (block ok
-    (let ((d (getelementptr i8 (getelementptr %struct.fib.array.i8 dst (i32 0) (i32 4) (i64 0)) (mul di esize)))
-          (s (getelementptr i8 (getelementptr %struct.fib.array.i8 src (i32 0) (i32 4) (i64 0)) (mul si esize))))
-      (call @memmove d s (mul n esize))
-      (ret))))
+(DEFINE INTERNAL (fib.array-blit VOID) ((PTR dst) (I64 di) (PTR src) (I64 si) (I64 n) (I64 esize))
+  (BLOCK entry
+    (LET ((dn (CALL (GLOBAL fib.array-len) dst)) (sn (CALL (GLOBAL fib.array-len) src))
+          (bad (OR (OR (ICMP SLT di (I64 0)) (ICMP SLT si (I64 0)))
+                   (OR (ICMP SLT n (I64 0)) (OR (ICMP SGT n (SUB dn di)) (ICMP SGT n (SUB sn si)))))))
+      (BR bad range ok)))
+  (BLOCK range
+    (LET ((buf (ALLOCA I8 (I32 128)))
+          (len (CALL (GLOBAL snprintf) buf (I64 128) (STRING "array-blit! of %lld elements at dst %lld (of %lld) from src %lld (of %lld) is out of range")
+                     n di (CALL (GLOBAL fib.array-len) dst) si (CALL (GLOBAL fib.array-len) src))))
+      (CALL (GLOBAL fib.trap-bytes) buf (SEXT I64 len))
+      (UNREACHABLE)))
+  (BLOCK ok
+    (LET ((d (GETELEMENTPTR I8 (GETELEMENTPTR (STRUCT fib.array.i8) dst (I32 0) (I32 4) (I64 0)) (MUL di esize)))
+          (s (GETELEMENTPTR I8 (GETELEMENTPTR (STRUCT fib.array.i8) src (I32 0) (I32 4) (I64 0)) (MUL si esize))))
+      (CALL (GLOBAL memmove) d s (MUL n esize))
+      (RET))))
 
 ;; `array-push!` (in-place-update.md §2): a copy of a with room for 32 elements
 ;; (the vector tail's whole range), the elements not yet retained. ROOMY (flag
@@ -72,41 +72,41 @@
 ;; place while len is below 32, or is not a power of two; at a power of two the next push copies into a block of twice the
 ;; room (amortised constant time per push, LIBFIX-1: an array of 32 or more elements used to get exactly one more element
 ;; per copy, so a loop of pushes was quadratic). A pop only shortens len, so the block always has at least that capacity.
-(define internal (fib.array-cap i64) ((i64 n))
-  (block entry (br loop))
-  (block loop
-    (let ((c (phi i64 (entry (i64 32)) (step c1))))
-      (br (icmp ult c n) step done)))
-  (block step
-    (let ((c1 (shl c (i64 1))))
-      (br loop)))
-  (block done (ret c)))
+(DEFINE INTERNAL (fib.array-cap I64) ((I64 n))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((c (PHI I64 (entry (I64 32)) (step c1))))
+      (BR (ICMP ULT c n) step done)))
+  (BLOCK step
+    (LET ((c1 (SHL c (I64 1))))
+      (BR loop)))
+  (BLOCK done (RET c)))
 
-(define internal (fib.array-room ptr) ((ptr a) (i32 tid) (i64 esize))
-  (block entry
-    (let ((n (call @fib.array-len a))
-          (cap (call @fib.array-cap (add n (i64 1))))
-          (r (call @fib.alloc (add (i64 24) (mul cap esize)) tid))
-          (src (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)))
-          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0)))
-          (fp (getelementptr %struct.fib.hdr r (i32 0) (i32 2))))
-      (store n (getelementptr %struct.fib.array.i8 r (i32 0) (i32 3)))
-      (call @memcpy dst src (mul n esize))
-      (store (or (load i32 fp) (i32 16)) fp)
-      (ret r))))
+(DEFINE INTERNAL (fib.array-room PTR) ((PTR a) (I32 tid) (I64 esize))
+  (BLOCK entry
+    (LET ((n (CALL (GLOBAL fib.array-len) a))
+          (cap (CALL (GLOBAL fib.array-cap) (ADD n (I64 1))))
+          (r (CALL (GLOBAL fib.alloc) (ADD (I64 24) (MUL cap esize)) tid))
+          (src (GETELEMENTPTR (STRUCT fib.array.i8) a (I32 0) (I32 4) (I64 0)))
+          (dst (GETELEMENTPTR (STRUCT fib.array.i8) r (I32 0) (I32 4) (I64 0)))
+          (fp (GETELEMENTPTR (STRUCT fib.hdr) r (I32 0) (I32 2))))
+      (STORE n (GETELEMENTPTR (STRUCT fib.array.i8) r (I32 0) (I32 3)))
+      (CALL (GLOBAL memcpy) dst src (MUL n esize))
+      (STORE (OR (LOAD I32 fp) (I32 16)) fp)
+      (RET r))))
 
 ;; True when a is unique and ROOMY with a free slot: array-push! writes it in place. Below 32 there is always room; from 32 on
 ;; the capacity is the power of two at or above len, so there is room unless len is a power of two.
-(define internal (fib.array-roomy? i1) ((ptr a))
-  (block entry
-    (br (call @fib.unique? a) test no))
-  (block test
-    (br (icmp ne (and (call @fib.flags a) (i32 16)) (i32 0)) full no))
-  (block full
-    (let ((n (call @fib.array-len a)))
-      (br (icmp slt n (i64 32)) yes big)))
-  (block big
-    (let ((m (and n (sub n (i64 1)))))
-      (ret (icmp ne m (i64 0)))))
-  (block yes (ret (i1 1)))
-  (block no (ret (i1 0))))
+(DEFINE INTERNAL (fib.array-roomy? I1) ((PTR a))
+  (BLOCK entry
+    (BR (CALL (GLOBAL fib.unique?) a) test no))
+  (BLOCK test
+    (BR (ICMP NE (AND (CALL (GLOBAL fib.flags) a) (I32 16)) (I32 0)) full no))
+  (BLOCK full
+    (LET ((n (CALL (GLOBAL fib.array-len) a)))
+      (BR (ICMP SLT n (I64 32)) yes big)))
+  (BLOCK big
+    (LET ((m (AND n (SUB n (I64 1)))))
+      (RET (ICMP NE m (I64 0)))))
+  (BLOCK yes (RET (I1 1)))
+  (BLOCK no (RET (I1 0))))

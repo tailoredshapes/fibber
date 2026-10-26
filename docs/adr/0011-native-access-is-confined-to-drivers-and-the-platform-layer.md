@@ -27,7 +27,7 @@ and, once the emitter pruned unused code, did not reach it either.
 
 4. **The GPU is core, the driver is not** (owner, 2026-10-07, docs/design/decisions-2026-10-04.md GPU; package GPU-2). `fib.gpu` declares
    no `extern`: its kernel side is a core form (`defkernel`, syntax §3.22) and builtins (`gpu/*`, types §2.17) that the emitter lowers to
-   lIR forms (`(sreg ..)`, `(barrier)`, `(global shared ..)`), and its host side is the `fib.gpu.device` protocols a driver implements
+   lIR forms (`(SREG ..)`, `(BARRIER)`, `(GLOBAL SHARED ..)`), and its host side is the `fib.gpu.device` protocols a driver implements
    (fib-gpu-cuda, in its own repository, holds the 32 CUDA externs under rule 2). That is the allowance this rule makes explicit: a core
    module may *emit* the forms of a native target without wrapping its library; what reaches the native library stays in the driver.
 

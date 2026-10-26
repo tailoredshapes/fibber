@@ -28,8 +28,8 @@ for m in "${MUTANTS[@]}"; do
   cp -r "$R/cases/stdlib/support" "$T/tree/cases/stdlib/"; cp "$R"/cases/stdlib/814[0-2]-*.fib "$T/tree/cases/stdlib/"
   C=$T/tree/compiler/emit
   case $m in
-    bounds) for f in "$T/tree/rt/array.lir" "$C/runtime.fib"; do plant "$f" 's/(fib\.array-blit void.*?)\(br bad range ok\)/$1(br (i1 0) range ok)/s'; done;;
-    short)  for f in "$T/tree/rt/array.lir" "$C/runtime.fib"; do plant "$f" 's/\(call \@memmove d s \(mul n esize\)\)/(call \@memmove d s (mul (sub n (i64 1)) esize))/'; done;;
+    bounds) for f in "$T/tree/rt/array.lir" "$C/runtime.fib"; do plant "$f" 's/(fib\.array-blit VOID.*?)\(BR bad range ok\)/$1(BR (I1 0) range ok)/s'; done;;
+    short)  for f in "$T/tree/rt/array.lir" "$C/runtime.fib"; do plant "$f" 's/\(CALL \(GLOBAL memmove\) d s \(MUL n esize\)\)/(CALL (GLOBAL memmove) d s (MUL (SUB n (I64 1)) esize))/'; done;;
     shared) plant "$C/lower/builtins.fib" 's/\(do \(fb-term b \(str-join \["\(br " \(v-text ok\) " " lj/(do (fb-term b (str-join ["(br " "(i1 1)" " " lj/';;
     esize)  plant "$C/lower/builtins.fib" 's/(\(v-text \(nth a 4\)\) " \(i64 " )\(str \(\. r esize\)\)/$1(str 1)/';;
     *) echo "mutant-blit: unknown mutant $m" >&2; exit 2;;

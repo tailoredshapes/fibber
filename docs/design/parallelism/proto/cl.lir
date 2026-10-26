@@ -2,114 +2,114 @@
 ;; out: dup 0 lost 0
 ;; Chase-Lev deque (Le, Pop, Cohen, Nardelli 2013) in lIR with a stress test: the owner (main) pushes the items 1..N, pops every fourth push and drains at the
 ;; end; three thieves steal. Every item must be taken exactly once: seen[i] counts the takers of item i. dup = items taken more than once, lost = never taken.
-(declare pthread_create i32 (ptr ptr ptr ptr))
-(declare pthread_join i32 (i64 ptr))
-(declare printf i32 (ptr ...))
-(declare calloc ptr (i64 i64))
-(global top i64 (i64 0))
-(global bottom i64 (i64 0))
-(global buf ptr (ptr null))
-(global seen ptr (ptr null))
-(global done i32 (i32 0))
+(DECLARE pthread_create I32 (PTR PTR PTR PTR))
+(DECLARE pthread_join I32 (I64 PTR))
+(DECLARE printf I32 (PTR ...))
+(DECLARE calloc PTR (I64 I64))
+(GLOBAL top I64 (I64 0))
+(GLOBAL bottom I64 (I64 0))
+(GLOBAL buf PTR (PTR NULL))
+(GLOBAL seen PTR (PTR NULL))
+(GLOBAL done I32 (I32 0))
 
-(define (push void) ((i64 v))
-  (block entry
-    (let ((b (atomic-load monotonic i64 @bottom))
-          (slot (getelementptr i64 (load ptr @buf) (and b (i64 16383)))))
-      (atomic-store monotonic v slot)
-      (fence release)
-      (atomic-store monotonic (add b (i64 1)) @bottom)
-      (ret))))
+(DEFINE (push VOID) ((I64 v))
+  (BLOCK entry
+    (LET ((b (ATOMIC-LOAD MONOTONIC I64 (GLOBAL bottom)))
+          (slot (GETELEMENTPTR I64 (LOAD PTR (GLOBAL buf)) (AND b (I64 16383)))))
+      (ATOMIC-STORE MONOTONIC v slot)
+      (FENCE RELEASE)
+      (ATOMIC-STORE MONOTONIC (ADD b (I64 1)) (GLOBAL bottom))
+      (RET))))
 
-(define (pop i64) ()
-  (block entry
-    (let ((b (sub (atomic-load monotonic i64 @bottom) (i64 1))))
-      (atomic-store monotonic b @bottom)
-      (fence seq_cst)
-      (let ((t (atomic-load monotonic i64 @top)))
-        (br (icmp sle t b) nonempty empty))))
-  (block empty
-    (atomic-store monotonic (add b (i64 1)) @bottom)
-    (ret (i64 0)))
-  (block nonempty
-    (let ((x (atomic-load monotonic i64 (getelementptr i64 (load ptr @buf) (and b (i64 16383))))))
-      (br (icmp eq t b) last more)))
-  (block more (ret x))
-  (block last
-    (let ((r (cmpxchg seq_cst monotonic @top t (add t (i64 1)))))
-      (atomic-store monotonic (add b (i64 1)) @bottom)
-      (ret (select (extractvalue r 1) x (i64 0))))))
+(DEFINE (pop I64) ()
+  (BLOCK entry
+    (LET ((b (SUB (ATOMIC-LOAD MONOTONIC I64 (GLOBAL bottom)) (I64 1))))
+      (ATOMIC-STORE MONOTONIC b (GLOBAL bottom))
+      (FENCE SEQ_CST)
+      (LET ((t (ATOMIC-LOAD MONOTONIC I64 (GLOBAL top))))
+        (BR (ICMP SLE t b) nonempty empty))))
+  (BLOCK empty
+    (ATOMIC-STORE MONOTONIC (ADD b (I64 1)) (GLOBAL bottom))
+    (RET (I64 0)))
+  (BLOCK nonempty
+    (LET ((x (ATOMIC-LOAD MONOTONIC I64 (GETELEMENTPTR I64 (LOAD PTR (GLOBAL buf)) (AND b (I64 16383))))))
+      (BR (ICMP EQ t b) last more)))
+  (BLOCK more (RET x))
+  (BLOCK last
+    (LET ((r (CMPXCHG SEQ_CST MONOTONIC (GLOBAL top) t (ADD t (I64 1)))))
+      (ATOMIC-STORE MONOTONIC (ADD b (I64 1)) (GLOBAL bottom))
+      (RET (SELECT (EXTRACTVALUE r 1) x (I64 0))))))
 
-(define (steal i64) ()
-  (block entry
-    (let ((t (atomic-load acquire i64 @top)))
-      (fence seq_cst)
-      (let ((b (atomic-load acquire i64 @bottom)))
-        (br (icmp slt t b) some none))))
-  (block none (ret (i64 0)))
-  (block some
-    (let ((x (atomic-load monotonic i64 (getelementptr i64 (load ptr @buf) (and t (i64 16383)))))
-          (r (cmpxchg seq_cst monotonic @top t (add t (i64 1)))))
-      (ret (select (extractvalue r 1) x (i64 0))))))
+(DEFINE (steal I64) ()
+  (BLOCK entry
+    (LET ((t (ATOMIC-LOAD ACQUIRE I64 (GLOBAL top))))
+      (FENCE SEQ_CST)
+      (LET ((b (ATOMIC-LOAD ACQUIRE I64 (GLOBAL bottom))))
+        (BR (ICMP SLT t b) some none))))
+  (BLOCK none (RET (I64 0)))
+  (BLOCK some
+    (LET ((x (ATOMIC-LOAD MONOTONIC I64 (GETELEMENTPTR I64 (LOAD PTR (GLOBAL buf)) (AND t (I64 16383)))))
+          (r (CMPXCHG SEQ_CST MONOTONIC (GLOBAL top) t (ADD t (I64 1)))))
+      (RET (SELECT (EXTRACTVALUE r 1) x (I64 0))))))
 
-(define (take void) ((i64 x))
-  (block entry (br (icmp ne x (i64 0)) yes no))
-  (block yes (atomicrmw add seq_cst (getelementptr i32 (load ptr @seen) x) (i32 1)) (br no))
-  (block no (ret)))
+(DEFINE (take VOID) ((I64 x))
+  (BLOCK entry (BR (ICMP NE x (I64 0)) yes no))
+  (BLOCK yes (ATOMICRMW ADD SEQ_CST (GETELEMENTPTR I32 (LOAD PTR (GLOBAL seen)) x) (I32 1)) (BR no))
+  (BLOCK no (RET)))
 
-(define (thief ptr) ((ptr arg))
-  (block entry (br loop))
-  (block loop
-    (let ((x (call @steal)))
-      (call @take x)
-      (br (icmp eq x (i64 0)) idle loop)))
-  (block idle
-    (br (icmp eq (atomic-load acquire i32 @done) (i32 1)) out loop))
-  (block out (ret (ptr null))))
+(DEFINE (thief PTR) ((PTR arg))
+  (BLOCK entry (BR loop))
+  (BLOCK loop
+    (LET ((x (CALL (GLOBAL steal))))
+      (CALL (GLOBAL take) x)
+      (BR (ICMP EQ x (I64 0)) idle loop)))
+  (BLOCK idle
+    (BR (ICMP EQ (ATOMIC-LOAD ACQUIRE I32 (GLOBAL done)) (I32 1)) out loop))
+  (BLOCK out (RET (PTR NULL))))
 
-(define (main i32) ()
-  (block entry
-    (store (call @calloc (i64 16384) (i64 8)) @buf)
-    (store (call @calloc (i64 4000002) (i64 4)) @seen)
-    (let ((ids (alloca i64 (i32 3))))
-      (call @pthread_create (getelementptr i64 ids (i32 0)) (ptr null) @thief (ptr null))
-      (call @pthread_create (getelementptr i64 ids (i32 1)) (ptr null) @thief (ptr null))
-      (call @pthread_create (getelementptr i64 ids (i32 2)) (ptr null) @thief (ptr null))
-      (br produce)))
-  (block produce
-    (let ((i (phi i64 (entry (i64 1)) (cont i2))))
-      (br (icmp sle i (i64 4000000)) step drain)))
-  (block step
-    (let ((size (sub (atomic-load monotonic i64 @bottom) (atomic-load monotonic i64 @top))))
-      (br (icmp slt size (i64 8000)) dopush dopop)))
-  (block dopush (call @push i) (br maybe))
-  (block dopop (call @take (call @pop)) (call @push i) (br maybe))
-  (block maybe
-    (br (icmp eq (and i (i64 3)) (i64 0)) popnow cont))
-  (block popnow (call @take (call @pop)) (br cont))
-  (block cont (let ((i2 (add i (i64 1)))) (br produce)))
-  (block drain
-    (let ((x (call @pop)))
-      (call @take x)
-      (br (icmp eq x (i64 0)) finish drain)))
-  (block finish
-    (atomic-store release (i32 1) @done)
-    (call @pthread_join (load i64 (getelementptr i64 ids (i32 0))) (ptr null))
-    (call @pthread_join (load i64 (getelementptr i64 ids (i32 1))) (ptr null))
-    (call @pthread_join (load i64 (getelementptr i64 ids (i32 2))) (ptr null))
-    (br check))
-  (block check
-    (let ((k (phi i64 (finish (i64 1)) (next k2)))
-          (dup (phi i64 (finish (i64 0)) (next dup2)))
-          (lost (phi i64 (finish (i64 0)) (next lost2))))
-      (br (icmp sle k (i64 4000000)) body report)))
-  (block body
-    (let ((c (load i32 (getelementptr i32 (load ptr @seen) k)))
-          (dup2 (select (icmp ugt c (i32 1)) (add dup (i64 1)) dup))
-          (lost2 (select (icmp eq c (i32 0)) (add lost (i64 1)) lost))
-          (k2 (add k (i64 1))))
-      (br next)))
-  (block next (br check))
-  (block report
-    (call @printf (string "dup %lld lost %lld\n") dup lost)
-    (ret (i32 0))))
+(DEFINE (main I32) ()
+  (BLOCK entry
+    (STORE (CALL (GLOBAL calloc) (I64 16384) (I64 8)) (GLOBAL buf))
+    (STORE (CALL (GLOBAL calloc) (I64 4000002) (I64 4)) (GLOBAL seen))
+    (LET ((ids (ALLOCA I64 (I32 3))))
+      (CALL (GLOBAL pthread_create) (GETELEMENTPTR I64 ids (I32 0)) (PTR NULL) (GLOBAL thief) (PTR NULL))
+      (CALL (GLOBAL pthread_create) (GETELEMENTPTR I64 ids (I32 1)) (PTR NULL) (GLOBAL thief) (PTR NULL))
+      (CALL (GLOBAL pthread_create) (GETELEMENTPTR I64 ids (I32 2)) (PTR NULL) (GLOBAL thief) (PTR NULL))
+      (BR produce)))
+  (BLOCK produce
+    (LET ((i (PHI I64 (entry (I64 1)) (cont i2))))
+      (BR (ICMP SLE i (I64 4000000)) step drain)))
+  (BLOCK step
+    (LET ((size (SUB (ATOMIC-LOAD MONOTONIC I64 (GLOBAL bottom)) (ATOMIC-LOAD MONOTONIC I64 (GLOBAL top)))))
+      (BR (ICMP SLT size (I64 8000)) dopush dopop)))
+  (BLOCK dopush (CALL (GLOBAL push) i) (BR maybe))
+  (BLOCK dopop (CALL (GLOBAL take) (CALL (GLOBAL pop))) (CALL (GLOBAL push) i) (BR maybe))
+  (BLOCK maybe
+    (BR (ICMP EQ (AND i (I64 3)) (I64 0)) popnow cont))
+  (BLOCK popnow (CALL (GLOBAL take) (CALL (GLOBAL pop))) (BR cont))
+  (BLOCK cont (LET ((i2 (ADD i (I64 1)))) (BR produce)))
+  (BLOCK drain
+    (LET ((x (CALL (GLOBAL pop))))
+      (CALL (GLOBAL take) x)
+      (BR (ICMP EQ x (I64 0)) finish drain)))
+  (BLOCK finish
+    (ATOMIC-STORE RELEASE (I32 1) (GLOBAL done))
+    (CALL (GLOBAL pthread_join) (LOAD I64 (GETELEMENTPTR I64 ids (I32 0))) (PTR NULL))
+    (CALL (GLOBAL pthread_join) (LOAD I64 (GETELEMENTPTR I64 ids (I32 1))) (PTR NULL))
+    (CALL (GLOBAL pthread_join) (LOAD I64 (GETELEMENTPTR I64 ids (I32 2))) (PTR NULL))
+    (BR check))
+  (BLOCK check
+    (LET ((k (PHI I64 (finish (I64 1)) (next k2)))
+          (dup (PHI I64 (finish (I64 0)) (next dup2)))
+          (lost (PHI I64 (finish (I64 0)) (next lost2))))
+      (BR (ICMP SLE k (I64 4000000)) body report)))
+  (BLOCK body
+    (LET ((c (LOAD I32 (GETELEMENTPTR I32 (LOAD PTR (GLOBAL seen)) k)))
+          (dup2 (SELECT (ICMP UGT c (I32 1)) (ADD dup (I64 1)) dup))
+          (lost2 (SELECT (ICMP EQ c (I32 0)) (ADD lost (I64 1)) lost))
+          (k2 (ADD k (I64 1))))
+      (BR next)))
+  (BLOCK next (BR check))
+  (BLOCK report
+    (CALL (GLOBAL printf) (STRING "dup %lld lost %lld\n") dup lost)
+    (RET (I32 0))))

@@ -348,7 +348,7 @@ Sections are tagged with the package that found them.
   around each `array-get`, because the read of the cell gives the loop a counted reference. The calls are not inlined (the runtime is
   separate), so a table lookup costs two calls and a count update.
 - **Reproduction.** `(defun f (c: (Cell (Array i64)) n: i64) -> i64 (loop [i 0 s 0] (if (< i n) (recur (+ i 1) (+ s (array-get @c i))) s)))`,
-  then `fibc emit` shows `(call @fib.retain t..)` and `(call @fib.release t..)` inside the loop (also visible in the lIR of
+  then `fibc emit` shows `(CALL (GLOBAL fib.retain) t..)` and `(CALL (GLOBAL fib.release) t..)` inside the loop (also visible in the lIR of
   `f.fib.regex.dfa.dfa-forward` before the rewrite).
 - **Java/C.** A field read; no count.
 - **Evidence.** regex-redux, one counting pass over 50 MB: 160 ms with the table in a cell, 78 ms when the scan loop takes the table as a borrowed
@@ -361,7 +361,7 @@ Sections are tagged with the package that found them.
 
 - **Missing.** A byte of a `str` costs a function call; `fib.str-byte-at` is 8.0% of the self time of regex-redux, in a loop that is otherwise
   one load, one table lookup, one table lookup.
-- **Reproduction.** `fibc emit` of any loop over `(str-byte-at s i)`: `(call @fib.str-byte-at p1 t..)`.
+- **Reproduction.** `fibc emit` of any loop over `(str-byte-at s i)`: `(CALL (GLOBAL fib.str-byte-at) p1 t..)`.
 - **Java/C.** `charAt` is an intrinsic; C indexes.
 - **Recommendation (compiler).** An intrinsic: bounds check, load of the byte, as `array-get` has.
 

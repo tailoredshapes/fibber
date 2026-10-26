@@ -16,7 +16,7 @@ ck() { if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2] want 
 cat > "$out/app.fib" <<'EOT'
 (ns main (:use fib.core) (:require [fib.os.time :as t]))
 (defun answer (p: ptr) -> i64
-  (unsafe (lir [p: ptr] -> i64 "(block entry (ret (add (atomic-load acquire i64 p) (i64 1))))")))
+  (unsafe (lir [p: ptr] -> i64 "(BLOCK entry (RET (ADD (ATOMIC-LOAD ACQUIRE I64 p) (I64 1))))")))
 (defun main () -> i64
   (unsafe (let [cell (alloc 8)]
     (do (store-i64 cell 10)
@@ -31,7 +31,7 @@ for _ in $(seq 100); do grep -q "live at" "$out/stderr" 2>/dev/null && break; sl
 last() { tail -n 1 "$out/stdout"; }
 for _ in $(seq 50); do [ "$(last)" = "answer 11" ] && break; sleep 0.1; done
 ck "the program prints the first body's value" "$(last)" "answer 11"
-swap() { printf '%s\n' "(defun answer (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(block entry (ret (add (atomic-load acquire i64 p) (i64 $1))))\")))" | timeout 60 "$fibc" repl --connect "$pid" 2>&1 | grep -c "swapped answer"; }
+swap() { printf '%s\n' "(defun answer (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(BLOCK entry (RET (ADD (ATOMIC-LOAD ACQUIRE I64 p) (I64 $1))))\")))" | timeout 60 "$fibc" repl --connect "$pid" 2>&1 | grep -c "swapped answer"; }
 ck "a redefinition with another lir body is swapped" "$(swap 100)" 1
 for _ in $(seq 50); do [ "$(last)" = "answer 110" ] && break; sleep 0.1; done
 ck "and the running program takes the new body" "$(last)" "answer 110"

@@ -51,14 +51,14 @@ mut() {
   rm "$f.orig"
 }
 case $MODE in
-  no-isolate)     mut rt/core.lir 's/\(br \(icmp ne tk \(ptr null\)\) in-task plain\)/(br (icmp ne tk (ptr null)) plain plain)/' ;;
-  join-ignores)   mut rt/task.lir 's/\(br \(icmp ne msg \(ptr null\)\) failed done\)/(br (icmp ne msg (ptr null)) done done)/' ;;
-  ok-failed)      mut rt/task.lir 's/\(ret \(atomic-load acquire ptr \(getelementptr %struct\.fib\.task task \(i32 0\) \(i32 10\)\)\)\)/(ret (ptr null))/' ;;
-  no-release)     mut rt/core.lir 's/      \(call \@fib\.release task\)\n      \(call \@fib\.thread-done\)/      (call \@fib.thread-done)/' ;;
-  double-release) mut rt/core.lir 's/      \(call \@fib\.release task\)\n      \(call \@fib\.thread-done\)/      (call \@fib.release task)\n      (call \@fib.release task)\n      (call \@fib.thread-done)/' ;;
+  no-isolate)     mut rt/core.lir 's/\(BR \(ICMP NE tk \(PTR NULL\)\) in-task plain\)/(BR (ICMP NE tk (PTR NULL)) plain plain)/' ;;
+  join-ignores)   mut rt/task.lir 's/\(BR \(ICMP NE msg \(PTR NULL\)\) failed done\)/(BR (ICMP NE msg (PTR NULL)) done done)/' ;;
+  ok-failed)      mut rt/task.lir 's/\(RET \(ATOMIC-LOAD ACQUIRE PTR \(GETELEMENTPTR \(STRUCT fib\.task\) task \(I32 0\) \(I32 10\)\)\)\)/(RET (PTR NULL))/' ;;
+  no-release)     mut rt/core.lir 's/      \(CALL \(GLOBAL fib\.release\) task\)\n      \(CALL \(GLOBAL fib\.thread-done\)\)/      (CALL (GLOBAL fib.thread-done))/' ;;
+  double-release) mut rt/core.lir 's/      \(CALL \(GLOBAL fib\.release\) task\)\n      \(CALL \(GLOBAL fib\.thread-done\)\)/      (CALL (GLOBAL fib.release) task)\n      (CALL (GLOBAL fib.release) task)\n      (CALL (GLOBAL fib.thread-done))/' ;;
   leak-message)   mut compiler/emit/objects/walk.fib 's/\(conj \(conj \(conj \(counted \(some-of caps\) slot-task-capture0\) slot-task-result\)\s*slot-task-waiters\)\s*slot-task-failure\)/(conj (conj (counted (some-of caps) slot-task-capture0) slot-task-result) slot-task-waiters)/' ;;
-  main-isolated)  mut rt/core.lir 's/\(br \(icmp ne tk \(ptr null\)\) in-task plain\)/(br (i1 1) in-task plain)/' ;;
-  oom-isolated)   mut rt/core.lir 's/fib\.fatal-c \(string "out of memory"\)/fib.trap-c (string "out of memory")/g' ;;
+  main-isolated)  mut rt/core.lir 's/\(BR \(ICMP NE tk \(PTR NULL\)\) in-task plain\)/(BR (I1 1) in-task plain)/' ;;
+  oom-isolated)   mut rt/core.lir 's/fib\.fatal-c\) \(STRING "out of memory"\)/fib.trap-c) (STRING "out of memory")/g' ;;
   ex-cause)       mut lib/fib/ex.fib 's/\(\. e cause\)\)\s*$/nil)/' ;;
 esac
 

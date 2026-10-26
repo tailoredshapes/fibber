@@ -45,20 +45,20 @@ if [ -n "${MUT_DEMO:-}" ]; then
 fi
 
 # The two lines of fib.unique? (rt/core.lir, and its copy in the generated runtime.fib), each unique in its file:
-#   (br (icmp ne (and f (i32 15)) (i32 0)) no test)               the flag test: a flagged object answers false at `no`
-#   (block test (ret (icmp eq (load i64 ..) (i64 1))))            the count test: count is 1
+#   (BR (ICMP NE (AND f (I32 15)) (I32 0)) no test)               the flag test: a flagged object answers false at `no`
+#   (BLOCK test (RET (ICMP EQ (LOAD I64 ..) (I64 1))))            the count test: count is 1
 mutate() { # mutate FILE
   local f=$1
-  perl -0pi -e 's/\(i32 15\)\) \(i32 0\)\) no test\)/(i32 15)) (i32 0)) test test)/' "$f"
-  perl -0pi -e 's/^  \(block test \(ret \(icmp eq \(load i64 .*$/  (block test (ret (i1 1))))/m' "$f"
+  perl -0pi -e 's/\(I32 15\)\) \(I32 0\)\) no test\)/(I32 15)) (I32 0)) test test)/' "$f"
+  perl -0pi -e 's/^  \(BLOCK test \(RET \(ICMP EQ \(LOAD I64 .*$/  (BLOCK test (RET (I1 1))))/m' "$f"
   if [ "$MODE" = nocount ]; then   # undo the flag half: keep the flag test
-    perl -0pi -e 's/\(i32 15\)\) \(i32 0\)\) test test\)/(i32 15)) (i32 0)) no test)/' "$f"
+    perl -0pi -e 's/\(I32 15\)\) \(I32 0\)\) test test\)/(I32 15)) (I32 0)) no test)/' "$f"
   fi
-  grep -q '(block test (ret (i1 1))))' "$f" || { echo "mutant-unique: fib.unique? not found in $f (the runtime changed?)" >&2; exit 2; }
+  grep -q '(BLOCK test (RET (I1 1))))' "$f" || { echo "mutant-unique: fib.unique? not found in $f (the runtime changed?)" >&2; exit 2; }
 }
 mutate "$OUT/tree/rt/core.lir"
 mutate "$OUT/tree/compiler/emit/runtime.fib"
-grep -A5 'define internal (fib.unique? i1)' "$OUT/tree/rt/core.lir"
+grep -A5 'DEFINE INTERNAL (fib.unique? I1)' "$OUT/tree/rt/core.lir"
 
 cd "$OUT/tree" || exit 2
 echo "mutant-unique[$MODE]: building the mutant stage 2 with $FIBC"

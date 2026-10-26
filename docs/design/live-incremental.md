@@ -139,7 +139,7 @@ code. A session of a thousand swaps is 200 MB of generations (estimate); the 680
 In the scratch copy, `emit.defs.jit/emit-def` keeps, under `FIB_LIVE_DEFCACHE=1`, the value (`DefValue`) of each constant def and the
 constant items its reading appended, keyed by the def's body name (`d.fib.http.body.piece`: module-qualified, stable across the programs of
 a session where the def ids are not), in a process-wide atom; a later program's `emit-def` of the same name replays the items into its
-`Defs` (the `@def.N` names, the counter past them) and records the value, and still lowers the initialiser's body (0 to 2 ms: the statics it
+`Defs` (the `(GLOBAL def.N)` names, the counter past them) and records the value, and still lowers the initialiser's body (0 to 2 ms: the statics it
 names must exist in this program), skipping only the JIT. 60 lines; not for the tree (global state, and the closure problem of 2.4.5).
 The same transcript with `Fp2` (`run3`):
 
@@ -184,23 +184,23 @@ Three additions to `emit.program/Tables`, all written by the base's emit and rea
 
 1. **The constant defs' values and items** (LE1): `defs: (Cell (Map str (Pair DefValue (Vec LItem))))` keyed by the def's body name
    (`en/body-name g (BodyDef d) []`: `d.MODULE.NAME`, what 1.6 keyed by), and `emit-def` consults it as the experiment did: a hit replays
-   the items (their `@def.N` names into `constants`, the counter past the largest) and records the value; a miss evaluates through the
+   the items (their `(GLOBAL def.N)` names into `constants`, the counter past the largest) and records the value; a miss evaluates through the
    JIT and records. The key is the name and not the id because the ids are the program's (`slots-agree` already refuses an input whose
    numbering moved) and a `require` input adds modules before the session's. The values are the lIR expressions of immortal constants:
-   plain data, or `@def.N` and `@str.N` references (shared names), or `@clo.N` (not shared today: item 3). Under `FIB_LIVE_EMIT=verify`
+   plain data, or `(GLOBAL def.N)` and `(GLOBAL str.N)` references (shared names), or `(GLOBAL clo.N)` (not shared today: item 3). Under `FIB_LIVE_EMIT=verify`
    (2.5) a hit is also evaluated and the two values compared.
 2. **The runtime's items** once per process (`runtime-items-target`, `-host`: 25 ms of parsing per program today): a cell in `Tables`
    or a lazily filled `def` of emit.rt (the runtime text is a constant of the build). Small; goes with LE1.
-3. **Closure and vtable statics shared by name** (LE2): today `statics-closure` names an immortal closure `@clo.N` by the count of the
-   program's own `closures` cell and `statics-vtable` names `@vt.N` the same way, so two programs of a session number them differently,
+3. **Closure and vtable statics shared by name** (LE2): today `statics-closure` names an immortal closure `(GLOBAL clo.N)` by the count of the
+   program's own `closures` cell and `statics-vtable` names `(GLOBAL vt.N)` the same way, so two programs of a session number them differently,
    which is why `program-tables` gives each program fresh closure and vtable cells and the session copies them into every cut (LV1 note
    (f); emit.statics `program-static?` is the one predicate: serve.livesess, serve.livesplit and emit.defs.cache read it). A quoted form
-   `@q.N` (emit.program `program-fresh-quote`) is numbered per program the same way and is under the same rule since the swap crash of
+   `(GLOBAL q.N)` (emit.program `program-fresh-quote`) is numbered per program the same way and is under the same rule since the swap crash of
    docs/design/live-meshql.md 10; LE2 shares it by content as it shares the others. In live mode (`p.live`) the name is the key instead: `clo.CODE` for the closure whose code is `CODE` (a stub name,
    resident), `vt.NAME` for the vtable of instance `NAME` (mangled as `emit.names` mangles). Then the cells can be shared, the cut
-   declares a static the base has and copies only a new one, and a def value that holds `@clo.f.x.owned` means the same object in every
+   declares a static the base has and copies only a new one, and a def value that holds `(GLOBAL clo.f.x.owned)` means the same object in every
    program. Plain mode keeps the counters, so a plain emit stays byte-identical (the LV0 guard, `compiler/tests/live/stubs.sh`'s golden).
-   Why this matters for LE1: a constant def whose value is a function value (a table of handlers) would otherwise replay a `@clo.N` of the
+   Why this matters for LE1: a constant def whose value is a function value (a table of handlers) would otherwise replay a `(GLOBAL clo.N)` of the
    base into a program where `N` is another closure. The experiment did not hit this on meshql-fib (the server answered right through the
    transcript and 1.7's test), but nothing proves no def of a program holds a closure, so LE2 precedes the gate stage of LE1.
 
@@ -254,7 +254,7 @@ swap under 40 ms**, of an expression input about the same, of a new function the
    specialisation whose types name an input's private type (a `defstruct` of an expression) cannot be re-requested and keeps its slot, as
    now; a test covers both.
 5. **Vtables and statics.** With LE2 shared by name, a swapped method body's vtable is the base's (declared); a new instance's is copied
-   once and exported. Keyword ids are the program's table (sealed, shared). Strings are shared. A def value's `@clo.CODE` is the base's.
+   once and exported. Keyword ids are the program's table (sealed, shared). Strings are shared. A def value's `(GLOBAL clo.CODE)` is the base's.
 6. **The slot-agreement check** (`slots-agree`) stays: it is 0 ms and it is the guard for a `require` input that reorders the ids.
 7. **An input's program is still checked whole** by the engine (LV4): the rules compare every family's scheme and summary; queue mode
    changes nothing before the emit.
@@ -384,7 +384,7 @@ MODE` plants one fault in a copy, as live-repl.md §6 prescribes); the live stag
 
 | Pkg | Scope | Files | Acceptance (executable) | Mutants that must be killed | Depends | Size |
 |---|---|---|---|---|---|---|
-| **LE1** def values in the Tables | `Tables.defs` by body name; `emit-def` replays a hit (items, constants, counter, value); the runtime's items parsed once; `FIB_LIVE_EMIT=verify` compares a replayed value with a fresh evaluation | `emit/program.fib` (`Tables`), `emit/defs/jit.fib`, `emit/defs/data.fib`, `emit/rt.fib`, `serve/livesess.fib` | `compiler/tests/live/swap.sh` unchanged and green; `compiler/tests/live/emit.sh` (new): a hello app with 6 constant defs (an array, a struct with a string, an `Option`, a scalar, a `str`, one holding a function value: LE2's guard) and a handler reading them: swap the handler three times and read every def through the handler and through `inspect value`: the same values each time; under `verify` byte-identical; the swap's `emit_ms` under a third of the first input's (the first evaluates, the rest replay); the meshql demo transcript (`scripts/live-demo.sh` on `live-dev`) with `emit_ms` under 1,200 on every input after the first (measured 1,001 to 1,076 in 1.6) | `def-cache-keyed-by-id` (keyed by the def id: a `(require ..)` input that adds a module before the session's shifts the ids: the test's `inspect value` reads another def's value), `replay-skips-constants` (the `@def.N` names not re-added: the next miss renumbers and the JIT's names-check refuses, or the value points at the wrong constant), `verify-ignores-value` (verify compares nothing: the keyed-by-id test under verify must refuse) | LV2 | 150 |
+| **LE1** def values in the Tables | `Tables.defs` by body name; `emit-def` replays a hit (items, constants, counter, value); the runtime's items parsed once; `FIB_LIVE_EMIT=verify` compares a replayed value with a fresh evaluation | `emit/program.fib` (`Tables`), `emit/defs/jit.fib`, `emit/defs/data.fib`, `emit/rt.fib`, `serve/livesess.fib` | `compiler/tests/live/swap.sh` unchanged and green; `compiler/tests/live/emit.sh` (new): a hello app with 6 constant defs (an array, a struct with a string, an `Option`, a scalar, a `str`, one holding a function value: LE2's guard) and a handler reading them: swap the handler three times and read every def through the handler and through `inspect value`: the same values each time; under `verify` byte-identical; the swap's `emit_ms` under a third of the first input's (the first evaluates, the rest replay); the meshql demo transcript (`scripts/live-demo.sh` on `live-dev`) with `emit_ms` under 1,200 on every input after the first (measured 1,001 to 1,076 in 1.6) | `def-cache-keyed-by-id` (keyed by the def id: a `(require ..)` input that adds a module before the session's shifts the ids: the test's `inspect value` reads another def's value), `replay-skips-constants` (the `(GLOBAL def.N)` names not re-added: the next miss renumbers and the JIT's names-check refuses, or the value points at the wrong constant), `verify-ignores-value` (verify compares nothing: the keyed-by-id test under verify must refuse) | LV2 | 150 |
 | **LE2** statics by name in live mode | `clo.CODE`, `vt.NAME` under `p.live`; the closure and vtable cells shared through `Tables`; the cut declares a static the base has | `emit/statics.fib`, `emit/program.fib`, `serve/livesess.fib` (`program-tables`), `live/extract.fib` (`own-static?` goes) | `stubs.sh`'s goldens unchanged (plain mode byte-identical); `emit.sh`: a def holding a named function as a value and a swapped body that calls through it: the base's closure object (one `clo.` static in `status`), the swapped body's call reaches the new generation; a method swap whose vtable is the base's (no `vt.` in the cut: the cut's item names are in the answer under `FIB_LIVE_DEBUG=cut`); a new instance in an input makes one new vtable | `closure-renumbered` (the counter kept in live mode: the def's function value calls the wrong code: the test's answer differs), `vtable-copied` (the cut copies the base's vtable: two `vt.` for one instance in `status`) | LE1 | 120 |
 | **LE3** the queue mode | `Tables.resident`; a request answered by name when the code name is resident; the session fills the set from its index; registered specialisations requested by recorded type text; `FIB_LIVE_EMIT=verify` compares the cut's items with the whole emit's | `emit/mono.fib` or `emit/program.fib` (`program-request`), `emit/compile.fib`, `emit/live.fib` (`LiveBody.tys-text`), `serve/livesess.fib`, `serve/liveswap.fib` (`requests-of`) | `swap.sh` green, and under `verify`; `emit.sh`: the swap's `emit_ms` under 60 on the hello app (measured today 9,000 on meshql, estimate under 40 after); the generic test of `swap.sh` with a specialisation reached only through a resident caller (a planted "reached from main only" variant): both instantiations swap; a swapped body calling a library function at a new type (the body is lowered and exported, `status.values.resident` grows by one); the meshql demo with `emit_ms` under 100 on every input after the first and the whole transcript under `verify` byte-identical | `resident-by-family` (the family name checked instead of the code name: the swapped generation is never lowered: the 404 → 410 check fails), `skip-new-specialisation` (a missing specialisation answered by name: ORC's lookup fails: the library-at-new-type check), `literal-counter-per-program` (literal names restart per program: `names-check` refuses the second swap), `specialisation-not-requested` (only `main`-reached specialisations swap: the planted generic variant fails) | LE1, LE2 | 300 |
 | **LE4** `inspect` as a lookup; expression inputs through the queue | `inspect` from the table and the last catalogue, `value: true` for an evaluation; the entry is the only body lowered for an expression | `serve/live.fib`, `serve/livesess.fib`, `serve/liveswap.fib` | `attach.sh` extended: `inspect handle` answers `generation`, `bodies`, `scheme` `(fn :send (Request) Response)` and no `stats`; wall under 20 ms in the test's harness; `inspect` with `value: true` of a def answers its `pr-str`; `(count [1])` on the hello app under 150 ms | `inspect-runs-input` (the answer carries `stats`) | LE3 | 80 |
@@ -401,7 +401,7 @@ meshql scenario), LM2. LE1 through LE5 is about 700 lines; LM1 and LM2 550. Late
 
 Risks:
 
-1. **A def value that names a closure** (2.2 item 3): LE1 without LE2 replays a `@clo.N` into a program where `N` is another closure. The
+1. **A def value that names a closure** (2.2 item 3): LE1 without LE2 replays a `(GLOBAL clo.N)` into a program where `N` is another closure. The
    experiment did not hit it on meshql-fib; the LE1 test plants one def that does, so LE1 ships with LE2 or with that def refused
    (`live/DefClosure`, a miss every time) until LE2.
 2. **Queue mode trusts the resident index.** A name that is resident but whose definition the session changed without a new generation
@@ -537,7 +537,7 @@ Decisions for the owner:
   session's cells would put into every program a closure whose code the queue mode does not lower there, and the module a constant def
   is evaluated in (emit.defs.jit) would name it; (b) **a def value that names a closure or a vtable is still not kept by LE1's cache**
   (emit.defs.cache): it is evaluated by every program, and since LE2 the value names the base's closure, which the cut declares (a def
-  read through its live slot is the base's value anyway). Keeping it would put `@clo.CODE` into a later program's constant-evaluation
+  read through its live slot is the base's value anyway). Keeping it would put `(GLOBAL clo.CODE)` into a later program's constant-evaluation
   module, which has neither the static nor its code; a replay that also brings the closure and its code is the lift; (c) a closure of a
   generation's literal (`clo.l.NAME.gK.N`) goes with that generation's code (never exported), as before. Measured on meshql-fib's
   `scripts/live-demo.sh` (4 runs each, the build before and after interleaved, lilnas at load 2.5 to 10): the swaps' `emit_ms` median 45

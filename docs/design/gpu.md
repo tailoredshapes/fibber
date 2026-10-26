@@ -16,8 +16,8 @@ was measured on this machine (RTX 4080 SUPER, 16 GB, driver 610.57.04, CUDA 13.4
 |---|---|---|
 | `defkernel` as a core form | expand.top `kernel-defun`; types.lower `defun-kernel?`; types.decls `kernels` | spec/syntax.md 3.22: `(defkernel name (param*) body+)` is `(defun name (param*) :kernel -> unit (unsafe (do body+)))`; the mark is read by the checker and the emitter |
 | the kernel-subset checker | compiler/own/kernel.fib, after inference, before the ownership pass | spec/types.md 2.17: one error per kernel at its source position, the path when it is in a reached function (`:kernel-pure` is inferred); cases/stdlib 8530-8542 (thirteen refusals), scripts/mutant-gpu.sh (ten rules removed one at a time, each caught by a case) |
-| the `gpu/*` builtins | compiler/emit/lower/gpu.fib; lib/fib/gpu.fib (facade), lib/fib/gpu/host.fib | spec/types.md 2.17: `(sreg ..)`, `(barrier)`, `(global shared ..)` on a kernel target; the host index state, nothing, a static buffer on the host; `host-launch` runs a kernel over a grid on the CPU (the one-language guard: cases 8545-8547, examples/gpu/gpu.fib: vadd and gemm match a CPU loop, 0 mismatches) |
-| shared memory in lIR | spec/lir.md 6.9a `(global shared NAME T init)`; lir.parse, lir.print, native.lower `add-shared-global` | address space 3, `@NAME` the generic address; `gpu/shared` emits one per call site; the GEMM through it: 17.1 TFLOPS at 4096 (section 0.1) |
+| the `gpu/*` builtins | compiler/emit/lower/gpu.fib; lib/fib/gpu.fib (facade), lib/fib/gpu/host.fib | spec/types.md 2.17: `(SREG ..)`, `(BARRIER)`, `(GLOBAL SHARED ..)` on a kernel target; the host index state, nothing, a static buffer on the host; `host-launch` runs a kernel over a grid on the CPU (the one-language guard: cases 8545-8547, examples/gpu/gpu.fib: vadd and gemm match a CPU loop, 0 mismatches) |
+| shared memory in lIR | spec/lir.md 6.9a `(GLOBAL SHARED NAME T init)`; lir.parse, lir.print, native.lower `add-shared-global` | address space 3, `(GLOBAL NAME)` the generic address; `gpu/shared` emits one per call site; the GEMM through it: 17.1 TFLOPS at 4096 (section 0.1) |
 | the kernel table and module | emit.compile `kernel-table`, `compile-kernels`; native.kernel reads `fib.kernel.NAME` | the `gpu-kernel-` name convention of GPU-1 is gone; the extractor's refusal (runtime, libc) is the backstop below the checker; the stack entries of a scalar cell (`fib.stack-init`, `fib.stack-end`) get device versions (three stores, no trace) |
 | the launch ABI | native.kernel `kernel-signatures`: `// fib.kernel-sig NAME: kind..` lines before the PTX; lib/fib/gpu/device.fib `parse-signatures`, `check-args`, `check-dims` | a launch with the wrong count or kind is `:arguments` naming the kernel and the position, before `cuLaunchKernel` (case 8548; the driver's `--wrong-args`; the contract) |
 | `--kernel-target TRIPLE` (FIB_KERNEL_TARGET) | driver.commands `build-with-kernels` | the program is lowered for the kernel target (the PTX to `OUT.ptx`, beside the executable: the inspectable by-product), then for the host with the PTX embedded (`gpu/program-ptx`, through FIB_KERNEL_PTX); `fibc run` and `fibc cases` run a kernel's body on the host (the development loop), `fibc build` of an executable needs the target or refuses |
@@ -127,7 +127,7 @@ What a kernel body may contain (the checker of section 6 enforces it; the protot
 | `load-f32`/`store-f32`, `load-i32`, .. through `ptr+` on a parameter (the prototype's `gpu/f32-at`, `gpu/f32-set!`) | `ld.global`/`st.global` at natural alignment (3.3) |
 | calls of other functions of the program or the library whose bodies are in the subset (inlined by LLVM; `gpu/global-id` is one) | device functions |
 | checked `+`, `*`, an index check, `(trap "..")` | a device trap: `trap;` (3.4) |
-| `(gpu/local-id d)`, `(gpu/group-id d)`, `(gpu/group-size d)`, `(gpu/grid-size d)`, `(gpu/global-id d)`, `(gpu/barrier)` | `(sreg tid.x)`, `(sreg ctaid.x)`, `(sreg ntid.x)`, `(sreg nctaid.x)`, `(barrier)` (spec/lir.md 6.9a) |
+| `(gpu/local-id d)`, `(gpu/group-id d)`, `(gpu/group-size d)`, `(gpu/grid-size d)`, `(gpu/global-id d)`, `(gpu/barrier)` | `(SREG tid.x)`, `(SREG ctaid.x)`, `(SREG ntid.x)`, `(SREG nctaid.x)`, `(BARRIER)` (spec/lir.md 6.9a) |
 | not yet: `(gpu/shared f32 N)`, a block-local window of N elements; f16/bf16; atomics; a warp reduction | section 6 |
 
 Refused: anything that reaches the runtime (`array`, `str`, a Vec, `println`, `spawn`, a closure that allocates, `(Simd T n)` values: the
@@ -166,16 +166,16 @@ window, and the body cannot read the owner (case 339's rule) or lend it twice (c
 while a kernel runs" and "two lends" as compile-time rejections with no new checker rule; "release twice" and "use after release" become
 impossible when `release` is the scope exit of `with-buffer`. Section 10 schedules it after the kernel checker.
 
-Alignment: the kernel subset indexes elements, never bytes. The emitter writes `(align 1)` for a raw-pointer access of a float on a CPU
+Alignment: the kernel subset indexes elements, never bytes. The emitter writes `(ALIGN 1)` for a raw-pointer access of a float on a CPU
 target (spec/syntax.md 3.15: unaligned addresses are allowed there); on NVPTX a byte-aligned f32 load is four `ld.global.b8`, so on a kernel
-target the emitter writes the scalar's own size, `(align 4)` for `load-f32`/`store-f32` and `(align 8)` for the f64 pair (emit.lower.gpu
-`raw-align`), and the PTX has `ld.global.b32`. lair lowers `(align N)` as written on every target (since 2026-10-25; until then it read
-`(align 1)` on a scalar as the scalar's size on a kernel target, `kernel-align`, spec/lir.md 6.9a).
+target the emitter writes the scalar's own size, `(ALIGN 4)` for `load-f32`/`store-f32` and `(ALIGN 8)` for the f64 pair (emit.lower.gpu
+`raw-align`), and the PTX has `ld.global.b32`. lair lowers `(ALIGN N)` as written on every target (since 2026-10-25; until then it read
+`(ALIGN 1)` on a scalar as the scalar's size on a kernel target, `kernel-align`, spec/lir.md 6.9a).
 
 ### 3.4 Errors
 
 Every device call returns a `Result`. A device-side assert is a kernel's `trap` (fibber's `(trap "..")`, a checked `+` or `*` that
-overflows, an index check): the runtime's trap entries (`fib.trap`, `fib.trap-c`, `fib.trap-index`) become `(trap)` in the kernel module,
+overflows, an index check): the runtime's trap entries (`fib.trap`, `fib.trap-c`, `fib.trap-index`) become `(TRAP)` in the kernel module,
 `trap;` in PTX, and the host sees the `Err` of the `sync` that follows (CUDA: 719 "unspecified launch failure" on this driver, 715
 "illegal instruction" on others). The message is lost on the device (no `write`), which is why a kernel's trap should be rare and its
 inputs checked on the host; a `printf`-style device log is not planned. After a trap the CUDA context is unusable: the `Device` is closed
@@ -203,7 +203,7 @@ it has no assembly parser). `scripts/llvm-static.sh` lists `nvptx`.
 `compiler/native/kernel.fib`. The program is lowered as usual (every pass, every check: the kernels are the emitter's export roots on a
 kernel target, `emit.compile/kernel-specs`), then the kernel module is extracted from the lIR: the `gpu-kernel-NAME` defines and everything
 they reach through `@` references; the entry is renamed `NAME`, made external and given `kernelcc` (LLVM's `ptx_kernel`); the runtime's trap
-entries become `(trap)`; the index-space externs `gpu.sreg.R` and `gpu.barrier` become `(sreg R)` and `(barrier)`; names become PTX names
+entries become `(TRAP)`; the index-space externs `gpu.sreg.R` and `gpu.barrier` become `(SREG R)` and `(BARRIER)`; names become PTX names
 (`f.main.gpu-kernel-vadd` reaches the driver as `vadd`, `-` as `_`); the host's `(target (cpu ..))` form is dropped; string constants come
 along (a trap's message, unused). Anything else of the runtime (`fib.*`) or of libc reached is a refusal with the path. The module is parsed
 and checked again, so lair sees a module like any other, and lowered with the NVPTX machine; the "assembly" of that machine is PTX.
@@ -305,7 +305,7 @@ supplies the parallelism; `Simd` values are refused in a kernel (NVPTX has `.v2`
    that captures heap data, a `str`, a `Simd` value, a protocol call whose instance is not in the subset, a `spawn`, a recursion, a
    `barrier` under an index-dependent condition. Today the refusal is at the lIR level (4.2) with a path; it catches everything but names
    lIR symbols, not source positions. Size: M (three to five days).
-3. **Address spaces in lIR**: `(global shared NAME [N x float] ..)` lowered with `LLVMAddGlobalInAddressSpace(.., 3)` and an
+3. **Address spaces in lIR**: `(GLOBAL SHARED NAME (ARRAY N FLOAT) ..)` lowered with `LLVMAddGlobalInAddressSpace(.., 3)` and an
    `addrspacecast` at each `@NAME` use (LLVM's `InferAddressSpaces` then makes `ld.shared`); a `(gpu/shared T N)` builtin that emits one
    per kernel. The measured gain: 1.55x on GEMM (16.9 against 10.9 TFLOPS). Size: S-M (two to three days: the lIR grammar, the lowering, the
    builtin with its spec row and case, ADR 0014).
@@ -377,7 +377,7 @@ What the emitter needed: **nothing above the lIR.** The compiler change (two com
 |---|---|
 | compiler/lir/targets.fib | the row `row-nvptx64-cuda`; `kernel-row?`, `kernel-triple?`, `KERNEL-FUN-PREFIX`; `os-of-triple` knows `-cuda`; `row-buildable?` admits a kernel row |
 | compiler/llvm/target.fib, core.fib | the four NVPTX initialisers; `LLVMGetTypeKind`, `LLVMGetIntTypeWidth` |
-| compiler/lir/{types,ast,parse/ty,parse/control,check/expr,check/phi,print,dump}.fib | `CcKernel` (`kernelcc`); `KSreg`, `KBarrier` (`(sreg R)`, `(barrier)`) |
+| compiler/lir/{types,ast,parse/ty,parse/control,check/expr,check/phi,print,dump}.fib | `CcKernel` (`kernelcc`); `KSreg`, `KBarrier` (`(SREG R)`, `(BARRIER)`) |
 | compiler/native/lower/{lx,arith,expr,memory}.fib, lower.fib | cc 71; the intrinsics; the `kernel` flag of `Lx`; `kernel-refusal` off a kernel target (`kernel-align` removed 2026-10-25) |
 | compiler/native/kernel.fib (new, 215 lines) | the kernel module: reach, rewrite, refuse, PTX names |
 | compiler/native/api.fib, target.fib | `--emit ptx`; the kernel module on a kernel target; `requested-triple-row` |
@@ -394,10 +394,10 @@ The design replaces three stand-ins of the prototype (each a delta the front end
 2. **The index space as builtins.** Today: externs `gpu.sreg.R`, `gpu.barrier` in gpu.fib, rewritten by `native.kernel` to the lIR forms.
    Design: builtins `gpu/local-id`, `gpu/group-id`, `gpu/group-size`, `gpu/grid-size`, `gpu/barrier` (ADR 0014: a spec row and a case
    each) in a platform-layer module `fib.gpu` (ADR 0011: it declares no extern, it emits forms), lowered by emit/lower/builtins.fib to
-   `(sreg ..)` and `(barrier)`. ADR 0003 checked: no function of `compiler/` or `lib/` is named `defkernel`, `global-id`, `local-id`,
+   `(SREG ..)` and `(BARRIER)`. ADR 0003 checked: no function of `compiler/` or `lib/` is named `defkernel`, `global-id`, `local-id`,
    `group-size`, `grid-size` or `barrier`; `lib/fib/tls/hello.fib` has a `group-id` (TLS groups), which the qualified builtin `gpu/group-id`
    does not capture, but the plain name `group-id` must not become a core form.
-3. **Alignment from the emitter, not from lair.** Done 2026-10-25: the scalar raw accessors emit `(align 4)`/`(align 8)` on a kernel target
+3. **Alignment from the emitter, not from lair.** Done 2026-10-25: the scalar raw accessors emit `(ALIGN 4)`/`(ALIGN 8)` on a kernel target
    (`raw-align`), and lair's `kernel-align` rule is removed (section 3.3).
 
 ## 10. Phases, sizes, the first milestone
@@ -465,7 +465,7 @@ The two kernel-side gaps of section 12. Verified on this machine's RTX 4080 SUPE
 
 | what | where | verdict |
 |---|---|---|
-| warp shuffles as builtins | `gpu/shfl-{down,up,xor,idx}-{i32,f32}`, `gpu/subgroup-size`, `gpu/lane-id`, `gpu/ballot` (compiler/types/builtins.fib, emit.lower.gpu; spec/types.md 2.17): lIR `(shfl-MODE v lane)`, `(sreg warpsize)`, `(sreg laneid)`, `(ballot c)` (spec/lir.md 6.9a, the intrinsic table of lir.intrin, class `warp`) | PTX `shfl.sync.{down,up,bfly,idx}.b32 .., 31 (0 for up), -1`, `%warpsize`, `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroupShuffle*`, `subgroupBallot(c).x`, the entry builtins (webgpu.md 3.6). On the host a thread is a warp of one |
+| warp shuffles as builtins | `gpu/shfl-{down,up,xor,idx}-{i32,f32}`, `gpu/subgroup-size`, `gpu/lane-id`, `gpu/ballot` (compiler/types/builtins.fib, emit.lower.gpu; spec/types.md 2.17): lIR `(SHFL-MODE v lane)`, `(SREG warpsize)`, `(SREG laneid)`, `(BALLOT c)` (spec/lir.md 6.9a, the intrinsic table of lir.intrin, class `warp`) | PTX `shfl.sync.{down,up,bfly,idx}.b32 .., 31 (0 for up), -1`, `%warpsize`, `%laneid`, `vote.sync.ballot.b32`; WGSL `subgroupShuffle*`, `subgroupBallot(c).x`, the entry builtins (webgpu.md 3.6). On the host a thread is a warp of one |
 | rejected where unsupported | a WGSL module that uses a warp form says `// fib.requires: subgroups`; a device without the feature rejects it by name before compiling; the C and JS backends refuse the forms like `sreg` | `rejected: the module requires the WebGPU subgroups feature ..` (exit 4 of the harnesses) |
 | the library | `fib.gpu.warp` (exported by `fib.gpu`: `shfl-down-i32` .., `subgroup-size`, `lane-id`, `ballot`), `fib.gpu.reduce-warp` (`block-sum-i32 -max-i32 -min-i32 block-sum-f32 -max-f32`), `fib.gpu.reduce-warp-kernels` (`reduce-warp-sum-i32 -max-i32 -min-i32 -max-f32 -partials-f32`, `warp-probe`) | the butterfly `shfl-xor` reduces a warp so every lane holds its value; one shared word per thread, one barrier, a second butterfly over the warp values: one barrier where the tree has 2 log2(block). Integer and f32-max results equal the CPU's exactly; the f32 sum is deterministic for a warp width but not the tree's order, within n * 2^-24 * sum \|x\| of the left-to-right sum |
 | f32 atomics in WGSL | `gpu/atomic-add-f32` (and, new, `gpu/atomic-max-f32`, `gpu/atomic-min-f32`; lIR `atomicrmw fadd fsub fmax fmin`) lowered in native/wgsl/atomic.fib to a compare-and-exchange loop over the u32 bits; PTX keeps `atom.global.add.f32` | accepted by the WGSL printer (cases 8578, 8580); add within the documented bound, max and min exact |

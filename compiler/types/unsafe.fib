@@ -7,9 +7,16 @@
 (ns types.unsafe
   (:use syntax.pos types.ty types.table types.ast types.decls types.program))
 
-;; The words of lIR that matter to a reviewer, with the orderings and operators that follow them.
-(def interesting: (Vec str) ["atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence" "spin-hint" "cache-line" "call" "inttoptr" "ptrtoint" "store" "load"])
-(def orderings: (Vec str) ["unordered" "monotonic" "acquire" "release" "acq_rel" "seq_cst"])
+;; The words of lIR that matter to a reviewer, with the orderings that follow them: as the body writes them (upper case, spec/lir.md 2),
+;; and the canonical name the report gives each (lower case, as lIR's own messages name a word).
+(def interesting-names: (Vec str) ["atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence" "spin-hint" "cache-line" "call" "inttoptr" "ptrtoint" "store" "load"])
+(def interesting: (Vec str) ["ATOMIC-LOAD" "ATOMIC-STORE" "ATOMICRMW" "CMPXCHG" "FENCE" "SPIN-HINT" "CACHE-LINE" "CALL" "INTTOPTR" "PTRTOINT" "STORE" "LOAD"])
+(def ordering-names: (Vec str) ["unordered" "monotonic" "acquire" "release" "acq_rel" "seq_cst"])
+(def orderings: (Vec str) ["UNORDERED" "MONOTONIC" "ACQUIRE" "RELEASE" "ACQ_REL" "SEQ_CST"])
+
+;; The canonical name of a word of `words`, whose names are `names` in the same order.
+(defun canonical :private (words: (Vec str) names: (Vec str) w: str) -> str
+  (match (first (filter (fn (i: i64) (= (nth words i) w)) (range (count words)))) ((some i) (nth names i)) (nil w)))
 
 (defun separator? :private (b: i8) -> bool (or (or (= b 32i8) (= b 10i8)) (or (= b 9i8) (or (= b 40i8) (= b 41i8)))))
 
@@ -32,7 +39,8 @@
                      (if (member? interesting w)
                          (let [near (vec (take 4 (drop (+ i 1) ts)))
                                ords (vec (filter (fn (x: str) (member? orderings x)) near))]
-                           (some (str-join (vec (interpose " " (into [w] ords))))))
+                           (some (str-join (vec (interpose " " (into [(canonical interesting interesting-names w)]
+                                                                     (mapv (fn (o: str) (canonical orderings ordering-names o)) ords)))))))
                          nil)))
                  (range (count ts)))))))))
 
