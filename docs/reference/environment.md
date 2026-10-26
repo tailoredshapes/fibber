@@ -23,9 +23,6 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_EMIT_EXE` | [compiler/driver/commands.fib:14](../../compiler/driver/commands.fib#L14) |
 | `FIB_EXPORTS` | [compiler/driver/shared.fib:17](../../compiler/driver/shared.fib#L17) |
 | `FIB_HEADER` | [compiler/driver/shared.fib:14](../../compiler/driver/shared.fib#L14) |
-| `FIB_JS_ARGV0` | [compiler/lir2js.fib:60](../../compiler/lir2js.fib#L60) |
-| `FIB_JS_RT` | [compiler/lir2js.fib:46](../../compiler/lir2js.fib#L46) |
-| `FIB_JS_UNLINK` | [compiler/lir2js.fib:59](../../compiler/lir2js.fib#L59) |
 | `FIB_KERNEL_PTX` | [compiler/driver/commands.fib:146](../../compiler/driver/commands.fib#L146) |
 | `FIB_KERNEL_TARGET` | [compiler/driver/commands.fib:82](../../compiler/driver/commands.fib#L82) |
 | `FIB_LAIR_WORKERS` | [compiler/native/cases.fib:19](../../compiler/native/cases.fib#L19) |
