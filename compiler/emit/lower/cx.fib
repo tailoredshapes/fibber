@@ -13,7 +13,7 @@
 ;; `hub-default` in emit.lower.mod (the only constructor). A context for a generated body (a wrapper, a vtable function) is
 ;; `lcx-sub` of the context it is made in: it keeps the hub.
 (ns emit.lower.cx
-  (:use syntax.pos types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program)
+  (:use syntax.pos types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program emit.statics)
   (:require [emit.node :as nx]) (:require [lir.ast :as la] [lir.types :as lt]))
 
 ;; What an expression yielded: a value, or a jump (the block ended). Rust: lower/mod.rs:38 Flow
@@ -180,16 +180,21 @@
 (defun pos-text (p: Pos) -> str
   (str-join [(. p file) ":" (str (. p line)) ":" (str (. p col))]))
 
+;; The address of a C string holding `text`: the program's one constant of that text (emit.statics `statics-cstring`), so the
+;; sites of one message share it.
+(defun lcx-cstr (cx: LowerCx text: str) -> la/LExpr
+  (nx/reference (statics-cstring (. (. cx p) statics) text)))
+
 ;; A trap with a C-string message: the block ends here. In a macro module (`macro-module`) a trap fails the expansion through the
 ;; module's hook and carries the position of the expression being lowered (`at`). Rust: lower/fault.rs:18 Cx::trap_c
 (defun lcx-trap-c (cx: LowerCx msg: str) -> unit
-  (let ((plain (nx/call "fib.trap-c" [(nx/string msg)])))
+  (let ((m (lcx-cstr cx msg)) (plain (nx/call "fib.trap-c" [m])))
     (lcx-fail cx (match @(. cx at)
                    ((some e) (if @(. (. cx p) macro-module)
-                                 (nx/call "fib.trap-at-c" [(nx/string (pos-text (. e pos))) (nx/string msg)])
+                                 (nx/call "fib.trap-at-c" [(lcx-cstr cx (pos-text (. e pos))) m])
                                  plain))
                    (nil plain))
-              (nx/call "fib.raise-c" [(nx/string msg)]))))
+              (nx/call "fib.raise-c" [m]))))
 
 ;; The block no clause of a match matched, or that an irrefutable binding failed into, when no value can reach it: the checker
 ;; proved the clauses exhaustive (types.exhaust, on every def, defun, method and macro body; types.elab's matches end in `_`) or

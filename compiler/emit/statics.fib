@@ -19,13 +19,15 @@
    keywords: (Cell (Vec str)) keyword-index: (Cell (Map str i64)) keywords-sealed: (Cell bool)
    closures: (Cell (Vec StaticClosure)) closure-index: (Cell (Map str str))
    vtables: (Cell (Vec StaticVtable)) vtable-index: (Cell (Map str str))
+   ;; The C strings the emitter writes at many sites (a trap's message, a position), each text once: its constant `cstr.N`, by text.
+   cstrs: (Cell (Vec la/LItem)) cstr-index: (Cell (Map str str))
    ;; Module-level items written in full by whoever needs them (the host index state and the shared-memory windows of fib.gpu,
    ;; emit.lower.gpu; the kernel table of a kernel target, emit.compile), by name, each once.
    items: (Cell (Vec la/LItem)) item-index: (Cell (Set str))))
 
 (defun statics-new () -> Statics
   (Statics (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell false)
-           (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty))))
+           (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell []) (cell (set-empty))))
 
 ;; The module item `lir` under the name `name`, added once; the answer is `@name`.
 (defun statics-item (st: Statics name: str item: la/LItem) -> str
@@ -42,6 +44,17 @@
           (name (str-join ["@str." (str (count @(. st strings)))])))
       (do (cell-update! (. st strings) (fn (strings: (Vec StaticStr)) (conj strings (StaticStr tid-str text (render-string i tid-str text)))))
           (cell-update! (. st string-index) (fn (names: (Map str str)) (assoc names text name)))
+          name))))
+
+;; The address of the private constant holding `text` and a NUL, the one of every site that names this text: `@cstr.N`, made when the
+;; text is first wanted. spec/lir.md 3 makes each `(string ..)` its own constant, so the emitter writes a message it repeats (the trap
+;; of every checked `+` says "integer overflow in + at i64") once here rather than as a `(string ..)` at each site.
+(defun statics-cstring (st: Statics text: str) -> str
+  (if-some [n (get @(. st cstr-index) text)]
+    n
+    (let ((i (count @(. st cstrs))) (name (str-join ["@cstr." (str i)])))
+      (do (cell-update! (. st cstrs) (fn (items: (Vec la/LItem)) (conj items (render-cstring i text))))
+          (cell-update! (. st cstr-index) (fn (names: (Map str str)) (assoc names text name)))
           name))))
 
 ;; The interned id of a keyword. Once the table is sealed, a keyword that is not in it is a broken invariant: a trap, as the
@@ -124,7 +137,13 @@
                                             (n/integer lt/ty-i64 count) (n/array-value array-ty (byte-words text))])
                               true (la/LModifiers la/lk-internal false false false false false nil) 0 false))))
 
-;; The constants: strings, immortal closures, vtables, one piece each (the pieces `statics-render` joins; a string's is made once).
+;; `(constant private cstr.I [N x i8] ..)`: the bytes of `text` and a NUL.
+(defun render-cstring :private (i: i64 text: str) -> la/LItem
+  (let ((ty (lt/TArray (+ (str-len text) 1) lt/ty-i8)))
+    (la/ItGlobal (la/LGlobalDef (str "cstr." i) ty (n/array-value ty (byte-words text))
+                              true (la/LModifiers la/lk-private false false false false false nil) 0 false))))
+
+;; The constants: strings, C strings, immortal closures, vtables, one piece each (the pieces `statics-render` joins; a string's is made once).
 ;; Rust: statics.rs:105 Statics::render
 (defun statics-render-pieces (st: Statics) -> (Vec str)
   (mapv (fn (item: la/LItem) (print/print-module (la/LModule [item]))) (statics-items st)))
@@ -134,7 +153,7 @@
 
 
 (defun statics-items (st: Statics) -> (Vec la/LItem)
-  (into (into (into (mapv (fn (s: StaticStr) (. s item)) @(. st strings)) @(. st items))
+  (into (into (into (into (mapv (fn (s: StaticStr) (. s item)) @(. st strings)) @(. st cstrs)) @(. st items))
               (mapv (fn (c: StaticClosure)
                       (la/ItGlobal (la/LGlobalDef (unat (. c name)) (lt/TAnon [lt/ty-i64 lt/ty-i32 lt/ty-i32 lt/ty-ptr])
                                                 (n/aggregate [(n/integer lt/ty-i64 0) (n/integer lt/ty-i32 (. c tid))

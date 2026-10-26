@@ -212,7 +212,13 @@ FLT   ::= a float token | INF | -INF | NAN   ; §1
   2 has type i64, expected i32`). `(ZEROINITIALIZER T)` is a constant
   of any sized `T`; it emits no instruction.
 - `(STRING "…")` may appear in any function and as a global
-  initialiser (§9); each occurrence is its own constant.
+  initialiser (§9); each occurrence is its own constant: two equal
+  strings have two addresses, on both paths and at every optimisation
+  level. lair writes the constant `private` and never `unnamed_addr`
+  (LLVM merges only `unnamed_addr` constants; until 2026-10-25 lair
+  marked every string so and the spec and the code disagreed: decision
+  D12 of docs/design/lir-language.md, **Decided** owner 2026-10-25, the
+  code follows the spec; §14 item 22; `cases/lir/instr/string-own-constant.lir`).
 
 ## 4. Modules
 
@@ -2061,3 +2067,4 @@ one the passes used.
 | 19 | `(dependent-library STRING)`: LLVM's `!llvm.dependent-libraries` as a module form; lair lowers it to that metadata and links and loads from it on every path, and reads no `;; link-lib:` comment and no list beside the module any more | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.9, cases/lir/link |
 | 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |
 | 21 | lIR spells names out and every word it owns is upper case (owner, 2026-10-25: "lir should prefer spelled out names not abbreviations or macros. So @ should be 'global'"; "I'm also ok with using CAPS for lir"): `(GLOBAL f)` for `@f`, `(STRUCT S)` for `%struct.S`, `(PTR (ADDRSPACE 1))` for `(ptr 1)`, `FUNCTION` for `fn`, `ALWAYSINLINE` for `inline`, `PRESERVE_MOSTCC` for `preservemost`, `INF`/`NAN`, `(VECTOR N T)`, `(ARRAY N T)` and `(LITERAL-STRUCT ..)` for LLVM's bracket syntax; names as written; a name that is a word refused; the reserved words and the reserved macro names gone; one table of the words (`compiler/lir/words.fib`) held equal to the grammar by `compiler/tests/lir/words.sh`; `lair respell` converts a text. The audit and the plan: `/tank/data/fibber-scratch/lir-language/respell-audit.md` | **Decided** (owner, 2026-10-25) | §1, §2, §3, §4, §5.1, §5.3, §6, §9, §12 |
+| 22 | string constants: each `(STRING ..)` is its own constant, so lair writes no `unnamed_addr` and LLVM merges none (D12: the code follows the spec) | **Decided** (owner, 2026-10-25) | §3, cases/lir/instr/string-own-constant.lir |
