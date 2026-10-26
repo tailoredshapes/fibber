@@ -23,4 +23,4 @@ false sharing (for which a larger stride would help) but something else on the E
 
 **What this does not show.** One CPU. A store-and-load test: the adjacent-line prefetcher's effect on **reads** of the neighbouring line (a consumer polling a cursor next to a line a
 producer writes) is not measured here, and is the case the 128-byte folklore is about. Until a read-polling variant and the other targets (Zen, Apple M, a Neoverse) are measured the
-table in `compiler/types/targets.fib` keeps its conservative values: 128 for x86-64 and AArch64, 64 for the rest.
+table in `compiler/lir/targets.fib` keeps its conservative values: 128 for x86-64 and AArch64, 64 for the rest.

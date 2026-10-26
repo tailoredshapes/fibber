@@ -84,9 +84,9 @@ Two, both per target, both in lIR (so the form needs no special case):
 | `(spin-hint)` | `void`: x86-64 `pause`, AArch64 `yield` (`hint #1`), RISC-V `pause` (Zihintpause), nothing where the target has none. Emitted as the target's intrinsic, which the reserved `llvm.` names keep out of user lIR |
 | `(cache-line)` | `i64` constant: the **destructive interference size** of the target, the distance two threads' writes must be apart not to share a line. It is not necessarily the cache line the OS reports (the folklore is that Intel's adjacent-line prefetcher doubles it; the first measurement, docs/shootout/cache-line, found **64 enough** between this i7-14700KF's cores for a store-and-load test, and did not test the read-polling case that folklore is about) |
 
-`(cache-line)` is also a fibber builtin of the same name beside `(has-fma)` (types 1.9, `compiler/types/target.fib`'s `Target` record gets a field), so a macro or a
+`(cache-line)` is also a fibber builtin of the same name beside `(has-fma)` (types 1.9, `compiler/lir/target.fib`'s `Target` record gets a field), so a macro or a
 `defstruct` padding can use it. The value per target is **measured, not copied**: a false-sharing sweep (two threads, each incrementing its own word, at strides 8 to 256) on
-one machine of each target family in `docs/shootout/`, and the table in `compiler/types/targets.fib` cites the run. Until a family is measured it takes the conservative 128
+one machine of each target family in `docs/shootout/`, and the table in `compiler/lir/targets.fib` cites the run. Until a family is measured it takes the conservative 128
 (x86-64 and AArch64) or 64 (the rest). A code path that must also run where the build target differs (a library compiled for one CPU and run on another) stores the value it was
 built with in its own header, as fib-disruptor will.
 
@@ -161,7 +161,7 @@ The form, the library and the acceptance case are built (fibber commits after `6
 * **A body may not call a function** (there is no way to declare one in it yet): sleeping a thread, `sched_yield` and so on stay in the platform layer.
 * **The partitioner** (compiler/native/liro/partition.fib) copies every `inline` function into every unit that calls it, always (before, copying small functions across units was an opt-in knob,
   `FIB_LIRO_IMPORT`); without it `alwaysinline` cannot inline a call into another unit, which is where the default build splits the program.
-* **`(cache-line)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (types.targets `cache-line-of-arch`), not per CPU.
+* **`(cache-line)` is not a fibber builtin**: `fib.atomic/cache-line` wraps the lIR form and LLVM folds the constant. The table is per architecture (lir.targets `cache-line-of-arch`), not per CPU.
 * **Measured** (fib-disruptor, one producer and one consumer, an i7-14700KF, two runs each): the ring written in fibber over `fib.atomic` runs 550 to 560 M events a second at batch 64 and 1024 and 40 M
   at batch 1; the extern version ranged 25 to 32 M at batch 1 and 270 to 660 M above. Its 24 specs and 13 mutants run under a plain `fibc test`: no shared library, no build script, no `LD_PRELOAD`.
 * **`fibc explain unsafe FILE`** (compiler/types/unsafe.fib) lists every `unsafe` block, `extern` call and `lir` form of the program and its libraries, sorted by place, with the atomics and orderings each `lir` form uses; checked in compiler/tests/driver/cli.sh.

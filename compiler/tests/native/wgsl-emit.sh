@@ -1,5 +1,5 @@
 #!/bin/bash
-# The WebGPU kernel target (docs/design/webgpu.md; compiler/types/targets.fib `row-wgsl-webgpu`; native.wgsl): what `fibc build --target
+# The WebGPU kernel target (docs/design/webgpu.md; compiler/lir/targets.fib `row-wgsl-webgpu`; native.wgsl): what `fibc build --target
 # wgsl-unknown-webgpu --emit wgsl` writes for examples/webgpu/kernels.fib, and what it refuses. No GPU is needed.
 #   1. the table has the row, marked a kernel target, and `fibc build` accepts it without --allow-unsupported;
 #   2. the WGSL holds the four kernels as `@compute @workgroup_size(wg_x, wg_y, wg_z)` entries with their `// fib.kernel-sig` signature lines, the

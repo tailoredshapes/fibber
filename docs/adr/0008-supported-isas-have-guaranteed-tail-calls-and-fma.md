@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-10-06
-Source: the owner, 2026-10-06 (docs/design/decisions-2026-10-04.md, "Supported instruction sets"); compiler/types/targets.fib; docs/design/targets.md.
+Source: the owner, 2026-10-06 (docs/design/decisions-2026-10-04.md, "Supported instruction sets"); compiler/lir/targets.fib; docs/design/targets.md.
 
 ## Context
 
@@ -18,7 +18,7 @@ where FMA is simply unavailable we emit a warning / trap if its used on that sys
 ## Decision
 
 A native target is **supported** only when its toolchain guarantees a tail call between functions of any signature (LLVM `tailcc` with
-`musttail`) **and** its instruction set has fused multiply-add. The table of targets (`compiler/types/targets.fib`, `fibc targets`) says so
+`musttail`) **and** its instruction set has fused multiply-add. The table of targets (`compiler/lir/targets.fib`, `fibc targets`) says so
 per row in its `support` column, and `row-supported?` checks the facts as well as the mark.
 
 - x86-64 is supported at **x86-64-v3** (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE): the row's CPU for cross builds and releases
@@ -48,7 +48,7 @@ per row in its `support` column, and `row-supported?` checks the facts as well a
 
 ## Governance
 
-The rules read the table's `TargetRow` literals in `compiler/types/targets.fib` (24 fields after the head: 12 `has-fma`, 14 `tail-cc`,
+The rules read the table's `TargetRow` literals in `compiler/lir/targets.fib` (24 fields after the head: 12 `has-fma`, 14 `tail-cc`,
 15 `tail-kind`, 24 `support`), so a planted row is seen exactly as a real one would be.
 
 ```fibber fitness
@@ -61,11 +61,11 @@ The rules read the table's `TargetRow` literals in `compiler/types/targets.fib` 
 
 (defun table-rows (repo: Repo) -> (Vec Node)
   (reduce (fn (acc: (Vec Node) f: SrcFile) (reduce (fn (a: (Vec Node) t: Top) (into a (rows-in (. t node)))) acc (. f tops)))
-          [] (select repo ["compiler/types/targets.fib"])))
+          [] (select repo ["compiler/lir/targets.fib"])))
 
 (defun field (row: Node i: i64) -> str (atom-text (nth (items-of row) i)))
 
-(defun row-finding (row: Node why: str) -> Finding (Finding "compiler/types/targets.fib" (node-line row) (str (field row 1) ": " why)))
+(defun row-finding (row: Node why: str) -> Finding (Finding "compiler/lir/targets.fib" (node-line row) (str (field row 1) ": " why)))
 
 (defun supported-row? (row: Node) -> bool (= (field row 24) "\"supported\""))
 
@@ -73,27 +73,27 @@ The rules read the table's `TargetRow` literals in `compiler/types/targets.fib` 
   (mapv (fn (r: Node) (row-finding r "marked supported without tailcc 18, musttail and fma"))
         (filterv (fn (r: Node) (and (supported-row? r) (not (and (= (field r 12) "true") (and (= (field r 14) "18") (= (field r 15) "2"))))))
                  (table-rows repo)))
-  (plant "compiler/types/targets.fib" "\n(defun row-bad () -> TargetRow (TargetRow \"wasm64-x\" \"wasm64\" \"wasi\" \"Linux\" \"\" 64 true \"none\" 128 \"generic\" \"\" false 0 0 1 1 \"none\" \"wasm\" \"wasm-ld\" \"\" \"none\" [] \"emits\" \"supported\"))\n"))
+  (plant "compiler/lir/targets.fib" "\n(defun row-bad () -> TargetRow (TargetRow \"wasm64-x\" \"wasm64\" \"wasi\" \"Linux\" \"\" 64 true \"none\" 128 \"generic\" \"\" false 0 0 1 1 \"none\" \"wasm\" \"wasm-ld\" \"\" \"none\" [] \"emits\" \"supported\"))\n"))
 
 (rule "riscv64 has a row, and it is parked, not supported"
   (let ((rv (filterv (fn (r: Node) (= (field r 2) "\"riscv64\"")) (table-rows repo))))
     (if (empty? rv)
-        [(Finding "compiler/types/targets.fib" 1 "no riscv64 row")]
+        [(Finding "compiler/lir/targets.fib" 1 "no riscv64 row")]
         (mapv (fn (r: Node) (row-finding r "riscv64 is not parked")) (filterv (fn (r: Node) (not (starts-with? (field r 24) "\"parked"))) rv))))
-  (plant "compiler/types/targets.fib" "\n(defun row-rv-bad () -> TargetRow (TargetRow \"riscv64-x\" \"riscv64\" \"linux\" \"Linux\" \"\" 64 true \"pthreads\" 128 \"generic-rv64\" \"\" true 0 18 2 2 \"dwarf-eh\" \"elf\" \"cc\" \"\" \"glibc\" [] \"emits\" \"supported\"))\n"))
+  (plant "compiler/lir/targets.fib" "\n(defun row-rv-bad () -> TargetRow (TargetRow \"riscv64-x\" \"riscv64\" \"linux\" \"Linux\" \"\" 64 true \"pthreads\" 128 \"generic-rv64\" \"\" true 0 18 2 2 \"dwarf-eh\" \"elf\" \"cc\" \"\" \"glibc\" [] \"emits\" \"supported\"))\n"))
 
 (rule "the x86_64 and aarch64 rows are supported, and x86_64's CPU is x86-64-v3"
   (into (mapv (fn (r: Node) (row-finding r "not marked supported"))
               (filterv (fn (r: Node) (and (or (= (field r 2) "\"x86_64\"") (= (field r 2) "\"aarch64\"")) (not (supported-row? r)))) (table-rows repo)))
         (mapv (fn (r: Node) (row-finding r "x86_64's CPU is not x86-64-v3"))
               (filterv (fn (r: Node) (and (= (field r 2) "\"x86_64\"") (not (= (field r 10) "\"x86-64-v3\"")))) (table-rows repo))))
-  (plant "compiler/types/targets.fib" "\n(defun row-x-bad () -> TargetRow (TargetRow \"x86_64-x\" \"x86_64\" \"linux\" \"Linux\" \"\" 64 true \"pthreads\" 128 \"x86-64-v2\" \"\" true 0 18 2 2 \"dwarf-eh\" \"elf\" \"cc\" \"\" \"glibc\" [] \"runs\" \"supported\"))\n"))
+  (plant "compiler/lir/targets.fib" "\n(defun row-x-bad () -> TargetRow (TargetRow \"x86_64-x\" \"x86_64\" \"linux\" \"Linux\" \"\" 64 true \"pthreads\" 128 \"x86-64-v2\" \"\" true 0 18 2 2 \"dwarf-eh\" \"elf\" \"cc\" \"\" \"glibc\" [] \"runs\" \"supported\"))\n"))
 
 (rule "the rules above read the table: at least seven rows, four of them supported (an unreadable table would pass them all)"
   (let ((rs (table-rows repo)))
     (if (and (>= (count rs) 7) (>= (count (filterv supported-row? rs)) 4)) []
-        [(Finding "compiler/types/targets.fib" 1 (str (count rs) " TargetRow literals, " (count (filterv supported-row? rs)) " supported"))]))
-  (plant-file "compiler/types/targets.fib" "(ns types.targets)\n"))
+        [(Finding "compiler/lir/targets.fib" 1 (str (count rs) " TargetRow literals, " (count (filterv supported-row? rs)) " supported"))]))
+  (plant-file "compiler/lir/targets.fib" "(ns lir.targets)\n"))
 
 (rule "the release baseline in mk/release.mk is x86-64-v3, and no live line of it names x86-64-v2"
   (into (must-contain repo "mk/release.mk" "RELEASE_CPU ?= x86-64-v3") (grep-live repo ["mk/release.mk"] "x86-64-v2"))

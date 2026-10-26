@@ -8,7 +8,7 @@
 ;;
 ;; FIB_TARGET_CPU names the CPU to generate code for instead of the host's, with no extra features (a release is built for a baseline
 ;; such as `x86-64-v2`); unset, empty or `host` mean the host's CPU name and feature string, as `requested_cpu` in target.rs.
-(ns llvm.target (:require [llvm.ffi :as ffi] [llvm.core :as core] [types.targets :as tt]))
+(ns llvm.target (:require [llvm.ffi :as ffi] [llvm.core :as core] [lir.targets :as tt]))
 
 (extern LLVMInitializeX86TargetInfo () -> unit)
 (extern LLVMInitializeX86Target () -> unit)
@@ -61,7 +61,7 @@
 
 ;; ---------------------------------------------------------------------------------------------------------------------------------
 
-;; Registers the x86-64, AArch64, WebAssembly, RISC-V and NVPTX targets (the architectures of types.targets' rows), their machine-code layers, assembly printer and
+;; Registers the x86-64, AArch64, WebAssembly, RISC-V and NVPTX targets (the architectures of lir.targets' rows), their machine-code layers, assembly printer and
 ;; parser (NVPTX has no parser: its assembly is PTX, which the GPU driver assembles). Idempotent in LLVM; call it once.
 (defun init () -> unit
   (unsafe
@@ -115,11 +115,11 @@
 ;; cases/stdlib/6223 and 6224): the reload of a spilled value for the next call's argument is placed before the `sub sp, sp, #N` that
 ;; restores the callee-popped bytes, so it reads the wrong slot and the program crashes (docs/design/aarch64.md 2.3). On AArch64 -O 0
 ;; therefore generates code at level Less (the selector and register allocator of -O 1; IR optimisation stays off). x86 is unchanged. The floor
-;; is the row's `min-level` (types.targets).
+;; is the row's `min-level` (lir.targets).
 (defun machine-level :private (triple: i64 opt: i64) -> i32
   (codegen-level (max opt (. (tt/target-row-of-triple (ffi/c-string-at triple)) min-level))))
 
-;; The relocation model of a machine for the triple at address `triple`: the row's (types.targets `reloc`; PIC but on WebAssembly).
+;; The relocation model of a machine for the triple at address `triple`: the row's (lir.targets `reloc`; PIC but on WebAssembly).
 (defun reloc-of :private (triple: i64) -> i32
   (if (= (. (tt/target-row-of-triple (ffi/c-string-at triple)) reloc) 1) 1i32 2i32))
 
@@ -181,7 +181,7 @@
     (if (or (= v "") (= v "host")) nil (some v))
     nil))
 
-;; The CPU a cross target is built for when FIB_TARGET_CPU names none: the row's (types.targets): `apple-m1` for the Apple triples (NEON, FMA and the
+;; The CPU a cross target is built for when FIB_TARGET_CPU names none: the row's (lir.targets): `apple-m1` for the Apple triples (NEON, FMA and the
 ;; rest of ARMv8.4), `generic-rv64` for riscv64, else LLVM's `generic` (NEON and FP are baseline in AArch64; a Linux server CPU can be named with FIB_TARGET_CPU).
 (defun default-cpu-of (triple: str) -> str
   (. (tt/target-row-of-triple triple) default-cpu))

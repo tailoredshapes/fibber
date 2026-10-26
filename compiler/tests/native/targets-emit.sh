@@ -1,5 +1,5 @@
 #!/bin/bash
-# Code generation for the targets of the table (compiler/types/targets.fib, docs/design/targets.md) that this machine cannot run: wasm32-wasip1,
+# Code generation for the targets of the table (compiler/lir/targets.fib, docs/design/targets.md) that this machine cannot run: wasm32-wasip1,
 # wasm32-unknown-unknown and riscv64-unknown-linux-gnu. Nothing is linked or run here (no wasm-ld, WASI sysroot, wasmtime or riscv64 sysroot).
 #   0. the table: `fibc targets` prints a row for each triple; the runtime's C functions of the table are exactly the `declare`s of rt/*.lir;
 #   1. lowering and code generation succeed for the accepted lIR cases (cases/lir/{simd,instr,mapping}) through `lairf build --emit obj` and for fibber
@@ -45,7 +45,7 @@ for t in $triples x86_64-unknown-linux-gnu aarch64-apple-darwin aarch64-unknown-
 done
 [ $bad -eq 0 ] && ok "the table has a row for each of the $(($(wc -l < "$T/table") - 1)) targets"
 rt_decls() { grep -ho '^(declare [^ ]*' rt/*.lir | awk '{print $2}' | sort -u; }
-table_fns() { sed -n '/(defun runtime-c-functions/,/^$/p' compiler/types/targets.fib | grep -o '"[^"]*"' | tr -d '"' | sort -u; }
+table_fns() { sed -n '/(defun runtime-c-functions/,/^$/p' compiler/lir/targets.fib | grep -o '"[^"]*"' | tr -d '"' | sort -u; }
 if diff <(rt_decls) <(table_fns) > "$T/d"; then ok "runtime-c-functions is exactly the $(rt_decls | wc -l) declares of rt/*.lir"; else no "runtime-c-functions and rt/*.lir differ: $(tr '\n' ' ' < "$T/d")"; fi
 
 # 1. lowering and code generation

@@ -33,7 +33,7 @@ The runtime (`rt/*.lir`) and `fib.os` need the services of docs/design/platform-
 | sockets, `fork`/`exec`, pipes, `dup`, host names, `mkdtemp`, the path of the executable | not in preview 1. `fib.os` answers ENOSYS where the library asks (`lib/platform/wasi/fib/os/backend.fib`); a program that calls `fork`, `getaddrinfo` or `mkdtemp` does not link, and the link error says what to do |
 | errno | wasi-libc's numbers are WASI's (ENOENT is 44); the runtime and `fib.os` answer the Linux numbers of the same errors, so the library's error kinds are one table |
 
-Why wasi-libc and not "no libc": the runtime needs about 50 C functions (`compiler/types/targets.fib` `runtime-c-functions`); wasi-libc has 47 of them and `snprintf`/`strtod` (the float
+Why wasi-libc and not "no libc": the runtime needs about 50 C functions (`compiler/lir/targets.fib` `runtime-c-functions`); wasi-libc has 47 of them and `snprintf`/`strtod` (the float
 printer and reader, `%.800e`, are the hard part of a libc-free runtime). The measured price is size: a hello world is **43 KB** stripped, 231 KB with the name section (of which `printf`'s core
 is 8.7 KB, `dlmalloc` 5.4 KB): the libc is what the module is, not a dependency to apologise for. The libc-free design of targets.md 5.3 stays right for `wasm32-unknown-unknown` (the browser
 without WASI), where it is most of the work; it is not done.
@@ -60,7 +60,7 @@ The cases this changes are listed in compiler/tests/wasm/expected.txt with the r
 - **The JIT runs on the host.** Constant `def`s and macros are evaluated by running the program's code in an in-process JIT, so for a target whose pointers are not the host's they are laid out
   and lowered for the host; the constants come back as text (LLVM lays the struct constants out for the target), and the rest of the module is lowered afresh at the target's width
   (`emit.compile/make-defs-at`, `emit.program/program-rebuilt`). A macro's module always uses the host layout (`macro-module`).
-- **`size_t` and `long` are `i32`** in wasi-libc. The runtime and the library write them `i64`; the lowering declares the libc functions of `types.targets/libc-narrow-names` with the target's
+- **`size_t` and `long` are `i32`** in wasi-libc. The runtime and the library write them `i64`; the lowering declares the libc functions of `lir.targets/libc-narrow-names` with the target's
   types and narrows each argument and widens each result (`native.lower.calls`). A size that does not fit becomes the largest `i32` (so that `malloc` fails, not that its low 32 bits succeed).
   `lseek`'s `off_t` is 64 bits and stays.
 - **`main`** is wasi-libc's `__main_argc_argv`.

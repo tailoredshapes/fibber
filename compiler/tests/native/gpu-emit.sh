@@ -1,5 +1,5 @@
 #!/bin/bash
-# The kernel target (docs/design/gpu.md; compiler/types/targets.fib `row-nvptx64-cuda`; native.kernel; own.kernel): what `fibc build --target
+# The kernel target (docs/design/gpu.md; compiler/lir/targets.fib `row-nvptx64-cuda`; native.kernel; own.kernel): what `fibc build --target
 # nvptx64-nvidia-cuda --emit ptx` writes for examples/gpu/kernels.fib, what it refuses, and what `--kernel-target` builds. No GPU is needed
 # (fib-gpu-cuda runs the PTX; its tests are in that repository).
 #   1. the table has the row, marked a kernel target, and `fibc build` accepts it without --allow-unsupported;

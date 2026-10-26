@@ -1,4 +1,4 @@
-;; compiler/types/target.fib: the code generation target as the front end sees it (docs/design/simd-and-tensors.md 2.9, spec/lir.md 4.5).
+;; compiler/lir/target.fib: the code generation target as the front end sees it (docs/design/simd-and-tensors.md 2.9, spec/lir.md 4.5).
 ;;
 ;; A `Target` is the CPU (and CPU features) the module's code is generated for, and what the front end must know of it: the vector width
 ;; that `:native` and `f32xn` stand for and whether `fma` is fast. It is a plain value, an explicit parameter of the checker (it lives in
@@ -7,21 +7,21 @@
 ;; host; this module is pure, so that the checker needs no LLVM.
 ;;
 ;; The width is the vector width the compiler *prefers* (a Skylake-X or client AVX-512 machine prefers 256, as LLVM does; Sapphire Rapids, Zen 4 and
-;; later and x86-64-v4 prefer 512: types.targets, docs/design/avx512.md; FIB_VECTOR_BITS overrides it); a wrong
+;; later and x86-64-v4 prefer 512: lir.targets, docs/design/avx512.md; FIB_VECTOR_BITS overrides it); a wrong
 ;; choice costs speed, never results, because every vector operation legalises on every target (design 0.4).
-(ns types.target (:use types.targets))
+(ns lir.target (:use lir.targets))
 
 ;; `cpu` and `features` are the strings of the module's `(target (cpu ..) (features ..))`: `features` is empty for a named CPU (LLVM
 ;; knows what the name stands for) and the host's whole list for the host. `vector-bits` is 128, 256 or 512.
 (defstruct Target (cpu: str features: str vector-bits: i64 has-fma: bool))
 (derive Eq Target)
 
-;; Whether `cpu` is an aarch64 CPU by name (types.targets `cpu-row`).
+;; Whether `cpu` is an aarch64 CPU by name (lir.targets `cpu-row`).
 (defun cpu-aarch64? :private (cpu: str) -> bool
   (match (cpu-row cpu) ((some r) (= (. r family) "aarch64")) (nil false)))
 
 ;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own: the width and fma of its row in the CPU table of
-;; types.targets (x86-64-v3 and the AVX2 CPUs 256 bits with FMA, an aarch64 CPU 128 bits with FMA); a name the table lacks is a baseline x86-64.
+;; lir.targets (x86-64-v3 and the AVX2 CPUs 256 bits with FMA, an aarch64 CPU 128 bits with FMA); a name the table lacks is a baseline x86-64.
 (defun target-of-cpu (cpu: str) -> Target
   (match (cpu-row cpu)
     ((some r) (Target cpu "" (. r vector-bits) (. r has-fma)))

@@ -10,8 +10,8 @@ of data. It shows what each new row emits today and lists what stands between em
 
 ## 1. Summary
 
-* `compiler/types/targets.fib` holds the table: one `TargetRow` per target, plus a CPU table. Four readers now get their answers from it:
-  `types.target` (lane counts and fma from the CPU table), `llvm.target` (the cross CPU, features, the -O 0 floor, the relocation model and
+* `compiler/lir/targets.fib` holds the table: one `TargetRow` per target, plus a CPU table. Four readers now get their answers from it:
+  `lir.target` (lane counts and fma from the CPU table), `llvm.target` (the cross CPU, features, the -O 0 floor, the relocation model and
   the backends it initialises), `native.target` (the checker's Target for `--target`) and `expand.targetos` (the OS backend of the library and the
   runtime). The lowering also gets lIR's `tailcc` and the tail-call kind from the row. `fibc targets` prints the table.
 * The host and the x86 and aarch64 rows behave as before. Main's F and this branch's F emit byte-identical lIR, and main's lairf and this

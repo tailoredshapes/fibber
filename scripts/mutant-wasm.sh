@@ -21,7 +21,7 @@ ulimit -v 16000000
 command -v node >/dev/null || { echo "skip: node is not installed"; exit 77; }
 if [ -z "${WASI_SDK:-}" ]; then for d in "$HOME"/.cache/fibber-scratch/tools/wasm/wasi-sdk-*; do [ -d "$d" ] && WASI_SDK=$d; done; export WASI_SDK; fi
 if [ -z "${WASI_SDK:-}" ] && ! command -v wasm-ld >/dev/null && [ -z "${WASM_LD:-}" ]; then echo "skip: no wasm-ld (set WASI_SDK)"; exit 77; fi
-files="compiler/native/linkwasm.fib compiler/native/lower/calls.fib compiler/types/targets.fib compiler/emit/lower/simdfn.fib compiler/emit/layout.fib"
+files="compiler/native/linkwasm.fib compiler/native/lower/calls.fib compiler/lir/targets.fib compiler/emit/lower/simdfn.fib compiler/emit/layout.fib"
 for f in $files; do mkdir -p "$out/orig/$(dirname "$f")"; cp "$root/$f" "$out/orig/$f"; done
 restore() { for f in $files; do cp "$out/orig/$f" "$root/$f"; done; }
 trap restore EXIT
@@ -48,7 +48,7 @@ mutant() { # NAME FILE OLD NEW
 }
 mutant memory-grow compiler/native/linkwasm.fib '4294901760' '67108864'
 mutant fd-write compiler/native/lower/calls.fib '(core/const-int i64t 4294967295 false)))' '(core/const-int i64t 65535 false)))'
-mutant tail-call compiler/types/targets.fib '"+simd128,+tail-call" false 1 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT"' '"+simd128" false 1 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT"'
+mutant tail-call compiler/lir/targets.fib '"+simd128,+tail-call" false 1 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT"' '"+simd128" false 1 0 1 1 "none" "wasm" "wasm-ld" "WASI_SYSROOT"'
 mutant simd-lane-order compiler/emit/lower/simdfn.fib '(range (* 16 k) (* 16 (+ k 1)))' '(range (* 16 (- (quot n 16) (+ k 1))) (* 16 (- (quot n 16) k)))'
 mutant pointer-width compiler/emit/layout.fib '((LirPtr) (Pair pb pb)) ((LirRaw) (Pair pb pb))' '((LirPtr) (Pair 8 8)) ((LirRaw) (Pair 8 8))'
 mutant no-saturation compiler/native/lower/calls.fib '(b-select (. fx b) big (core/const-int i32t 4294967295 false) low)' '(b-select (. fx b) big low low)'

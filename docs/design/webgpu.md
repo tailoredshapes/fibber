@@ -1,6 +1,6 @@
 # WebGPU: the second kernel backend, for the browser, node and the native host
 
-Status: built and measured (WEBGPU-1, 2026-10-07). In this tree: the kernel-target row `wgsl-unknown-webgpu` (compiler/types/targets.fib),
+Status: built and measured (WEBGPU-1, 2026-10-07). In this tree: the kernel-target row `wgsl-unknown-webgpu` (compiler/lir/targets.fib),
 the WGSL printer `native.wgsl` (compiler/native/wgsl.fib and wgsl/), `--emit wgsl`, the JS host glue and the wasm host (examples/webgpu/js/),
 the example kernels and their CPU references (examples/webgpu/), the tests (compiler/tests/native/wgsl-emit.sh, cases/stdlib 8570-8577,
 scripts/webgpu-agree.sh, scripts/mutant-webgpu.sh) and the tool fetcher (scripts/fetch-webgpu-tools.sh). In its own repository: the native
@@ -246,7 +246,7 @@ CUDA and WebGPU and planted faults); the rule that stays is the source-level one
 
 | where | delta |
 |---|---|
-| compiler/types/targets.fib | the row `row-wgsl-webgpu` (triple `wgsl-unknown-webgpu`, arch `wgsl`, os `webgpu`, object format `wgsl`, a kernel target); `wgsl-row?`; `os-of-triple` knows `-webgpu` |
+| compiler/lir/targets.fib | the row `row-wgsl-webgpu` (triple `wgsl-unknown-webgpu`, arch `wgsl`, os `webgpu`, object format `wgsl`, a kernel target); `wgsl-row?`; `os-of-triple` knows `-webgpu` |
 | compiler/native/wgsl.fib (160 lines), wgsl/wx.fib (170), wgsl/expr.fib (250), wgsl/func.fib (200) | the printer: the module (the prelude, the signatures, the entries), the context and types, the expressions, the functions |
 | compiler/native/api.fib | `--emit wgsl`: the kernel module through `native.wgsl` instead of `aot-emit`; every LLVM `--emit` refused on the row |
 | compiler/driver/args.fib | the `wgsl` word |

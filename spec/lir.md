@@ -1201,7 +1201,7 @@ more than one core.
 | Form | Type | Meaning |
 |---|---|---|
 | `(SPIN-HINT)` | void, not a terminator | the target's hint that this thread is spinning: `pause` on x86-64, `yield` on AArch64 (`llvm.x86.sse2.pause`, `llvm.aarch64.hint(1)`); nothing on a target that has none. It orders no memory and is not a fence; the optimiser may not remove it |
-| `(CACHE-LINE)` | `i64`, a constant | the **destructive interference size** of the target in bytes: how far apart two threads' writes must be not to share a line. 128 on x86-64 and AArch64, 64 elsewhere (a conservative table, `types.targets` `cache-line-of-arch`; the measurements that would replace a row are in docs/shootout/cache-line). It is the size of the target the module is generated for, so a library built for one CPU and run on another keeps the value it was built with |
+| `(CACHE-LINE)` | `i64`, a constant | the **destructive interference size** of the target in bytes: how far apart two threads' writes must be not to share a line. 128 on x86-64 and AArch64, 64 elsewhere (a conservative table, `lir.targets` `cache-line-of-arch`; the measurements that would replace a row are in docs/shootout/cache-line). It is the size of the target the module is generated for, so a library built for one CPU and run on another keeps the value it was built with |
 
 Both take no operands (`spin-hint expects 0 operands, found 1`). Cases: `cases/lir/inline`.
 
@@ -1243,7 +1243,7 @@ It takes no operands (`stack-addr expects 0 operands, found 1`). The calling con
 
 ### 6.9a Kernel forms (accepted by the owner on 2026-10-07; GPU-1, docs/design/gpu.md; the warp forms `laneid`, `warpsize`, `shfl-*`, `ballot` accepted on 2026-10-08, GPU-5)
 
-Additions for a **kernel target** (types.targets `kernel-row?`: `nvptx64-nvidia-cuda`), whose module is the kernels of a program and whose
+Additions for a **kernel target** (lir.targets `kernel-row?`: `nvptx64-nvidia-cuda`), whose module is the kernels of a program and whose
 assembly is PTX; nothing of them runs on a CPU target, and lair refuses them there before LLVM sees them.
 
 | Form | Rule |

@@ -34,7 +34,7 @@ Pure functions the runtime and libraries take from libc but that need no platfor
 `strlen` (LLVM emits them), `strerror`, `snprintf` (`%f`, `%.17g`: `fib.fmt`, `fib.json`), `strtod` `strtof`, `trunc` `truncf` `sqrt` (LLVM intrinsics), `gmtime_r` `strftime`
 (the HTTP date), `inet_pton` `inet_ntop`. Not used anywhere: `dlopen`, `getaddrinfo` (no DNS), `setlocale`, `iconv`, `mmap` directly, `signal` handlers, `getpwnam`.
 
-Where it is cheap, the interface already goes through one place: the runtime's C functions are one list (`runtime-c-functions` in `compiler/types/targets.fib`, checked against the
+Where it is cheap, the interface already goes through one place: the runtime's C functions are one list (`runtime-c-functions` in `compiler/lir/targets.fib`, checked against the
 `declare`s of `rt/` by `compiler/tests/native/targets-emit.sh`), each target row says which its C library lacks (`libc-lacks`), and the OS differences of the runtime are one
 module, `compiler/emit/os.fib` (`sys-for`: Darwin's names, musl's missing `mallopt`). A later tier is a new row and a new case in `sys-for`, not a rewrite. What is NOT
 one place: `fib.os`'s own `extern`s (spread over six files, which is where ADR 0011 says they belong) and the six violators listed in ADR 0011. This package does not move them.

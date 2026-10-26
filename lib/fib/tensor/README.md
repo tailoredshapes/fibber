@@ -214,7 +214,7 @@ original strides, so any view is accepted without a copy. The kernel is one sour
 so the tile follows the register file. At 256 bits (AVX2, sixteen ymm) it is a
 6x8 (`f64`) or 6x16 (`f32`) tile of twelve vector accumulators updated with
 `simd/fma`, a broadcast of A and two vector loads of B per inner step. Where the
-target's native width is 512 bits (`x86-64-v4`, Sapphire Rapids, Zen 4 and later: types.targets, docs/design/avx512.md; thirty-two zmm) it is a 6x32 (`f64`)
+target's native width is 512 bits (`x86-64-v4`, Sapphire Rapids, Zen 4 and later: lir.targets, docs/design/avx512.md; thirty-two zmm) it is a 6x32 (`f64`)
 or 6x64 (`f32`) tile of 24 accumulators, four vector loads of B and one broadcast: 29 of 32 registers, no spill. (A target without FMA, `(has-fma)` false, takes the multiply-then-add tiles of `gemm-f64`/`gemm-f32` instead; aarch64 would want its own tile.) An
 incomplete tile at the right or bottom edge goes through a scratch tile and the
 same kernel. Blocks are 256 (`f64` narrow tile) or 512 (every other tile) inner steps, 96 rows and
@@ -247,7 +247,7 @@ ordered scalar semantics.
 ## Vector width (AVX-512)
 
 The lane kernels are written over the target's native width: `(native-lanes f64)` is 4 at 256 bits and 8 at 512, `f32xn` 8 and 16. Which width a
-CPU gets is its row in `compiler/types/targets.fib` (`fibc targets` lists the targets; `x86-64-v4`, `sapphirerapids`, `graniterapids`, `znver4` and
+CPU gets is its row in `compiler/lir/targets.fib` (`fibc targets` lists the targets; `x86-64-v4`, `sapphirerapids`, `graniterapids`, `znver4` and
 `znver5` prefer 512, every other AVX2 CPU 256, Skylake-X and the client AVX-512 cores stay at 256 because they throttle or have one 512-bit fma unit),
 and `FIB_VECTOR_BITS=128|256|512` overrides it for one run (a width the CPU lacks is split into the registers it has: correct, at that CPU's speed;
 this is how the 512-bit shape of every kernel is tested on an AVX2 machine, `compiler/tests/lanes/lanes.sh`). A program built for the host on an

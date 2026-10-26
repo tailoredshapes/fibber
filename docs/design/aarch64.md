@@ -45,7 +45,7 @@ front end writes the form from the `Target` it was given (`emit/compile.fib:70-7
 
 ### 2.2 The `Target` record, lanes, fma
 
-`compiler/types/target.fib`: `cpu-avx2?` (lines 20-25) lists x86 CPU names; `target-of-cpu` (28) gives 256 bits and `has-fma` only for those and 128/false
+`compiler/lir/target.fib`: `cpu-avx2?` (lines 20-25) lists x86 CPU names; `target-of-cpu` (28) gives 256 bits and `has-fma` only for those and 128/false
 for every other name; `target-of-features` (34) reads `+avx2` and `+fma` from LLVM's host feature list; `target-baseline` is `x86-64`, `target-default`
 `x86-64-v3` (40, 44). On an aarch64 host `target-of-features` looks for `+avx2` and `+fma` in LLVM's host feature list; AArch64 FMA is base floating point and (to be confirmed on the Mac) not a listed `+fma` feature, so it would report **128 bits and no fma**, wrong for `has-fma`.
 * The spike does not touch this file (SC1 owns it). `native/target.fib` `cross-target-info` returns `(Target cpu "" 128 true)` for an aarch64 triple.
@@ -170,7 +170,7 @@ A64-6. The dynamic route (Homebrew `llvm@21`, rpath) works today and is what `ma
 * Scripts: `compiler/tests/native/a64-emit.sh` (6.1), `a64-cross-mac.sh`, `a64-fibc-on-mac.sh`, `scripts/mac-run-objects.sh`, `scripts/mac-check.sh`.
 
 Decisions: (1) one environment variable and one flag, no new tool: the target is global process configuration read at the three places that need it, as `FIB_TARGET_CPU` already is. No global
-mutable state is added in fibber code; the "state" is the process environment, as before. (2) The JIT never takes the target: it executes. (3) `cross-target-info` lives in `native/target.fib`, not `types/target.fib`,
+mutable state is added in fibber code; the "state" is the process environment, as before. (2) The JIT never takes the target: it executes. (3) `cross-target-info` lives in `native/target.fib`, not `lir/target.fib`,
 only because SC1 is editing the latter; the rows belong in `target-of-cpu` once it is free (A64-2).
 
 ## 4. Triples
@@ -289,7 +289,7 @@ Step 6 passes by listing the known failures; a failure outside `KNOWN` is printe
 | 4 | JIT `-O 0` crash on 6223 | fixed, root cause in 2.3 (a LLVM FastISel/RegAllocFast bug with callee-pop `tailcc` calls, JIT and AOT) |
 | 5 | `lairf cases`/`fuzz` use `/proc/self/exe` | fixed (`fib.os` `executable-path`); `lairf cases` ran on the Mac; `fuzz` shares the function and was not run there |
 | 6 | 7402/7404 timeouts on Darwin | 7404 was a real hang with a root cause shared with every variadic C call: see 7.1. 7402 passes alone in 1 s on the Mac (its earlier timeout was the 10-job load, or the same fcntl garbage) |
-| 7 | `has-fma` on a native aarch64 host | `(has-fma)` is true on the Mac (printed); cases 7077/7078 compare `mmul` with the reference of the target's kernel and pass on the Mac and on x86 with `FIB_TARGET_CPU=x86-64` and `x86-64-v3`. Rows for aarch64 CPUs in `types/target.fib` (A64-2) were not touched |
+| 7 | `has-fma` on a native aarch64 host | `(has-fma)` is true on the Mac (printed); cases 7077/7078 compare `mmul` with the reference of the target's kernel and pass on the Mac and on x86 with `FIB_TARGET_CPU=x86-64` and `x86-64-v3`. Rows for aarch64 CPUs in `lir/target.fib` (A64-2) were not touched |
 | 8 | `package.sh`, `llvm-static.sh`, `SEED`, CI Linux-x86 only | `SEED` has a per-platform table and `fetch-seed.sh` reads it; `package.sh` builds the darwin-arm64 tarball (7.2); CI and the release workflow were not changed |
 | 9 | iOS has no backend variant | open |
 | 10 | the macro runner under a different OS | open |
@@ -321,7 +321,7 @@ Sizes: S under a day, M one to three days, L about a week. "Linux" is what can b
 |---|---|---|---|---|
 | **A64-0** (this) | `--target`, AArch64 init, cross machine, `targetos`, tests, scripts, this design, cross seed | | `a64-emit.sh`, the x86 gate | `a64-cross-mac.sh`, `mac-check.sh` (done once: 6.3) |
 | **A64-1** (S) | land A64-0; add `a64-emit.sh --quick` to `scripts/gate.sh` (or CI) so the aarch64 emit path cannot rot; `mac-check.sh` into the release checklist | A64-0 | yes | no |
-| **A64-2** (S) | Target rows for aarch64 in `types/target.fib`: `cpu-aarch64?` table (apple-m1..m4, neoverse-*), `has-fma` true, 128 bits; `target-of-features` knows an aarch64 host (`+neon`, no `+fma` feature); remove `cross-target-info` | SC1's `has-fma` | unit tests; `a64-emit.sh` kernel | one native run of 7077/7078 |
+| **A64-2** (S) | Target rows for aarch64 in `lir/target.fib`: `cpu-aarch64?` table (apple-m1..m4, neoverse-*), `has-fma` true, 128 bits; `target-of-features` knows an aarch64 host (`+neon`, no `+fma` feature); remove `cross-target-info` | SC1's `has-fma` | unit tests; `a64-emit.sh` kernel | one native run of 7077/7078 |
 | **A64-3** (M) | Runtime and library portability: `sysconf` constant by OS (`rt/task.lir`, adapted in `emit/os.fib`), `strfromd` to `snprintf :varargs`, `lairf cases/fuzz` through `executable-path`, mailbox mutex size, `abi-data` errno in the tests (`3607`); 7402/7404 Darwin pipes/TCP | A64-0 | emit, x86 gate (changes are shared code) | yes: `mac-check.sh` must list fewer KNOWN |
 | **A64-4** (M) | JIT on arm64 macOS: root-cause 6223 at `-O 0` (FastISel/ORC), measure JIT startup and macro-heavy builds vs x86, mailbox/shim review against AAPCS64 for more than 8 integer arguments and variadic callees | A64-0 | no | yes (lldb on the Mac) |
 | **A64-5** (S) | Distribution decision: hardened runtime and `com.apple.security.cs.allow-jit` entitlement for a notarised `fibc`; ad-hoc is enough for a developer-built `fibc` (measured) | A64-4 | no | yes (`codesign`, `spctl`) |
@@ -337,7 +337,7 @@ The reason the cross route is short: `fibc emit` is pure fibber and needs no LLV
 ## 9. What was not done
 
 Nothing ran on iOS, the iOS Simulator, aarch64 Linux or an M4. The Mac's `mac-check.sh` was run in `--quick` mode only (A64-1: `0 step(s) failed`, KNOWN reduced to `1707`). A hardened-runtime or notarised `fibc` was not tried.
-A64-1 did not touch the aarch64 CPU rows of `types/target.fib`, CI, the release workflow or `a64-emit.sh` in the gate; it did not publish or tag anything, and the `SEED` row for darwin-arm64 is empty until a release exists.
+A64-1 did not touch the aarch64 CPU rows of `lir/target.fib`, CI, the release workflow or `a64-emit.sh` in the gate; it did not publish or tag anything, and the `SEED` row for darwin-arm64 is empty until a release exists.
 First performance numbers are in `docs/shootout/aarch64.md`; the NEON GEMM tile was not rewritten. The Rust seed and `crates/` were not touched.
 
 ## 10. DARWIN-2: a second `tailcc` finding

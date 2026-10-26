@@ -185,7 +185,7 @@ and reopened by the program, as CUDA demands.
 
 ### 4.1 The target table
 
-A row with a new class (compiler/types/targets.fib `row-nvptx64-cuda`, `kernel-row?`):
+A row with a new class (compiler/lir/targets.fib `row-nvptx64-cuda`, `kernel-row?`):
 
 | triple | ptr | threads | vector, CPU | fma | -O0 floor | tailcc / kind | reloc | object, linker | libc | status | support |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -375,7 +375,7 @@ What the emitter needed: **nothing above the lIR.** The compiler change (two com
 
 | where | delta |
 |---|---|
-| compiler/types/targets.fib | the row `row-nvptx64-cuda`; `kernel-row?`, `kernel-triple?`, `KERNEL-FUN-PREFIX`; `os-of-triple` knows `-cuda`; `row-buildable?` admits a kernel row |
+| compiler/lir/targets.fib | the row `row-nvptx64-cuda`; `kernel-row?`, `kernel-triple?`, `KERNEL-FUN-PREFIX`; `os-of-triple` knows `-cuda`; `row-buildable?` admits a kernel row |
 | compiler/llvm/target.fib, core.fib | the four NVPTX initialisers; `LLVMGetTypeKind`, `LLVMGetIntTypeWidth` |
 | compiler/lir/{types,ast,parse/ty,parse/control,check/expr,check/phi,print,dump}.fib | `CcKernel` (`kernelcc`); `KSreg`, `KBarrier` (`(sreg R)`, `(barrier)`) |
 | compiler/native/lower/{lx,arith,expr,memory}.fib, lower.fib | cc 71; the intrinsics; the `kernel` flag of `Lx`; `kernel-refusal` off a kernel target (`kernel-align` removed 2026-10-25) |
