@@ -22,7 +22,7 @@
 
 (defun item :private (form: Sexp) -> (Result LItem Diagnostic)
   (match form
-    ((SxList items pos)
+    ((SxList items pos _)
      (let ((head (if (> (count items) 0) (word-of (nth items 0)) ""))
            (rest (if (> (count items) 0) (vec-from items 1) items)))
        (cond (= head "defstruct") (defstruct-form rest pos)
@@ -42,7 +42,7 @@
   (if (not (= (count rest) 1))
       (err pos "dependent-library expects one string")
       (match (nth rest 0)
-        ((SxStr bs _) (if (= (array-len bs) 0)
+        ((SxStr bs _ _) (if (= (array-len bs) 0)
                           (err (sexp-pos (nth rest 0)) "dependent-library: the name must not be empty")
                           (Ok (ItDependentLibrary (LDependentLibrary (str-from-bytes bs) pos)))))
         (other (err (sexp-pos other) (str "dependent-library expects one string, found " (sexp-describe other)))))))
@@ -64,7 +64,7 @@
 
 (defun ownership-field :private (seen: (Map str str) f: Sexp) -> (Result (Map str str) Diagnostic)
   (match f
-    ((SxList items p)
+    ((SxList items p _)
      (let ((key (if (> (count items) 0) (word-of (nth items 0)) ""))
            (val (if (= (count items) 2) (some (nth items 1)) nil)))
        (cond (not (includes? key ownership-fields)) (err p (str "ownership: unknown field " (if (= key "") (sexp-describe f) key)))
@@ -115,7 +115,7 @@
 
 (defun target-field :private (acc: TargetAcc f: Sexp) -> (Result TargetAcc Diagnostic)
   (match f
-    ((SxList items p)
+    ((SxList items p _)
      (let ((key (if (> (count items) 0) (word-or-atom (nth items 0)) "")))
        (cond (and (= (count items) 2) (= key "cpu")) (target-cpu acc (nth items 1) p)
              (and (= (count items) 2) (= key "features")) (target-features acc (nth items 1) p)
@@ -127,7 +127,7 @@
 (defun target-cpu :private (acc: TargetAcc v: Sexp p: i64) -> (Result TargetAcc Diagnostic)
   (cond (some? (. acc cpu)) (err p "target: duplicate cpu")
         :else (match v
-                ((SxStr bs _) (if (and (> (array-len bs) 0) (name-bytes? bs 0 (array-len bs)))
+                ((SxStr bs _ _) (if (and (> (array-len bs) 0) (name-bytes? bs 0 (array-len bs)))
                                   (Ok (with acc (cpu (some (str-from-bytes bs)))))
                                   (err (sexp-pos v) "target: cpu must be a non-empty string of letters, digits, ., _ and -")))
                 (_ (err (sexp-pos v) "target: cpu must be a non-empty string of letters, digits, ., _ and -")))))
@@ -135,7 +135,7 @@
 (defun target-features :private (acc: TargetAcc v: Sexp p: i64) -> (Result TargetAcc Diagnostic)
   (cond (some? (. acc features)) (err p "target: duplicate features")
         :else (match v
-                ((SxStr bs _)
+                ((SxStr bs _ _)
                  (match (bad-feature bs)
                    ((some w) (err (sexp-pos v) (str "target: each feature must be +name or -name, found \"" w "\"")))
                    (nil (Ok (with acc (features (some (str-from-bytes bs))))))))
@@ -161,7 +161,7 @@
     (try-let ((_ (arity "defstruct" rest 2 pos))
               (name (global-name (nth rest 0))))
       (match (nth rest 1)
-        ((SxList fields _)
+        ((SxList fields _ _)
          (try-let ((fs (parse-types fields))) (Ok (ItStruct (LStructDef name fs pos mutable)))))
         (other (err (sexp-pos other) "expected a field type list"))))))
 
@@ -179,11 +179,11 @@
 ;; `(EXPORT-NAME "NAME")` among the modifiers: the name, or why the form is not one.
 (defun export-name-form :private (s: Sexp) -> (Result (Option str) Diagnostic)
   (match s
-    ((SxList items p)
+    ((SxList items p _)
      (if (and (> (count items) 0) (atom-word? (nth items 0) "export-name"))
          (if (= (count items) 2)
              (match (nth items 1)
-               ((SxStr bs _) (if (= (array-len bs) 0) (err p "export-name: the name must not be empty") (Ok (some (str-from-bytes bs)))))
+               ((SxStr bs _ _) (if (= (array-len bs) 0) (err p "export-name: the name must not be empty") (Ok (some (str-from-bytes bs)))))
                (other (err (sexp-pos other) (str "export-name expects one string, found " (sexp-describe other)))))
              (err p "export-name expects one string"))
          (Ok nil)))
@@ -294,7 +294,7 @@
         (if (< (count body) 2)
             (err pos "define expects (NAME R), parameters and blocks")
             (match (nth body 0)
-              ((SxList h _)
+              ((SxList h _ _)
                (if (= (count h) 2)
                    (define-rest m split body (nth h 0) (nth h 1) pos)
                    (err (sexp-pos (nth body 0)) "expected (NAME R) after define")))
@@ -312,12 +312,12 @@
 
 (defun params :private (s: Sexp) -> (Result Params Diagnostic)
   (match s
-    ((SxList items _)
+    ((SxList items _ _)
      (loop ((i 0) (tys []) (names []))
        (if (>= i (count items))
            (Ok (Params tys names))
            (match (nth items i)
-             ((SxList tn pp)
+             ((SxList tn pp _)
               (if (or (= (count tn) 2) (and (= (count tn) 3) (atom-word? (nth tn 1) "owned")))
                   (match (param-type (nth tn 0) (= (count tn) 3) pp)
                     ((Err d) (Err d))
@@ -345,7 +345,7 @@
 
 (defun block :private (s: Sexp) -> (Result LBlock Diagnostic)
   (match s
-    ((SxList items pos)
+    ((SxList items pos _)
      (if (and (> (count items) 0) (atom-word? (nth items 0) "block"))
          (if (< (count items) 2)
              (err pos "block needs a label")

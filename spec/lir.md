@@ -451,25 +451,30 @@ same shape for a module: its functions, globals, structs and macros.
 use's; `lir.sexp.gensym` makes a fresh name for a binding the macro introduces (`cases/lir/macros/gensym.lir`).
 
 **The form type.** A form of lIR is one of five kinds: a symbol, an integer, a float, a string or a list, each with its position (file,
-line, column). That is the reader's output (§1: what the text reads as), what a macro takes and returns, and what a **reader macro**
+line, column) and its span (start and end, byte offsets). That is the reader's output (§1: what the text reads as), what a macro takes and returns, and what a **reader macro**
 (§4.8) returns: their results and a macro's are the same type, interchangeable. lair holds the type in two representations that convert without loss: its own value (`lir.sexp/Sexp`, what the reader
 makes and the parser takes) and the objects a macro's code sees, laid out thus, owned by lIR and by no front end (fibber's `Form` is not
 them):
 
 ```
-(DEFSTRUCT lir.sexp (I64 I64 I64 PTR))                   ; the start of every object: tag, line, column, file
-(DEFSTRUCT lir.sexp.symbol (I64 I64 I64 PTR PTR I64))    ; 1, position, bytes (a NUL after them), count
-(DEFSTRUCT lir.sexp.integer (I64 I64 I64 PTR I64))       ; 2, position, value
-(DEFSTRUCT lir.sexp.float (I64 I64 I64 PTR DOUBLE))      ; 3, position, value
-(DEFSTRUCT lir.sexp.string (I64 I64 I64 PTR PTR I64))    ; 4, position, bytes (a NUL after them), count
-(DEFSTRUCT lir.sexp.list (I64 I64 I64 PTR PTR I64 I64 I64)) ; 5, position, items (an array of ptr), count, capacity, bracket (0 `()`, 1 `{}`, 2 `[]`)
+(DEFSTRUCT lir.sexp (I64 I64 I64 PTR I64 I64))                   ; the start of every object: tag, line, column, file, start, end
+(DEFSTRUCT lir.sexp.symbol (I64 I64 I64 PTR I64 I64 PTR I64))    ; 1, position, span, bytes (a NUL after them), count
+(DEFSTRUCT lir.sexp.integer (I64 I64 I64 PTR I64 I64 I64))       ; 2, position, span, value
+(DEFSTRUCT lir.sexp.float (I64 I64 I64 PTR I64 I64 DOUBLE))      ; 3, position, span, value
+(DEFSTRUCT lir.sexp.string (I64 I64 I64 PTR I64 I64 PTR I64))    ; 4, position, span, bytes (a NUL after them), count
+(DEFSTRUCT lir.sexp.list (I64 I64 I64 PTR I64 I64 PTR I64 I64 I64)) ; 5, position, span, items (an array of ptr), count, capacity, bracket (0 `()`, 1 `{}`, 2 `[]`)
 ```
 
 An atom of the text is an integer when it is an integer token (§1) whose value fits an `i64`, a float when it is a float token
 (`inf`, `-inf`, `nan` included), else a symbol: `(GLOBAL f)`, `(STRUCT s)`, names, keywords and `...` are symbols, and so is a vector type `(VECTOR N T)`,
 a symbol of exactly that text (one reads back as the type). A string is its bytes; `(LITERAL-STRUCT ..)` and `[ .. ]` are lists with their bracket.
 The position is the form's: its line and column, 1-based, and its file as a NUL-terminated path (the module's, or the library's for a
-form in one); line and column 0 and a null file for an object a macro made. Going back, an integer prints in decimal, a float as the
+form in one); line and column 0 and a null file for an object a macro made. The span is the text the form was read from: the byte
+offset in its file of its first character and of the byte after its last, counted from 0 (a list ends after its closing bracket, a
+string after its closing quote, whatever its escapes; `cases/lir/macros/span.lir`); a form a reader macro returned spans the text the
+run consumed (§4.8). A form no text made, an object a macro made, has no span: start and end 0, and it gets none when the macro
+returns (the expander gives it the use's position, not the use's span); a form a macro passed through keeps its span. Spans are offsets
+below 2³²; the reader keeps one word per form for them. Going back, an integer prints in decimal, a float as the
 shortest decimal that reads back to it or `inf`, `-inf`, `nan`. The layout is the contract: a macro may read the fields with
 `getelementptr`, but the functions below are the way, and they are declared in every macro's body without a `declare` (they and the
 stream's functions of §4.8 are the only names that are):
@@ -477,6 +482,7 @@ stream's functions of §4.8 are the only names that are):
 | Function | Does |
 |---|---|
 | `(lir.sexp.tag s) : i64`, `(lir.sexp.line s) : i64`, `(lir.sexp.column s) : i64`, `(lir.sexp.file s) : ptr` | the tag and the position of any object |
+| `(lir.sexp.start s) : i64`, `(lir.sexp.end s) : i64` | the span of any object: the byte offsets of its first character and of the byte after its last, 0 and 0 for a made one |
 | `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(STRING "DEFINE")`), copied |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
 | `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
@@ -691,7 +697,9 @@ becomes an object (§4.6: an integer token an integer, a float token a float, el
 made as symbols are symbols to the next macro, and the parser reads their text as it reads any atom's. A macro that wants a float from
 digits it read makes one with `lir.sexp.float-text` (§4.6). The form a macro returns is at the position of the first
 character (the `'` of `'x`, the `#` of `#(..)`); a form it read with `lir.read.form` keeps its own position
-(`cases/lir/readers/positions.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
+(`cases/lir/readers/positions.lir`). Its span is the text the run consumed, from the macro character (the `#` of a dispatch macro, the
+atom's first for the token reader) to where the run left the stream, and so is that of every form in it the macro made (the `quote` of
+`(quote x)`); a form it read with `lir.read.form`, and the token reader's atom, keep their own (`cases/lir/readers/span.lir`). A macro that returns null without a failure read **no form**: the reader goes on as if nothing
 stood there, inside a list or at the top level, which is how `#_` discards the next form (`cases/lir/readers/discard.lir`). A failure
 recorded with `lir.read.fail` is the module's error, at the position the macro gave or at the character; an error in a form the macro
 read through `lir.read.form` (a lexical error, an unclosed list, a nested macro's failure) is the module's error where it is, whatever

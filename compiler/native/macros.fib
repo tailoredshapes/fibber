@@ -66,7 +66,7 @@
 ;; a splice in a splice flattens by this recursion, and a spliced `define-macro` defines its macro for the forms after it.
 (defun splice :private (env: Env items: (Cell (Vec LItem)) importer: Importer r: Sexp) -> (Option Diagnostic)
   (match r
-    ((SxList xs _)
+    ((SxList xs _ _)
      (loop ((i 1))
        (if (>= i (count xs))
            nil
@@ -87,7 +87,7 @@
 ;; A top-level form with the macro at its head applied (`top-use`) and nothing else; a form that is no use, as it is.
 (defun top-result :private (env: Env form: Sexp) -> (Result Sexp Diagnostic)
   (match form
-    ((SxList its pos) (match (macro-of env its)
+    ((SxList its pos _) (match (macro-of env its)
                         ((some m) (top-use env m its pos 0))
                         (nil (Ok form))))
     (_ (Ok form))))
@@ -107,11 +107,11 @@
 ;; again while its head names a macro, and then its children are expanded. The arguments of a use reach the macro unexpanded.
 (defun expand :private (env: Env form: Sexp) -> (Result Sexp Diagnostic)
   (match form
-    ((SxList its pos) (match (macro-of env its)
-                        ((some m) (expand-use env m its pos 0))
-                        (nil (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxList xs pos)))))))
-    ((SxBrace its pos) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBrace xs pos)))))
-    ((SxBracket its pos) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBracket xs pos)))))
+    ((SxList its pos sp) (match (macro-of env its)
+                           ((some m) (expand-use env m its pos 0))
+                           (nil (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxList xs pos sp)))))))
+    ((SxBrace its pos sp) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBrace xs pos sp)))))
+    ((SxBracket its pos sp) (match (expand-all env its) ((Err d) (Err d)) ((Ok xs) (Ok (SxBracket xs pos sp)))))
     (_ (Ok form))))
 
 ;; A use inside a form: `top-use`, then the children; a result that is a splice has no place inside a form.
@@ -129,7 +129,7 @@
       (match (apply-macro env m its pos)
         ((Err d) (Err d))
         ((Ok out) (match out
-                    ((SxList xs p) (match (macro-of env xs)
+                    ((SxList xs p _) (match (macro-of env xs)
                                      ((some m2) (top-use env m2 xs p (+ steps 1)))
                                      (nil (Ok out))))
                     (_ (Ok out)))))))
@@ -228,7 +228,7 @@
 ;; `(define-macro NAME (PARAM..) BLOCK..)`: the blocks are expanded with the macros so far, then compiled.
 (defun define-macro :private (env: Env form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (if (< (count its) 4)
          (some (Diagnostic pos "define-macro expects NAME, (PARAM..) and blocks"))
          (match (try-let ((name (macro-name env (nth its 1)))
@@ -275,11 +275,11 @@
 ;; `(import "FILE")` (spec/lir.md 4.7): the form is checked here, the module is the importer's.
 (defun import-form :private (env: Env importer: Importer form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (if (not (= (count its) 2))
          (some (Diagnostic pos "import expects one string, the file"))
          (match (nth its 1)
-           ((SxStr bs _) ((. importer load) env (str-from-bytes bs) pos))
+           ((SxStr bs _ _) ((. importer load) env (str-from-bytes bs) pos))
            (other (some (Diagnostic (sexp-pos other) (str "import expects a string, found " (sexp-describe other))))))))
     (_ (some (Diagnostic (sexp-pos form) "import expects one string, the file")))))
 
@@ -296,11 +296,11 @@
 ;; `(require-macros "FILE")`.
 (defun require-macros :private (env: Env form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (if (not (= (count its) 2))
          (some (Diagnostic pos "require-macros expects one string, the file"))
          (match (nth its 1)
-           ((SxStr bs _) (load-library env (resolve env (str-from-bytes bs)) pos))
+           ((SxStr bs _ _) (load-library env (resolve env (str-from-bytes bs)) pos))
            (other (some (Diagnostic (sexp-pos other) (str "require-macros expects a string, found " (sexp-describe other))))))))
     (_ (some (Diagnostic (sexp-pos form) "require-macros expects one string, the file")))))
 
@@ -343,11 +343,11 @@
 ;; defines and globals declared in the macro bodies after it; neither linked into the program nor exported.
 (defun macro-import :private (env: Env form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (if (not (= (count its) 2))
          (some (Diagnostic pos "macro-import expects one string, the file"))
          (match (nth its 1)
-           ((SxStr bs _) (match (session-of env)
+           ((SxStr bs _ _) (match (session-of env)
                            ((Err e) (some (Diagnostic pos (str "macro-import: " e))))
                            ((Ok s) (match (session-import s (resolve env (str-from-bytes bs)) pos (. env gensym)) ((Err d) (some d)) ((Ok _) nil)))))
            (other (some (Diagnostic (sexp-pos other) (str "macro-import expects a string, found " (sexp-describe other))))))))
@@ -393,7 +393,7 @@
 ;; `...` parameter, is applied to them and its result is a top-level form.
 (defun module-macro :private (env: Env form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (cond (not (= (count its) 2)) (some (Diagnostic pos "module-macro expects one name, the macro"))
            (some? @(. env hook)) (some (Diagnostic pos "module-macro: the module has a module macro already"))
            :else (match (sexp-atom (nth its 1))
@@ -428,11 +428,11 @@
 ;; once per module by canonical path; a file that includes itself is a cycle. With a module macro armed, its forms are collected (`top-form`).
 (defun include :private (env: Env items: (Cell (Vec LItem)) importer: Importer form: Sexp) -> (Option Diagnostic)
   (match form
-    ((SxList its pos)
+    ((SxList its pos _)
      (if (not (= (count its) 2))
          (some (Diagnostic pos "include expects one string, the file"))
          (match (nth its 1)
-           ((SxStr bs _) (include-file env items importer (resolve env (str-from-bytes bs)) pos))
+           ((SxStr bs _ _) (include-file env items importer (resolve env (str-from-bytes bs)) pos))
            (other (some (Diagnostic (sexp-pos other) (str "include expects a string, found " (sexp-describe other))))))))
     (_ (some (Diagnostic (sexp-pos form) "include expects one string, the file")))))
 
