@@ -49,8 +49,16 @@ not a rule the programmer has to satisfy. Its guaranteed minimum:
   copying (§5).
 
 The reference interpreter implements the plain counting semantics. The
-compiler must produce the same results and the same frees, just with
-fewer count operations. This is how "borrow first" is checked.
+compiler must produce the same results and the same set of frees, just
+with fewer count operations. This is how "borrow first" is checked.
+
+Two things are true at once (**Decided**, owner, 2026-10-26). The
+programmer's model is the one above: a reference goes away when its
+scope ends, and that is what a program means. The compiler is free to
+free an object *earlier*, at the last use of its last reference, or to
+drop a count operation altogether, whenever nothing observable differs:
+the same results, every object freed, no use after free. It may not
+free later than the model does.
 
 ## 3. Escape
 
