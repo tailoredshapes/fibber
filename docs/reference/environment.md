@@ -70,7 +70,7 @@ Generated from quoted constants in `compiler`, `lib` and `rt`. Entries include t
 | `FIB_LOG_OVERFLOW` | [lib/fib/log/config.fib:30](../../lib/fib/log/config.fib#L30) |
 | `FIB_LOG_QUEUE` | [lib/fib/log/config.fib:33](../../lib/fib/log/config.fib#L33) |
 | `FIB_LSP_ISOLATE` | [compiler/lsp/server.fib:43](../../compiler/lsp/server.fib#L43) |
-| `FIB_MUSL_DIR` | [compiler/native/linkstatic.fib:66](../../compiler/native/linkstatic.fib#L66) |
+| `FIB_MUSL_DIR` | [compiler/lir/targets.fib:123](../../compiler/lir/targets.fib#L123) |
 | `FIB_NO_PROJECT` | [compiler/fibc.fib:137](../../compiler/fibc.fib#L137) |
 | `FIB_PRUNE` | [compiler/emit/compile.fib:84](../../compiler/emit/compile.fib#L84) |
 | `FIB_RESULT_STDOUT` | [compiler/emit/compile.fib:28](../../compiler/emit/compile.fib#L28) |
