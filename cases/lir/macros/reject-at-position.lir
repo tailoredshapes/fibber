@@ -1,0 +1,19 @@
+;; expect: reject
+;; error: 19:3: error: expected a top-level form (define, declare, declare-global, defstruct, global, constant), found frob
+;; spec/lir.md 4.6: a macro that rebuilds a form and gives the copy the original's position with lir.sexp.at has the copy's errors reported
+;; where the original was written (line 19, column 3), not at the use (line 18, column 1, where a made form is reported).
+(DEFINE-MACRO again (x)
+  (BLOCK entry
+    (LET ((made (CALL (GLOBAL lir.sexp.list) (I64 0))) (n (CALL (GLOBAL lir.sexp.count) x)))
+      (BR loop)))
+  (BLOCK loop
+    (LET ((i (PHI I64 (entry (I64 0)) (step i2))))
+      (BR (ICMP ULT i n) step done)))
+  (BLOCK step
+    (LET ((i2 (ADD i (I64 1))))
+      (CALL (GLOBAL lir.sexp.push) made (CALL (GLOBAL lir.sexp.nth) x i))
+      (BR loop)))
+  (BLOCK done (RET (CALL (GLOBAL lir.sexp.at) made x))))
+(DEFINE (main I32) () (BLOCK entry (RET (I32 0))))
+(again
+  (frob 1))

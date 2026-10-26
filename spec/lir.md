@@ -473,7 +473,8 @@ form in one); line and column 0 and a null file for an object a macro made. The 
 offset in its file of its first character and of the byte after its last, counted from 0 (a list ends after its closing bracket, a
 string after its closing quote, whatever its escapes; `cases/lir/macros/span.lir`); a form a reader macro returned spans the text the
 run consumed (§4.8). A form no text made, an object a macro made, has no span: start and end 0, and it gets none when the macro
-returns (the expander gives it the use's position, not the use's span); a form a macro passed through keeps its span. Spans are offsets
+returns (the expander gives it the use's position, not the use's span), unless `lir.sexp.at` gave it one; a form a macro passed
+through keeps its span. Spans are offsets
 below 2³²; the reader keeps one word per form for them. Going back, an integer prints in decimal, a float as the
 shortest decimal that reads back to it or `inf`, `-inf`, `nan`. The layout is the contract: a macro may read the fields with
 `getelementptr`, but the functions below are the way, and they are declared in every macro's body without a `declare` (they and the
@@ -483,6 +484,7 @@ stream's functions of §4.8 are the only names that are):
 |---|---|
 | `(lir.sexp.tag s) : i64`, `(lir.sexp.line s) : i64`, `(lir.sexp.column s) : i64`, `(lir.sexp.file s) : ptr` | the tag and the position of any object |
 | `(lir.sexp.start s) : i64`, `(lir.sexp.end s) : i64` | the span of any object: the byte offsets of its first character and of the byte after its last, 0 and 0 for a made one |
+| `(lir.sexp.at made orig) : ptr` | `made` given `orig`'s position and span (line, column, file, start, end); `made`. A macro that rebuilds a form (a definition without a marker) keeps where it was written, and the parser's errors in the copy are reported there (`cases/lir/macros/at.lir`, `reject-at-position.lir`) |
 | `(lir.sexp.symbol cstr) : ptr`, `(lir.sexp.string cstr) : ptr` | a symbol or a string of a NUL-terminated text (`(STRING "DEFINE")`), copied |
 | `(lir.sexp.integer v) : ptr`, `(lir.sexp.float v) : ptr` | an integer of an `i64`, a float of a `double` |
 | `(lir.sexp.float-text cstr) : ptr` | a float of a decimal text (`strtod`, rounded once): the way a reader macro makes a float from digits it read, since a symbol's text is never read as a number for it (§4.8) |
