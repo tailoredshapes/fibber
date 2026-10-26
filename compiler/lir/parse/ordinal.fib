@@ -1,0 +1,39 @@
+;; compiler/lir/parse/ordinal.fib: the program's ordinals and rows (spec/lir.md 4.7.1). `(ORDINAL T SET "NAME")` is the form
+;; `KIntrin "ordinal" 0 T [(KStr SET) (KStr NAME)] nil` of lir.intrin's class `ordinal`; `(ROW TABLE SET "NAME" T value)` is the item
+;; `ItRow`. The program loader (native.imports.ordinals) numbers the one and joins the other; nothing after it sees either.
+
+(ns lir.parse.ordinal
+  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty))
+
+;; The member's name: a non-empty string, its bytes as written.
+(defun member-name :private (what: str s: Sexp) -> (Result (Array i8) Diagnostic)
+  (match s
+    ((SxStr bs p _) (if (= (array-len bs) 0) (err p (str what ": the name must not be empty")) (Ok bs)))
+    (other (err (sexp-pos other) (str what ": expected the name as a string, found " (sexp-describe other))))))
+
+;; A set's or a table's name: a valid name (spec/lir.md 5.3), as a struct's is.
+(defun bare-name :private (what: str s: Sexp) -> (Result str Diagnostic)
+  (try-let ((a (atom-text s (str "the " what " name"))))
+    (valid-name a (sexp-pos s))))
+
+;; `(ORDINAL T SET "NAME")`: `T` an integer type.
+(defun parse-ordinal (args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (if (not (= (count args) 3))
+      (err pos (str "ordinal expects (ORDINAL T SET \"NAME\"), found " (count args) " operand" (if (= (count args) 1) "" "s")))
+      (try-let ((ty (parse-type (nth args 0)))
+                (_ (if (type-int? ty) (Ok ()) (err (sexp-pos (nth args 0)) (str "ordinal needs an integer type, found " (type-str ty)))))
+                (set (bare-name "set" (nth args 1)))
+                (name (member-name "ordinal" (nth args 2))))
+        (Ok (expr-new (KIntrin "ordinal" 0 (some ty) [(expr-new (KStr (str-bytes set)) (sexp-pos (nth args 1)))
+                                                      (expr-new (KStr name) (sexp-pos (nth args 2)))] nil) pos)))))
+
+;; `(ROW TABLE SET "NAME" T value)`: the value is parsed by `sub` (lir.parse.expr, which requires this module).
+(defun parse-row (rest: (Vec Sexp) pos: i64 sub: ExprParser) -> (Result LItem Diagnostic)
+  (if (not (= (count rest) 5))
+      (err pos (str "row expects (ROW TABLE SET \"NAME\" T value), found " (count rest) " operand" (if (= (count rest) 1) "" "s")))
+      (try-let ((table (bare-name "table" (nth rest 0)))
+                (set (bare-name "set" (nth rest 1)))
+                (name (member-name "row" (nth rest 2)))
+                (ty (parse-type (nth rest 3)))
+                (value (operand sub (nth rest 4))))
+        (Ok (ItRow (LRow table set name ty value pos))))))

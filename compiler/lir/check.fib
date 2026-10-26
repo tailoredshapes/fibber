@@ -5,16 +5,25 @@
   (:require [lir.own :as own]))
 
 
-;; The first error of one item, as a one-element or empty list.
-(defun check-item (env: LEnv item: LItem) -> (Result unit Diagnostic)
+;; The first error of one item, as a one-element or empty list. A row (spec/lir.md 4.7.1) is checked as a constant of its type when the
+;; module is one of a program the loader is joining (`rows`), and is an error anywhere else: only the loader joins rows into their tables.
+(defun check-item (env: LEnv item: LItem rows: bool) -> (Result unit Diagnostic)
   (match item
     ((ItGlobal g) (check-global env g))
     ((ItDefine f) (check-function env f))
+    ((ItRow r) (if rows (check-row env r) (row-unjoined r)))
     (_ (Ok ()))))
 
 ;; Checks the whole module: every error of the module-level rules, else the first error of each global and function, then the ownership
 ;; verifier (spec/lir.md 6.14.5, lir.own) over the typed module, on every path. (mod.rs `check`)
 (defun check (m: LModule) -> (Result unit (Vec Diagnostic))
+  (check-module m false))
+
+;; `check` of a module the program loader is joining (native.imports, spec/lir.md 4.7): its rows are checked, not refused.
+(defun check-loaded (m: LModule) -> (Result unit (Vec Diagnostic))
+  (check-module m true))
+
+(defun check-module :private (m: LModule rows: bool) -> (Result unit (Vec Diagnostic))
   (match (env-build m)
     ((Err ds) (Err ds))
     ((Ok env)
@@ -23,7 +32,7 @@
          (if (>= i (count items))
              (if (= (count errs) 0) (own/verify-module m env) (Err errs))
              (recur (+ i 1)
-                    (match (check-item env (nth items i))
+                    (match (check-item env (nth items i) rows)
                       ((Ok _) errs)
                       ((Err d) (conj errs d))))))))))
 

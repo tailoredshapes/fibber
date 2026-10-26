@@ -194,6 +194,7 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
         | ((STRUCT NAME) value*)     ; named struct value, one value per field
         | ((ARRAY N T) value*)       ; array value, exactly N elements of type T (§2.1)
         | (ZEROINITIALIZER T)   ; every bit zero: 0, 0.0, null, and so on through aggregates
+        | (ORDINAL T NAME STR)  ; the number of the member STR of the set NAME in the program: an integer constant of type T (§4.7.1)
         | instruction           ; §6
 FLT   ::= a float token | INF | -INF | NAN   ; §1
 ```
@@ -248,6 +249,7 @@ item   ::= (DEFSTRUCT MUTABLE? NAME (type*))       ; mutable: its fields may be 
          | (DEFINE-READER-BOM SKIP)                        ; a byte order mark at the start of a text read after it is skipped (§4.8)
          | (DEFINE-TOKEN-READER (PNAME PNAME) block+)      ; the module's token reader (§4.8)
          | (BEGIN item*)                                   ; a splice: each form a top-level form in its place (§4.6)
+         | (ROW NAME NAME STR type value)                  ; the element of the program's table NAME for the member STR of the set NAME (§4.7.1)
 class  ::= WHITESPACE | CONSTITUENT | TERMINATING
 param  ::= (type PNAME) | ((PTR (ADDRSPACE 1)) OWNED PNAME)    ; a parameter; `owned` is its ownership kind (§6.14.2)
 mod    ::= PRIVATE | INTERNAL | EXTERNAL           ; linkage (§4.3), at most one
@@ -644,15 +646,90 @@ lIR cannot be joined, and precompiled Fib libraries wait for symbolic ids (the A
 joins modules by name and knows no id; the modules it joins are written as lIR (gloss's layers, a program's own modules), which have none;
 and the only lIR that carries numbered ids is a whole emitted program, which defines `fib.types`, `fib.classes`, the runtime and `main`, so
 two of them are `@fib.types is also defined in FILE`. That is the limit, stated: a module with numbered ids imports, and is imported by
-nothing; when ids are symbolic the limit goes and no rule here changes.
+nothing; when ids are symbolic the limit goes and no rule here changes. §4.7.1 makes them symbolic: a module that names its ids with
+`ordinal` and carries its table rows with `row` imports and is imported as any module; a module with numbers it chose itself (a whole
+program fibber emitted) keeps the limit.
 
 **Where it runs.** On every path that reads lIR text, with the macros (§4.6): `lair check`, `run`, `build` (the JIT and the object cache
 compile the program, ADR 0024), `emit-llvm` and `dump-ast` (which show the program), `lair cases`, `check-source` and `jit-add-source`
 (§11, imports relative to the working directory). A module a front end hands lair as a tree has no imports; fibber's emitter makes such
-trees, and nothing of fibber's compile goes through this section: a module with no `import` is read, expanded, parsed and checked as before,
-and the program's tables are never built for it. A macro library (`require-macros`) imports nothing (`expected define-macro or
+trees, and nothing of fibber's compile goes through this section: a module with no `import` and no `row` is read, expanded, parsed and
+checked as before (its ordinals numbered, §4.7.1), and the program's tables are never built for it. A macro library (`require-macros`) imports nothing (`expected define-macro or
 require-macros, found import`). The cases are `cases/lir/imports/`: a module imported by others is a case of its own too (run alone, it is
 `no main function`).
+
+#### 4.7.1 Ordinals and tables
+
+**Proposed** (2026-10-26, for gloss's libraries as lIR, gloss docs/design/chunks.md row 9 and types-and-ownership.md §5, and the binding
+prototype fibber's ADR 0024 asks for; the owner decides; §14 item 23). A program numbers what it has one of each of, and a module names
+the number:
+
+```
+value ::= (ORDINAL T NAME STR)               ; the number of the member STR of the set NAME: an integer constant of type T
+item  ::= (ROW NAME NAME STR type value)     ; the element of the table NAME for the member STR of the set NAME: a constant of the type
+```
+
+**What it is.** A front end numbers things a program has one of each of, fibber its object types (the rows of `fib.types`, whose index an
+object's header and `alloc-object` carry, §6.14.3) and its keywords, and the numbers are constants in the code: a type id in a header, a
+keyword in a `switch`. Numbered by the module that writes them, two modules give one number two meanings, so separately emitted modules
+cannot be joined (ADR 0024; §4.7 states the limit). An ordinal names the number instead: `(ORDINAL I32 types "fib.vec")` is the number of
+the member `"fib.vec"` of the set `types`, which the program gives: lair numbers the members of each set once per program, densely from 0,
+as it loads the program's modules (§4.7). A row carries what a table holds for a member, `(ROW fib.types types "fib.vec" (STRUCT
+fib.typerec) ((STRUCT fib.typerec) (GLOBAL drop.vec) ..))`, and lair makes each table one constant array of its rows in ordinal order, so
+that `(GETELEMENTPTR (STRUCT fib.typerec) (GLOBAL fib.types) tid (I32 0))` finds a member's row by its number, as the runtime does today.
+
+**Why this form.** LLVM has no notion of it: a native linker resolves symbols, not integers inside instructions, initialisers or a
+`switch`, and LLVM's nearest device, `appending` linkage, concatenates arrays and gives no index by name. So it is lIR's own, as macros are
+(§4.6), and it is gone before anything else sees it: after loading, an ordinal is the literal `(T N)` and a table is a `constant`, the text a
+front end that numbered by itself would have written, and the checker, the passes, LLVM and the printers see only that. It is one value
+form and one item, not a `TYPE-ID` and a `KEYWORD-ID`: lIR has no vocabulary of a language built on it (§2), and a set is any name a front
+end chooses (fibber's types and keywords are two sets; a numbering of vtables or protocols would be a third), as a struct's name is. ADR
+0024 calls the numbers ordinals. The integer type is written, as every literal's is: a type id is an `I32` in a header and in
+`alloc-object`, a keyword an `I64`.
+
+**Numbering.** A module's ordinals are numbered when it is loaded, before it is checked (§10): the members of a set are numbered from 0 in
+the order the program meets them, its modules in load order (each imported module before the module that imports it, the named module last,
+as §4.7 admits them) and a module's ordinals and rows in the order written (a row meets its member). A member keeps its number for the rest
+of the program: two modules that name `"x"` in one set get one number (`cases/lir/imports/ordinal-shared.lir`), and the numbers of a set
+are dense, one per member, in load order (`ordinal-dense.lir`: an ordinal the named module writes before its imports is numbered after
+theirs). The numbers are the program's: another program, or the same modules loaded in another order, numbers otherwise, so a number is
+never stored where another program reads it. Rules, checked by the parser: `T` is an integer type (`ordinal needs an integer type, found
+double`), the set a valid name (§5.3; sets have their own namespace, as structs do), the member a non-empty string compared byte for byte
+(`ordinal: the name must not be empty`), and the form has its three operands (`ordinal expects (ORDINAL T SET "NAME"), found 2 operands`).
+The number must fit `T` as a literal of it does (§3: at most `2^K - 1`): `ordinal 2 of flags "c" does not fit i1`, at the form
+(`reject-ordinal-fit.lir`).
+
+**Tables.** `(ROW TABLE SET "NAME" T value)`: `value` is a constant of type `T`, as a global's initialiser is (§9), checked with its module
+(`row "x" of @tbl has type i64, expected %struct.rec`); `row expects (ROW TABLE SET "NAME" T value), found 4 operands`. A row's rules are
+the program's, met when its module is admitted (§4.7), after its renaming, so a row that names an internal function names its own module's:
+
+- a table's rows name one set and have one type: `@tbl is a table of the set types in FILE: row "x" names keywords`, `@tbl has rows of
+  %struct.rec in FILE: row "x" is i64` (`reject-row-set.lir`, `reject-row-type.lir`);
+- a member has one row in a table: a second row of the same text (positions aside) is the same row and is nothing, which is how two modules
+  that each carry a member's row join (`table-shared.lir`, `keyword-shared.lir`); one of another text is `row "x" of @tbl differs from its
+  row in FILE` at the second (`reject-row-differs.lir`, `reject-keyword-differs.lir`);
+- the table is a global of the program: its first row is a definition of its name under §4.7's rules, of type `(ARRAY 0 T)`, the type a
+  module that reads the table declares it with, `(DECLARE-GLOBAL tbl (ARRAY 0 (STRUCT rec)))` (§2.1: the length is the program's); a
+  declaration of another type is `@tbl is declared as [0 x i64] in FILE`, and an exported function or global of the name `@tbl is also
+  defined in FILE` (an internal one is the module's own and is renamed, §4.7) (`reject-row-defined.lir`, `reject-row-declared.lir`).
+
+At the union each table is `(CONSTANT TABLE (ARRAY N T) ((ARRAY N T) row₀ .. row_N₋₁))`, external, `N` the members of its set and row `i`
+the one of the member numbered `i`, after the modules' items, in the order the tables' first rows were admitted. Every member of the set has
+a row in the table: `@tbl has no row for "z" of types`, at the form where the program first met the member, or, when that is in an imported
+module, at the named module's import that loaded it, as `import: FILE:L:C: error: ..` (`reject-row-missing.lir`,
+`reject-row-missing-import.lir`). A set needs no table (keywords may be numbered with no table of their names), and only rows make a table:
+one that no module gives a row is not defined, and a module's `declare-global` of it stays undefined, as any.
+
+**Where it runs.** On every path that reads lIR text, with the imports (§4.7): `lair check`, `run`, `build`, `emit-llvm`, `dump-ast` and
+`expand` (which print the numbers and the tables and no ordinal or row: what lir2c and lir2js read, §4.6), `lair cases`, `check-source`
+and `jit-add-source`; a module with no imports is a program of one module and is numbered the same way (`table-local.lir`). A module a front end hands lair as
+a tree (§11) is not loaded, nor is a text lir2c or lir2js reads by itself: the checker refuses an ordinal in it (`ordinal types "x" is not
+numbered: lair numbers ordinals when it loads a program`) and a row (`row "x" of @tbl is not joined: lair joins rows when it loads a
+program`). The interface of an import (§4.7)
+carries no row and no table: the table is the program's, and a module that reads it declares it. fibber's emitter numbers by itself and
+writes neither form; a front end that compiles a library once for several programs (gloss) writes an ordinal wherever it would write a
+number, and a row beside each definition the number names. The cases are `cases/lir/imports/ordinal-*.lir`, `table-*.lir`,
+`keyword-*.lir` and the `reject-` cases named above.
 
 ### 4.8 Reader macros
 
@@ -2116,3 +2193,4 @@ one the passes used.
 | 20 | `(export-name STRING)` on a define, LLVM's `"wasm-export-name"`; a native library exports its `external` non-`hidden` definitions by their linkage and visibility, with no symbol list beside the module; library versus executable is lair's build option `--library`, not the environment variable `FIB_EXPORTS` | **Decided** (owner, 2026-10-25: the text is the contract) | §4, §4.3, §7.2, §12, cases/lir/attrs |
 | 21 | lIR spells names out and every word it owns is upper case (owner, 2026-10-25: "lir should prefer spelled out names not abbreviations or macros. So @ should be 'global'"; "I'm also ok with using CAPS for lir"): `(GLOBAL f)` for `@f`, `(STRUCT S)` for `%struct.S`, `(PTR (ADDRSPACE 1))` for `(ptr 1)`, `FUNCTION` for `fn`, `ALWAYSINLINE` for `inline`, `PRESERVE_MOSTCC` for `preservemost`, `INF`/`NAN`, `(VECTOR N T)`, `(ARRAY N T)` and `(LITERAL-STRUCT ..)` for LLVM's bracket syntax; names as written; a name that is a word refused; the reserved words and the reserved macro names gone; one table of the words (`compiler/lir/words.fib`) held equal to the grammar by `compiler/tests/lir/words.sh`; `lair respell` converts a text. The audit and the plan: `/tank/data/fibber-scratch/lir-language/respell-audit.md` | **Decided** (owner, 2026-10-25) | §1, §2, §3, §4, §5.1, §5.3, §6, §9, §12 |
 | 22 | string constants: each `(STRING ..)` is its own constant, so lair writes no `unnamed_addr` and LLVM merges none (D12: the code follows the spec) | **Decided** (owner, 2026-10-25) | §3, cases/lir/instr/string-own-constant.lir |
+| 23 | symbolic ids (fibber's ADR 0024, gloss's libraries as lIR): `(ORDINAL T SET "NAME")`, a member's number in a set, given by the program once, densely, in load order, and erased to `(T N)` before the checker; `(ROW TABLE SET "NAME" T value)`, a member's row, the rows of a table joined into one constant `(ARRAY N T)` by ordinal and refused when two differ | **Proposed** (2026-10-26; the owner decides) | §4.7.1, cases/lir/imports |

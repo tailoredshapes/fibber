@@ -3,11 +3,13 @@
 ;; checked on its own with the interface of what it imports (the `declare`s, `declare-global`s and `defstruct`s of the imported module's
 ;; exported names), and then admitted to the program under the name rules of 4.7: an exported name is defined once, a declared name agrees
 ;; in type with its definition, an internal or private name the program already has is renamed `NAME.N`. The named module is admitted last
-;; and the union is what the caller checks (native.pipeline) or dumps (native.cli). A module with no imports is returned as it was parsed:
-;; the tables are never built for it.
+;; and the union is what the caller checks (native.pipeline) or dumps (native.cli). Every module's ordinals are numbered as it is parsed,
+;; before its check, and its rows are joined into the program's tables at the union (spec/lir.md 4.7.1, native.imports.ordinals). A module
+;; with no imports and no rows is returned as it was parsed, its ordinals numbered: the tables are never built for it.
 (ns native.imports
   (:use lir.diag lir.types lir.ast native.imports.program)
-  (:require [native.macros :as macros] [native.macros.types :as mt] [native.macros.helpers :as mh] [lir.check :as check] [llvm.ffi :as ffi]))
+  (:require [native.macros :as macros] [native.macros.types :as mt] [native.macros.helpers :as mh] [native.imports.ordinals :as ord]
+            [lir.check :as check] [llvm.ffi :as ffi]))
 
 ;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported,
 ;; and the file whose `ownership` form (spec/lir.md 6.14.6) it took, if any: one per program, as the `target` form.
@@ -39,17 +41,21 @@
           (ffi/free-addr (. st gensym))
           r))))
 
-;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle); when it has any,
-;; checked with their interface, admitted last, and the union made.
+;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle), its ordinals numbered;
+;; when it has imports or rows, checked with their interface, admitted last, and the union made with the program's tables.
 (defun load-main :private (st: State im: Imports src: str file: str) -> (Result Program Diagnostic)
-  (try-let ((p (do (set! (. st loading) (conj @(. st loading) (mh/canonical file))) (parse-with st im src file))))
-    (let ((own (. (. p module) items)))
-      (if (empty? @(. st loaded))
-          (Ok (Program (. p module) {}))
-          (try-let ((_ (ownership-clash im own))
-                    (_ (check-with im (LModule (into @(. im iface) own))))
-                    (items (admit st file own)))
-            (Ok (Program (LModule (union-items st items)) @(. im hidden))))))))
+  (try-let ((p (do (set! (. st loading) (conj @(. st loading) (mh/canonical file))) (parse-with st im src file)))
+            (own (ord/number-items (. st ords) file true (. (. p module) items))))
+    (if (and (empty? @(. st loaded)) (not (has-rows? own)))
+        (Ok (Program (LModule own) {}))
+        (try-let ((_ (ownership-clash im own))
+                  (_ (check-with im (LModule (into @(. im iface) own))))
+                  (items (admit st file own))
+                  (tables (ord/table-items (. st ords))))
+          (Ok (Program (LModule (into (union-items st items) tables)) @(. im hidden)))))))
+
+(defun has-rows? :private (items: (Vec LItem)) -> bool
+  (some? (first (filter (fn (it: LItem) (match it ((ItRow _) true) (_ false))) items))))
 
 ;; Reads and expands a module, every `import` of it loaded as it is met; the environment is kept open in the state.
 (defun parse-with :private (st: State im: Imports src: str file: str) -> (Result mt/Parsed Diagnostic)
@@ -66,9 +72,14 @@
     (let ((key (mh/canonical file)))
       (cond (set-contains? @(. im files) key) nil
             (set-contains? @(. st loading) key) (some (Diagnostic pos (str "import: " file " imports itself")))
-            :else (match (match (get @(. st exports) key) ((some e) (Ok e)) (nil (load-module st file key pos)))
+            :else (match (match (get @(. st exports) key) ((some e) (Ok e)) (nil (load-module st file key (top-import st pos))))
                     ((Err d) (some d))
                     ((Ok e) (take-export im env e file key pos)))))))
+
+;; `pos`, the position of an import; when it is the named module's (the only module being loaded), what the module it loads makes the program
+;; meet is reported there (spec/lir.md 4.7.1: a member without a row in a table).
+(defun top-import :private (st: State pos: i64) -> i64
+  (do (when (= (count @(. st loading)) 1) (ord/set-via (. st ords) pos)) pos))
 
 ;; The module of `file` loaded, checked and admitted; its errors are at the import, prefixed with the file.
 (defun load-module :private (st: State file: str key: str pos: i64) -> (Result Export Diagnostic)
@@ -85,9 +96,10 @@
 ;; An imported module from its text: parsed, checked with the interface of its own imports, admitted; its export.
 (defun load-text :private (st: State im: Imports src: str file: str) -> (Result Export Diagnostic)
   (try-let ((p (parse-with st im src file))
-            (_ (ownership-clash im (. (. p module) items)))
-            (_ (check-with im (LModule (into @(. im iface) (. (. p module) items)))))
-            (items (admit st file (. (. p module) items))))
+            (own (ord/number-items (. st ords) file false (. (. p module) items)))
+            (_ (ownership-clash im own))
+            (_ (check-with im (LModule (into @(. im iface) own))))
+            (items (admit st file own)))
     (do (set! (. st loaded) (conj @(. st loaded) (Loaded file items)))
         (Ok (Export (interface items) (hidden-names (. (. p module) items)) (macros/own-macros (. p env)))))))
 
@@ -119,9 +131,9 @@
 
 ;; ---------------------------------------------------------------- the check of one module
 
-;; The whole-module check (spec/lir.md 10), its first error explained.
+;; The whole-module check (spec/lir.md 10), its rows checked (spec/lir.md 4.7.1), its first error explained.
 (defun check-with :private (im: Imports m: LModule) -> (Result unit Diagnostic)
-  (match (check/check m)
+  (match (check/check-loaded m)
     ((Ok _) (Ok ()))
     ((Err ds) (Err (explain-hidden @(. im hidden) (nth ds 0))))))
 

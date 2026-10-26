@@ -1,7 +1,8 @@
 ;; compiler/lir/check/globals.fib: global initialisers (spec/lir.md 9; crates/lir/src/check/globals.rs). OWNER: package K1.
 
 (ns lir.check.globals
-  (:use lir.diag lir.types lir.ast lir.check.env lir.check.walk))
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.walk)
+  (:require [lir.print :as print]))
 
 
 ;; The initialiser is a constant of the global's type. (globals.rs `check_global`)
@@ -14,6 +15,32 @@
             (err (. (. g init) pos)
                  (str "initializer of @" (. g name) " has type " (type-str t) ", expected " (type-str (. g ty))))))))
 
+;; A row (spec/lir.md 4.7.1): a constant of its type, as a global's initialiser is.
+(defun check-row (env: LEnv r: LRow) -> (Result unit Diagnostic)
+  (let ((v (. r value)) (what (str "row " (row-name r) " of @" (. r table))))
+    (if (not (constant? v))
+        (err (. v pos) (str what " must be a constant"))
+        (try-let ((t (const-type env v)))
+          (if (= t (. r ty)) (Ok ()) (err (. v pos) (str what " has type " (type-str t) ", expected " (type-str (. r ty)))))))))
+
+;; A row outside a program the loader joins (a module handed to lair as a tree, spec/lir.md 11, or read by lir2c and lir2js, which read
+;; `lair expand`'s text): nothing would join it into its table.
+(defun row-unjoined (r: LRow) -> (Result unit Diagnostic)
+  (err (. r pos) (str "row " (row-name r) " of @" (. r table) " is not joined: lair joins rows when it loads a program")))
+
+;; An `ordinal` the checker meets was not numbered: the loader numbers every ordinal of a program it loads from text before checking it.
+(defun ordinal-unnumbered (e: LExpr) -> Diagnostic
+  (match (. e kind)
+    ((KIntrin _ _ _ args _)
+     (Diagnostic (. e pos) (str "ordinal " (kstr-text (nth args 0)) " " (kstr-quoted (nth args 1))
+                                " is not numbered: lair numbers ordinals when it loads a program")))
+    (_ (Diagnostic (. e pos) "ordinal is not numbered"))))
+
+(defun row-name :private (r: LRow) -> str (print/string-text (. r name)))
+
+(defun kstr-text :private (e: LExpr) -> str (match (. e kind) ((KStr bs) (str-from-bytes bs)) (_ "?")))
+(defun kstr-quoted :private (e: LExpr) -> str (match (. e kind) ((KStr bs) (print/string-text bs)) (_ "?")))
+
 ;; The type of a constant expression. (globals.rs `const_type`)
 (defun const-type (env: LEnv e: LExpr) -> (Result LType Diagnostic)
   (match (. e kind)
@@ -23,7 +50,9 @@
     ((KZero t) (try-let ((_ (env-valid env t (. e pos)))) (Ok t)))
     ((KArray t es) (const-array env t es e))
     ((KNull) (Ok ty-ptr))
-    ((KIntrin name _ _ _ _) (if (= name "managed-null") (Ok ty-managed) (err (. e pos) "not a constant")))
+    ((KIntrin name _ _ _ _) (cond (= name "managed-null") (Ok ty-managed)
+                                  (= name "ordinal") (Err (ordinal-unnumbered e))
+                                  :else (err (. e pos) "not a constant")))
     ((KStr _) (Ok ty-ptr))
     ((KGlobal n) (if (contains? (. env symbols) n) (Ok ty-ptr) (err (. e pos) (str "undefined global @" n))))
     ((KStruct nil fs) (try-let ((ts (const-types env fs))) (Ok (TAnon ts))))

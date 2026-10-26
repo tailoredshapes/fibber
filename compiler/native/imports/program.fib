@@ -2,10 +2,10 @@
 ;; when it is admitted (an exported name is defined once; a declared name agrees in type with the program's definition or declaration of it;
 ;; an internal or private name the program already has is renamed `NAME.N` throughout the module, as `llvm-link` renames; one `target`
 ;; form), and the union of the admitted modules, in which a `declare` of a name the program defines, or a second `declare` of one name, is
-;; dropped.
+;; dropped. The rows of a module (spec/lir.md 4.7.1) are admitted after its renaming, each table's name as a definition of the program's.
 (ns native.imports.program
   (:use lir.diag lir.types lir.ast)
-  (:require [lir.rewrite :as rw] [native.macros.types :as mt] [llvm.ffi :as ffi]))
+  (:require [lir.rewrite :as rw] [native.macros.types :as mt] [native.imports.ordinals :as ord] [llvm.ffi :as ffi]))
 
 ;; A name of the program: the file that has it, whether as a definition (a `declare` otherwise) and its type as text.
 (defstruct Owner (file: str defined: bool ty: str))
@@ -24,10 +24,13 @@
 (defstruct State (loaded: (Cell (Vec Loaded)) loading: (Cell (Set str)) exports: (Cell (Map str Export)) names: (Cell (Map str Owner))
                   structs: (Cell (Map str str)) target: (Cell (Option str)) envs: (Cell (Vec mt/Env))
                   ;; the file whose `ownership` form the program has (spec/lir.md 6.14.6), one as the `target`
-                  ownership: (Cell (Option str)) gensym: i64))
+                  ownership: (Cell (Option str)) gensym: i64
+                  ;; the program's ordinals and tables (spec/lir.md 4.7.1)
+                  ords: ord/Ordinals))
 
 (defun state-new () -> State
-  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell []) (cell nil) (ffi/ptr->addr (ffi/slot-new))))
+  (State (cell []) (cell (set-empty)) (cell {}) (cell {}) (cell {}) (cell nil) (cell []) (cell nil) (ffi/ptr->addr (ffi/slot-new))
+         (ord/ordinals-new)))
 
 ;; ---------------------------------------------------------------- admission
 
@@ -47,7 +50,8 @@
   (let ((own (own-names items)))
     (loop ((i 0) (renames {}))
       (if (>= i (count items))
-          (Ok (if (empty? renames) items (mapv (fn (it: LItem) (rename-item it renames)) items)))
+          (let ((out (if (empty? renames) items (mapv (fn (it: LItem) (rename-item it renames)) items))))
+            (try-let ((_ (admit-rows st file own out))) (Ok out)))
           (match (admit-item st file own (nth items i) renames)
             ((Err d) (Err d))
             ((Ok r) (recur (+ i 1) r)))))))
@@ -58,6 +62,7 @@
     ((ItTarget t) (admit-target st file t renames))
     ((ItOwnership o) (admit-ownership st file o renames))
     ((ItDependentLibrary _) (Ok renames))
+    ((ItRow _) (Ok renames))
     ((ItDefine f) (admit-symbol st file own (. f name) (fn-type-str (. f ty)) true (exported? (. f mods)) (. f pos) renames))
     ((ItGlobal g) (admit-symbol st file own (. g name) (type-str (. g ty)) true (exported? (. g mods)) (. g pos) renames))
     ((ItDeclare d) (admit-symbol st file own (. d name) (fn-type-str (. d ty)) false true (. d pos) renames))
@@ -78,6 +83,22 @@
   (match @(. st ownership)
     ((some other) (err (. o pos) (str "ownership: " other " also has an ownership form")))
     (nil (do (set! (. st ownership) (some file)) (Ok renames)))))
+
+;; The rows of the module (spec/lir.md 4.7.1), renamed: a table new to the program is a definition of its name, of type `(ARRAY 0 T)` as a
+;; module declares it, under the rules of a name (a function or global of that name, or a declaration of another type, is refused).
+(defun admit-rows :private (st: State file: str own: (Set str) items: (Vec LItem)) -> (Result unit Diagnostic)
+  (loop ((i 0))
+    (if (>= i (count items))
+        (Ok ())
+        (match (nth items i)
+          ((ItRow r) (match (admit-row st file own r) ((Err d) (Err d)) ((Ok _) (recur (+ i 1)))))
+          (_ (recur (+ i 1)))))))
+
+(defun admit-row :private (st: State file: str own: (Set str) r: LRow) -> (Result unit Diagnostic)
+  (try-let ((_ (if (ord/table? (. st ords) (. r table))
+                   (Ok {})
+                   (admit-symbol st file own (. r table) (type-str (TArray 0 (. r ty))) true true (. r pos) {}))))
+    (ord/admit-row (. st ords) file r)))
 
 (defun record :private (st: State name: str o: Owner) -> unit
   (set! (. st names) (assoc @(. st names) name o)))
@@ -123,12 +144,14 @@
   (match it
     ((ItDefine f) (ItDefine (with f (name (renamed names (. f name))) (blocks (mapv (fn (b: LBlock) (rename-block b names)) (. f blocks))))))
     ((ItGlobal g) (ItGlobal (with g (name (renamed names (. g name))) (init (rename-expr (. g init) names)))))
+    ((ItRow r) (ItRow (with r (value (rename-expr (. r value) names)))))
     (_ it)))
 
 ;; ---------------------------------------------------------------- the union
 
 ;; The items of the program: every admitted module's in order, then `main`'s (the named module's, admitted last); a `declare` or
-;; `declare-global` of a name the program defines, or one the union has already, is left out.
+;; `declare-global` of a name the program defines, or one the union has already, is left out, and so are the rows, which the tables hold
+;; (native.imports.ordinals `table-items`, appended by the caller).
 (defun union-items (st: State main: (Vec LItem)) -> (Vec LItem)
   (let ((all (into (reduce (fn (acc: (Vec LItem) l: Loaded) (into acc (. l items))) [] @(. st loaded)) main)))
     (loop ((i 0) (seen (set-empty)) (out []))
@@ -136,10 +159,12 @@
           out
           (let ((it (nth all i)))
             (match (declared-name it)
-              (nil (recur (+ i 1) seen (conj out it)))
+              (nil (recur (+ i 1) seen (if (row? it) out (conj out it))))
               ((some n) (if (or (set-contains? seen n) (defined? st n))
                             (recur (+ i 1) seen out)
                             (recur (+ i 1) (conj seen n) (conj out it))))))))))
+
+(defun row? :private (it: LItem) -> bool (match it ((ItRow _) true) (_ false)))
 
 (defun declared-name :private (it: LItem) -> (Option str)
   (match it ((ItDeclare d) (some (. d name))) ((ItDeclareGlobal g) (some (. g name))) (_ nil)))

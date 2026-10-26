@@ -1,0 +1,154 @@
+;; compiler/native/imports/ordinals.fib: the program's ordinals and tables (spec/lir.md 4.7.1). An `(ORDINAL T SET "NAME")` is numbered when
+;; its module is loaded, before the module is checked: the members of a set are numbered from 0 in the order the program meets them (its
+;; modules in load order, the named module last; a module's forms in the order written, a row's member at the row), and the form becomes
+;; the literal `(T N)`. A `(ROW TABLE SET "NAME" T value)` is taken when its module is admitted (native.imports.program, after renaming), and
+;; at the union each table is one constant `(ARRAY N T)` of its rows in ordinal order, `N` the members of its set. Nothing after the loader
+;; sees an ordinal or a row: the checker, the passes, LLVM and the printers see the literals and the constants a front end could have written.
+(ns native.imports.ordinals
+  (:use lir.diag lir.types lir.lit lir.ast)
+  (:require [lir.rewrite :as rw] [lir.check.walk :as walk] [lir.print :as print]))
+
+;; Where the program first met a member: the file, whether it is the named module, the position there, and for another file the position of
+;; the named module's import that loaded it (an error about the member in another file is reported at that import, as `import` errors are).
+(defstruct Origin (file: str main: bool pos: i64 via: i64))
+
+;; A member of a set: its name as lIR writes the string (`"fib.vec"`: the key, any bytes, escaped) and where it was first met.
+(defstruct Member (key: str at: Origin))
+
+;; A row as the program took it: its value, the value's text (positions left out: two rows are one row when their texts are equal), where.
+(defstruct RowAt (value: LExpr text: str file: str pos: i64))
+
+;; A table of the program: its set, its rows' type, the file and position of its first row, its rows by member.
+(defstruct Table (set: str ty: LType file: str pos: i64 rows: (Map str RowAt)))
+
+;; The program's ordinals: per set, the number of each member and the members in number order; the tables, and their names in the order
+;; their first rows were admitted; the position of the named module's import being loaded; the first failure of a walk.
+(defstruct Ordinals (index: (Cell (Map str (Map str i64))) order: (Cell (Map str (Vec Member))) tables: (Cell (Map str Table))
+                     names: (Cell (Vec str)) via: (Cell i64) failure: (Cell (Option Diagnostic))))
+
+(defun ordinals-new () -> Ordinals (Ordinals (cell {}) (cell {}) (cell {}) (cell []) (cell 0) (cell nil)))
+
+;; The named module's import at `pos` is being loaded: what is met until the next is reported there.
+(defun set-via (o: Ordinals pos: i64) -> unit (set! (. o via) pos))
+
+(defun table? (o: Ordinals name: str) -> bool (contains? @(. o tables) name))
+
+(defun key-of (bs: (Array i8)) -> str (print/string-text bs))
+
+(defun members-of :private (o: Ordinals set: str) -> (Vec Member)
+  (match (get @(. o order) set) ((some ms) ms) (nil [])))
+
+;; The number of `key` in `set`: the one the program gave it, else the next, given now.
+(defun number-of :private (o: Ordinals set: str key: str at: Origin) -> i64
+  (let ((ix: (Map str i64) (match (get @(. o index) set) ((some m) m) (nil {}))))
+    (match (get ix key)
+      ((some n) n)
+      (nil (let ((members (members-of o set)))
+             (do (set! (. o index) (assoc @(. o index) set (assoc ix key (count members))))
+                 (set! (. o order) (assoc @(. o order) set (conj members (Member key at))))
+                 (count members)))))))
+
+(defun origin :private (o: Ordinals file: str main: bool pos: i64) -> Origin
+  (Origin file main pos (if main 0 @(. o via))))
+
+(defun fail :private (o: Ordinals d: Diagnostic) -> unit
+  (match @(. o failure) ((some _) ()) (nil (set! (. o failure) (some d)))))
+
+;; ---------------------------------------------------------------- numbering
+
+;; The items of the module of `file` (`main`: the named module) with every ordinal numbered and every row's member met, in the order written.
+(defun number-items (o: Ordinals file: str main: bool items: (Vec LItem)) -> (Result (Vec LItem) Diagnostic)
+  (let ((out (mapv (fn (it: LItem) (number-item o file main it)) items)))
+    (match @(. o failure)
+      ((some d) (do (set! (. o failure) nil) (Err d)))
+      (nil (Ok out)))))
+
+(defun number-item :private (o: Ordinals file: str main: bool it: LItem) -> LItem
+  (match it
+    ((ItRow r) (do (number-of o (. r set) (key-of (. r name)) (origin o file main (. r pos)))
+                   (ItRow (with r (value (number-expr o file main (. r value)))))))
+    ((ItGlobal g) (if (ordinal-in? (. g init)) (ItGlobal (with g (init (number-expr o file main (. g init))))) it))
+    ((ItDefine f) (if (block-ordinals? (. f blocks)) (ItDefine (with f (blocks (mapv (fn (b: LBlock) (number-block o file main b)) (. f blocks))))) it))
+    (_ it)))
+
+(defun number-block :private (o: Ordinals file: str main: bool b: LBlock) -> LBlock
+  (LBlock (. b label) (mapv (fn (e: LExpr) (number-expr o file main e)) (. b body)) (. b pos)))
+
+(defun number-expr :private (o: Ordinals file: str main: bool e: LExpr) -> LExpr
+  (match (. e kind)
+    ((KIntrin name _ ty args _) (if (= name "ordinal")
+                                    (ordinal-value o file main e (unwrap-or ty ty-i64) args)
+                                    (rw/map-children e (fn (c: LExpr) (number-expr o file main c)))))
+    (_ (rw/map-children e (fn (c: LExpr) (number-expr o file main c))))))
+
+;; `(T N)` for the ordinal `e`; `N` must fit `T` as a literal of it does (spec/lir.md 3: at most `2^K - 1`).
+(defun ordinal-value :private (o: Ordinals file: str main: bool e: LExpr t: LType args: (Vec LExpr)) -> LExpr
+  (let ((set (str-from-bytes (kstr (nth args 0)))) (key (key-of (kstr (nth args 1)))))
+    (let ((n (number-of o set key (origin o file main (. e pos)))) (bits (unwrap-or (type-bits t) 64)))
+      (if (or (>= bits 63) (< n (shl 1 bits)))
+          (LExpr (KInt t (lit-of n)) (. e pos))
+          (do (fail o (Diagnostic (. e pos) (str "ordinal " n " of " set " " key " does not fit " (type-str t)))) e)))))
+
+(defun kstr :private (e: LExpr) -> (Array i8)
+  (match (. e kind) ((KStr bs) bs) (_ (str-bytes ""))))
+
+(defun ordinal-in? :private (e: LExpr) -> bool
+  (match (. e kind)
+    ((KIntrin name _ _ _ _) (or (= name "ordinal") (any-ordinal? (walk/children e))))
+    (_ (any-ordinal? (walk/children e)))))
+
+(defun any-ordinal? :private (es: (Vec LExpr)) -> bool
+  (loop ((i 0)) (cond (>= i (count es)) false (ordinal-in? (nth es i)) true :else (recur (+ i 1)))))
+
+(defun block-ordinals? :private (bs: (Vec LBlock)) -> bool
+  (loop ((i 0)) (cond (>= i (count bs)) false (any-ordinal? (. (nth bs i) body)) true :else (recur (+ i 1)))))
+
+;; ---------------------------------------------------------------- rows and tables
+
+;; A row of the module of `file`, renamed as the module was: a table's rows name one set and have one type, and a member has one row in a
+;; table (a second is the same row when its text is, and is nothing then).
+(defun admit-row (o: Ordinals file: str r: LRow) -> (Result unit Diagnostic)
+  (let ((key (key-of (. r name))) (row (RowAt (. r value) (print/print-expr (. r value)) file (. r pos))) (name (. r table)))
+    (match (get @(. o tables) name)
+      (nil (do (set! (. o tables) (assoc @(. o tables) name (Table (. r set) (. r ty) file (. r pos) {key row})))
+               (set! (. o names) (conj @(. o names) name))
+               (Ok ())))
+      ((some t)
+       (cond (not (= (. t set) (. r set)))
+             (err (. r pos) (str "@" name " is a table of the set " (. t set) " in " (. t file) ": row " key " names " (. r set)))
+             (not (= (. t ty) (. r ty)))
+             (err (. r pos) (str "@" name " has rows of " (type-str (. t ty)) " in " (. t file) ": row " key " is " (type-str (. r ty))))
+             :else (match (get (. t rows) key)
+                     ((some old) (if (= (. old text) (. row text))
+                                     (Ok ())
+                                     (err (. r pos) (str "row " key " of @" name " differs from its row in " (. old file)))))
+                     (nil (do (set! (. o tables) (assoc @(. o tables) name (with t (rows (assoc (. t rows) key row))))) (Ok ())))))))))
+
+;; The program's tables, in the order their first rows were admitted: each the constant `(ARRAY N T)` of its rows in ordinal order.
+(defun table-items (o: Ordinals) -> (Result (Vec LItem) Diagnostic)
+  (loop ((i 0) (out []))
+    (if (>= i (count @(. o names)))
+        (Ok out)
+        (match (table-item o (nth @(. o names) i))
+          ((Err d) (Err d))
+          ((Ok it) (recur (+ i 1) (conj out it)))))))
+
+(defun table-item :private (o: Ordinals name: str) -> (Result LItem Diagnostic)
+  (match (get @(. o tables) name)
+    (nil (err 0 (str "internal error: no table @" name)))
+    ((some t)
+     (let ((members (members-of o (. t set))))
+       (loop ((i 0) (rows []))
+         (if (>= i (count members))
+             (let ((ty (TArray (count members) (. t ty))))
+               (Ok (ItGlobal (LGlobalDef name ty (LExpr (KArray ty rows) (. t pos)) true (mods-of lk-external false) (. t pos) false))))
+             (match (get (. t rows) (. (nth members i) key))
+               ((some r) (recur (+ i 1) (conj rows (. r value))))
+               (nil (Err (missing-row name (. t set) (nth members i)))))))))))
+
+;; `@TABLE has no row for "NAME" of SET`, where the program first met the member: in the named module there, else at its import.
+(defun missing-row :private (name: str set: str m: Member) -> Diagnostic
+  (let ((message (str "@" name " has no row for " (. m key) " of " set)) (at (. m at)))
+    (if (. at main)
+        (Diagnostic (. at pos) message)
+        (Diagnostic (. at via) (str "import: " (. at file) ":" (diag-str (Diagnostic (. at pos) message)))))))

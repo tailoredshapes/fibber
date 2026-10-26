@@ -6,7 +6,7 @@
 (ns lir.parse.expr
   (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty lir.parse.literal
         lir.parse.instr lir.parse.intrin lir.parse.memory lir.parse.atomics lir.parse.control lir.parse.own)
-  (:require [lir.words :as words]))
+  (:require [lir.words :as words] [lir.parse.ordinal :as ordinal]))
 
 ;; `parse-expr` as the value the instruction modules take.
 (defun expr-parser () -> ExprParser (ExprParser parse-expr))
@@ -71,7 +71,7 @@
     (Ok (expr-new (KArray ty elems) pos))))
 
 ;; A form headed by an atom: a scalar literal, a struct literal (old spelling), `(GLOBAL f)`, `(LITERAL-STRUCT v..)`, `(STRING ..)`,
-;; `(ZEROINITIALIZER T)`, or an instruction; `name` is the atom as written, `k` the word it spells ("" for none: `unknown instruction`).
+;; `(ZEROINITIALIZER T)`, `(ORDINAL T SET "NAME")` (spec/lir.md 4.7.1), or an instruction; `name` is the atom as written, `k` the word it spells ("" for none: `unknown instruction`).
 (defun named-form :private (name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
   (let ((sub (expr-parser)) (k (canon name)))
     (match (scalar-keyword k)
@@ -87,6 +87,7 @@
              (= k "zeroinitializer")
              (try-let ((_ (arity k args 1 pos)) (ty (type-arg (nth args 0))))
                (Ok (expr-new (KZero ty) pos)))
+             (= k "ordinal") (ordinal/parse-ordinal args pos)
              (= k "") (err pos (str "unknown instruction " name))
              :else (heads k args pos sub))))))
 

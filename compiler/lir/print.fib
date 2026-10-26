@@ -41,7 +41,9 @@
 (defun hex2 :private (b: i64) -> str
   (str (str-slice "0123456789abcdef" (shr b 4) (+ (shr b 4) 1)) (str-slice "0123456789abcdef" (bit-and b 15) (+ (bit-and b 15) 1))))
 
-(defun string-text :private (bs: (Array i8)) -> str
+;; The bytes as an lIR string token, `"…"` with the escapes of spec/lir.md 1: a string reads back to the same bytes, and two byte strings
+;; have two texts (the program loader keys the names of ordinals by it, native.imports.ordinals).
+(defun string-text (bs: (Array i8)) -> str
   (str "\""
        (str-join (loop ((i 0) (out []))
                    (if (>= i (array-len bs))
@@ -223,6 +225,7 @@
     ((KIntrin name flags ty args align)
      (cond (= name "load") (range-load-text ty args align)
            (= name "managed-null") (form [managed-text (w "null")])
+           (= name "ordinal") (form [(w "ordinal") (type-text (unwrap-or ty ty-i64)) (str-text (nth args 0)) (member-text (nth args 1))])
            (not (= (own-access-word name) ""))
            (form (concat-parts [[(w (if (starts-with? name "load-") "load" "store")) (w (own-access-word name))]
                                 (match ty ((some t) [(type-text t)]) (nil [])) (exprs-text args)]))
@@ -246,6 +249,13 @@
   (let ((bound (fn (e: LExpr) (match (expr-int-literal e) ((some v) (lit-str v)) (nil (print-expr e))))))
     (form (concat-parts [[(w "load") (form [(w "range") (bound (nth args 1)) (bound (nth args 2))])] (align-words align)
                          [(type-text (unwrap-or ty ty-i32)) (print-expr (nth args 0))]]))))
+
+;; The `KStr` operands of `ordinal` (spec/lir.md 4.7.1): the set's name bare, the member's name as a string.
+(defun str-text :private (e: LExpr) -> str
+  (match (. e kind) ((KStr bs) (str-from-bytes bs)) (_ (print-expr e))))
+
+(defun member-text :private (e: LExpr) -> str
+  (match (. e kind) ((KStr bs) (string-text bs)) (_ (print-expr e))))
 
 (defun binding-text :private (b: LBinding) -> str (form [(. b name) (print-expr (. b value))]))
 
@@ -284,6 +294,7 @@
      (form (into [(w "target") (form [(w "cpu") (string-text (str-bytes (. t cpu)))])]
                  (if (= (. t features) "") [] [(form [(w "features") (string-text (str-bytes (. t features)))])]))))
     ((ItDependentLibrary d) (form [(w "dependent-library") (string-text (str-bytes (. d name)))]))
+    ((ItRow r) (form [(w "row") (. r table) (. r set) (string-text (. r name)) (type-text (. r ty)) (print-expr (. r value))]))
     ((ItDefine f)
      (form (concat-parts [[(w "define")] (linkage-words (. f mods)) (cc-words (. (. f ty) cc))
                           [(form [(. f name) (ret-text (. (. f ty) ret))]) (params-text f)]
