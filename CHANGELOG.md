@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.21
+
+- The respelling, step 4 (spec/lir.md 2): every lIR text fibber owns is in the new spelling: the runtime (`rt/*.lir`), the lIR the
+  emitter, the live server and the live loader write by hand, the inline `lir` bodies in `lib/` and the cases, the planted faults of the
+  scripts, and the lIR quoted in the specs, ADRs and design documents. Every `fibc` and `lairf` the build runs has `FIB_LIR_SPELLING=new`,
+  so the old spelling is refused everywhere but one place: the seed, 0.1.20, embeds its runtime in the old spelling and is run with
+  `FIB_LIR_SPELLING=old` (`BUILDER_ENV` in mk/config.mk) until a seed built from this tree replaces it. lair keeps `--old-spelling` for
+  that seed; it goes once the seed reads the new spelling.
+- lIR (the pinned copy moves from lir b3d6ad39 to 714c626f): symbolic ids, `(ORDINAL T SET "NAME")` and `(ROW TABLE SET "NAME" T VALUE)`
+  (spec/lir.md 4.7.1), numbered and joined by the program loader, so a library compiled once can name a type id or a table row without a
+  program-wide pass; the ownership verifier hands a tail call's result to the caller instead of reporting a leak, verifies every function
+  that holds a managed value (one whose only managed value was a call's result was skipped), and consumes a call's owned positions before it
+  borrows the others (rule 2); `lairf respell` keeps the arguments of a macro use and skips text it cannot lex; the runtime C function table
+  holds the 15 functions it lacked, with the 32-bit narrowing of the ones that take or return a word.
+- `scripts/sync-lir.sh` regenerates docs/reference after a sync (the copied files move the lines the pages cite).
+
 ## 0.1.20
 
 - lIR has compile-time macros (spec/lir.md 4.6): `(define-macro NAME (P..) block+)` is a function from form objects to a form, written
