@@ -1,0 +1,113 @@
+;; compiler/native/jit/store.fib: the object files of macro sessions kept on disk between programs (native.jit.objects keeps them for one
+;; program). A module's object is stored under liro's cache (FIB_LIRO_CACHE, `off` for none; native.liro.context `cache-root`), in its
+;; directory `macro-objects`, one file per module: its key and its object. The key is the module's text (lir.print's, which reads back as
+;; the module) after the store's contract: liro's identity of the compiler and of LLVM (the SHA-256 of each, native.liro.hash), the host's
+;; triple, data layout, CPU and features, and the level the objects are optimised and generated at (native.jit.objects `cache-level`). A
+;; file is found by a hash of the key and taken only when the key it holds is the key, byte for byte, so two keys of one hash cost a
+;; compile and nothing else. A file is written whole under a name of its own and renamed into place, so a reader sees an old file or a new
+;; one, never a part; a store that cannot be read or written is no store.
+(ns native.jit.store
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [native.target :as target]
+            [native.liro.context :as liro] [native.liro.hash :as hash] [native.liro.io :as io] [fib.os :as os]))
+
+(extern LLVMCreateMemoryBufferWithContentsOfFile :private (ptr ptr ptr) -> i32)
+(extern memcmp :private (ptr ptr i64) -> i32)
+(extern fopen :private (ptr ptr) -> ptr)
+(extern fwrite :private (ptr i64 i64 ptr) -> i64)
+(extern fclose :private (ptr) -> i32)
+(extern getpid :private () -> i32)
+
+;; `dir` "" for no store; the contract and the scratch directory liro's identity needs, made when the store is first used; a count for the
+;; names of files being written.
+(defstruct Store (dir: str contract: (Cell str) scratch: (Cell str) seq: (Cell i64)))
+
+(defun store-new () -> Store
+  (let ((root (liro/cache-root)))
+    (Store (if (= root "") "" (str root "/macro-objects")) (cell "") (cell "") (cell 0))))
+
+;; Whether objects are kept on disk: FIB_LIRO_CACHE is not `off` and names or implies a directory.
+(defun store-on? (st: Store) -> bool
+  (not (= (. st dir) "")))
+
+(defun store-free (st: Store) -> unit
+  (when (not (= @(. st scratch) "")) (io/remove-tree @(. st scratch))))
+
+;; The contract, made once: "" when the store cannot be used (no directory, no identity).
+(defun contract :private (st: Store) -> str
+  (cond (= (. st dir) "") ""
+        (not (= @(. st contract) "")) @(. st contract)
+        :else (match (try-let ((scratch (io/temporary (. st dir)))
+                               (_ (do (set! (. st scratch) scratch) (Ok ())))
+                               (identity (hash/backend-identity scratch)))
+                       (match (target/machine-host 0)
+                         ((Err _) (Err "no host machine"))
+                         ((Ok m) (let ((t (str "lir-macro-objects=1\n" identity "triple=" (. m triple) "\nlayout=" (. m data-layout)
+                                                "\nhost-cpu=" (lt/host-cpu-name) "\nhost-features=" (lt/host-features) "\nlevel=2\n")))
+                                   (do (target/machine-dispose m) (Ok t))))))
+                ((Ok t) (do (set! (. st contract) t) t))
+                ((Err _) ""))))
+
+(defun hex :private (v: i64) -> str
+  (loop ((i 0) (out ""))
+    (if (>= i 16)
+        out
+        (let ((d (bit-and (shr v (* 4 (- 15 i))) 15)))
+          (recur (+ i 1) (str out (str-slice "0123456789abcdef" d (+ d 1))))))))
+
+(defun path-of :private (st: Store full: str) -> str
+  (str (. st dir) "/" (hex (hash full)) ".lo"))
+
+;; The object stored under `key`, as a memory buffer the caller owns; nil when none is, or the file holds another key.
+(defun load (st: Store key: str) -> (Option i64)
+  (let ((c (contract st)))
+    (if (= c "")
+        nil
+        (let ((full (str c key)) (p (ffi/bytes-new (path-of st full))) (out (ffi/slot-new)) (msg (ffi/slot-new)))
+          (unsafe
+            (let ((failed (LLVMCreateMemoryBufferWithContentsOfFile p out msg))
+                  (r (if (= failed 0i32) (entry-object (load-i64 out) full) (do (core/take-message (load-i64 msg)) nil))))
+              (do (free p) (free out) (free msg) r)))))))
+
+;; The object of the file's buffer `b` when the key it holds is `full`; `b` is disposed.
+(defun entry-object :private (b: i64 full: str) -> (Option i64)
+  (unsafe
+    (let ((start (core/LLVMGetBufferStart b)) (size (core/LLVMGetBufferSize b)) (n (str-len full))
+          (r (if (and (>= size (+ 8 n)) (= (load-i64 (ffi/addr->ptr start)) n) (same-bytes (+ start 8) full))
+                 (let ((name (ffi/bytes-new "lir.object")))
+                   (let ((o (core/LLVMCreateMemoryBufferWithMemoryRangeCopy (ffi/addr->ptr (+ start (+ 8 n))) (- size (+ 8 n)) name)))
+                     (do (free name) (some o))))
+                 nil)))
+      (do (core/LLVMDisposeMemoryBuffer b) r))))
+
+(defun same-bytes :private (at: i64 s: str) -> bool
+  (let ((p (ffi/bytes-new s)))
+    (unsafe (let ((r (memcmp (ffi/addr->ptr at) p (str-len s)))) (do (free p) (= r 0i32))))))
+
+;; Stores the object `buf` (the caller keeps it) under `key`: written whole to a file of its own, then renamed into place.
+(defun save (st: Store key: str buf: i64) -> unit
+  (let ((c (contract st)))
+    (when (and (not (= c "")) (io-ok? (io/mkdirs (. st dir))))
+      (let ((full (str c key))
+            (tmp (str (. st dir) "/.tmp-" (unsafe (sext i64 (getpid))) "-" @(. st seq))))
+        (do (set! (. st seq) (+ @(. st seq) 1))
+            (if (write-entry tmp full buf)
+                (match (os/rename-file tmp (path-of st full)) ((Ok _) ()) ((Err _) (do (os/remove-file tmp) ())))
+                (do (os/remove-file tmp) ())))))))
+
+(defun io-ok? :private (r: (Result unit str)) -> bool
+  (match r ((Ok _) true) ((Err _) false)))
+
+;; The file `path`: the key's length (8 bytes, the host's order), the key, the object; whether every byte was written.
+(defun write-entry :private (path: str full: str buf: i64) -> bool
+  (let ((p (ffi/bytes-new path)) (mode (ffi/bytes-new "wb")) (k (ffi/bytes-new full)) (len (ffi/slot-new)))
+    (unsafe
+      (let ((f (fopen p mode))
+            (ok (if (= (ffi/ptr->addr f) 0)
+                    false
+                    (do (store-i64 len (str-len full))
+                        (let ((a (fwrite len 1 8 f))
+                              (b (fwrite k 1 (str-len full) f))
+                              (c (fwrite (ffi/addr->ptr (core/LLVMGetBufferStart buf)) 1 (core/LLVMGetBufferSize buf) f))
+                              (closed (fclose f)))
+                          (and (= a 8) (= b (str-len full)) (= c (core/LLVMGetBufferSize buf)) (= closed 0i32)))))))
+        (do (free p) (free mode) (free k) (free len) ok)))))

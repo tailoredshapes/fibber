@@ -1,0 +1,37 @@
+;; compiler/native/macros/session.fib: a module's macro session (spec/lir.md 4.6): the JIT session its macros are compiled into, with the
+;; form library and the stream's library added from the program's objects (native.jit.objects), and its FIB_TIME report. Here, beside
+;; native.macros, so that the expander's file stays under 500 lines (ADR 0006).
+(ns native.macros.session
+  (:use lir.diag lir.ast native.macros.types native.macros.helpers)
+  (:require [native.jit :as jit] [native.call :as call] [native.macros.lib :as lib] [native.macros.readlib :as readlib]
+            [native.macros.readers :as readers] [native.macros.declares :as decl]))
+
+;; A fast-codegen session with the library in it, the runner's entries, the program's gensym word `g` given to it (spec/lir.md 4.6: every
+;; module's session counts in it), and `lir.sexp.expand` told to park on the module's worker (`rs`'s, made now if no reader macro made it):
+;; a reader macro that calls it is answered null by its runner.
+(defun session-new (rs: readers/Readers g: i64 c: MacroCache) -> (Result Session str)
+  (let ((t0 (sys-clock-now)) (r (session-make rs g c)))
+    (do (match r ((Ok s) (jit/session-note (. s jit) "session-new" t0)) ((Err _) ())) r)))
+
+(defun session-make :private (rs: readers/Readers g: i64 c: MacroCache) -> (Result Session str)
+  (try-let ((j (lair-str (jit/session-new-fast-codegen 0)))
+            (_ (lair-str (jit/session-add-source-cached j (. c objects) "lir.sexp" (lib/lib-source))))
+            (_ (lair-str (jit/session-add-source-cached j (. c objects) "lir.read" (readlib/lib-source))))
+            (take (lair-str (jit/session-address j "lir.sexp.failure-take")))
+            (at (lair-str (jit/session-address j "lir.sexp.failure-at")))
+            (set-hook (lair-str (jit/session-address j "lir.sexp.set-hook")))
+            (give-cell (lair-str (jit/session-address j "lir.sexp.gensym-cell")))
+            (_ (call/call-i64 give-cell [g]))
+            (mb (readers/mailbox-of rs))
+            (_ (call/call-i64 set-hook [(. (call/hook-addresses) one) (. mb handle)]))
+            (decls (match (decl/library-declares) ((Err d) (Err (diag-str d))) ((Ok v) (Ok v)))))
+    (Ok (Session j take at set-hook rs (cell nil) (cell (map-empty)) (cell (set-empty)) (cell []) decls (cell (decl/prune-new decls)) c))))
+
+;; FIB_TIME: the session's phases, one line each, `time lir.macros.PHASE N ms` (the session's own and its JIT's).
+(defun report-phases (s: Session) -> unit
+  (let ((ts (jit/session-times (. s jit))))
+    (doseq [k ["session-new" "session-import" "compile-entry" "macro-run" "macro-def" "macro-module" "jit.cache-key" "jit.parse-check"
+               "jit.store-load" "jit.check" "jit.names" "jit.lower" "jit.optimize" "jit.codegen" "jit.store-save" "jit.orc-add" "jit.lookup"]]
+      (match (get ts k)
+        ((some ns) (eprintln (str "time lir.macros." k " " (quot ns 1000000) " ms")))
+        (nil ())))))

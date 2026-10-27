@@ -9,7 +9,7 @@
 (ns native.imports
   (:use lir.diag lir.types lir.ast native.imports.program)
   (:require [native.macros :as macros] [native.macros.types :as mt] [native.macros.helpers :as mh] [native.imports.ordinals :as ord]
-            [lir.check :as check] [llvm.ffi :as ffi]))
+            [lir.check :as check] [llvm.ffi :as ffi] [native.jit.objects :as objects] [native.timing :as timing]))
 
 ;; What one module has taken from its imports: the interface items, the internal names of its imports (name -> file), the files imported,
 ;; and the file whose `ownership` form (spec/lir.md 6.14.6) it took, if any: one per program, as the `target` form.
@@ -35,10 +35,12 @@
 
 ;; The program of `src`, the text of `file` ("" for none: imports are then relative to the working directory).
 (defun load-program (src: str file: str) -> (Result Program Diagnostic)
-  (let ((st (state-new)) (im (imports-new)))
+  (let ((st (state-new)) (im (imports-new)) (t0 (timing/started)))
     (let ((r (load-main st im src file)))
       (do (doseq [e @(. st envs)] (macros/env-close e))
+          (objects/cache-free (. (. st cache) objects))
           (ffi/free-addr (. st gensym))
+          (timing/report "lir.imports.load-program" t0)
           r))))
 
 ;; The named module: parsed with its imports loaded (it is being loaded itself: a module that imports it is a cycle), its ordinals numbered;
@@ -59,7 +61,7 @@
 
 ;; Reads and expands a module, every `import` of it loaded as it is met; the environment is kept open in the state.
 (defun parse-with :private (st: State im: Imports src: str file: str) -> (Result mt/Parsed Diagnostic)
-  (let ((importer (mt/Importer (fn (env: mt/Env path: str pos: i64) (import-into st im env path pos)) (. st gensym))))
+  (let ((importer (mt/Importer (fn (env: mt/Env path: str pos: i64) (import-into st im env path pos)) (. st gensym) (. st cache))))
     (match (macros/parse-module src file importer)
       ((Err d) (Err d))
       ((Ok p) (do (set! (. st envs) (conj @(. st envs) (. p env))) (Ok p))))))
@@ -98,7 +100,7 @@
   (try-let ((p (parse-with st im src file))
             (own (ord/number-items (. st ords) file false (. (. p module) items)))
             (_ (ownership-clash im own))
-            (_ (check-with im (LModule (into @(. im iface) own))))
+            (_ (let ((t0 (timing/started)) (r (check-with im (LModule (into @(. im iface) own))))) (do (timing/report "lir.imports.check" t0) r)))
             (items (admit st file own)))
     (do (set! (. st loaded) (conj @(. st loaded) (Loaded file items)))
         (Ok (Export (interface items) (hidden-names (. (. p module) items)) (macros/own-macros (. p env)))))))

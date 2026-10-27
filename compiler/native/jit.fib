@@ -8,7 +8,8 @@
 (ns native.jit
   (:use lir.diag lir.types lir.lit lir.ast native.error native.jit.names native.jit.prune native.jit.trampoline)
   (:require [lir.check :as check] [lir :as front] [native.lower :as nl] [native.owned :as owned] [native.passes :as passes]
-            [native.target :as target] [llvm.orc :as orc] [llvm.support :as support] [native.libraries :as libraries]))
+            [native.target :as target] [llvm.orc :as orc] [llvm.support :as support] [native.libraries :as libraries]
+            [native.jit.objects :as objects]))
 
 
 (defstruct JitSession
@@ -17,7 +18,9 @@
    data-layout: str
    opt-level: i64
    ;; what every module so far defined and exported
-   names: (Cell JitNames)))
+   names: (Cell JitNames)
+   ;; nanoseconds spent per phase (`session-note`), for FIB_TIME: the caller reads them with `session-times`
+   times: (Cell (Map str i64))))
 
 ;; A session at optimisation level `opt` (0 runs no IR optimisation, 1 to 3 `default<On>`), a target machine at the same level. (mod.rs `Jit::new`)
 (defun session-new (opt: i64) -> (Result JitSession LairError)
@@ -34,12 +37,20 @@
         ((Err e) (Err e))
         ((Ok tm) (match (orc/jit-new tm)
                    ((Err m) (Err (ErrJit m)))
-                   ((Ok j) (Ok (JitSession j (orc/triple j) (orc/data-layout j) opt (cell (names-new))))))))))
+                   ((Ok j) (Ok (JitSession j (orc/triple j) (orc/data-layout j) opt (cell (names-new)) (cell {})))))))))
 
 (defun machine-handle :private () -> (Result i64 LairError)
   (match (target/machine-host 0)
     ((Err e) (Err e))
     ((Ok m) (Ok (. m tm)))))
+
+;; Adds the nanoseconds since `t0` to the phase's total in the session (FIB_TIME: `jit.check`, `jit.lower`, .., and the caller's own phases).
+(defun session-note (s: JitSession phase: str t0: i64) -> unit
+  (set! (. s times) (assoc @(. s times) phase (+ (match (get @(. s times) phase) ((some v) v) (nil 0)) (- (sys-clock-now) t0)))))
+
+;; The phases' totals so far, in nanoseconds.
+(defun session-times (s: JitSession) -> (Map str i64)
+  @(. s times))
 
 ;; Disposes the LLJIT; the addresses it gave out are dead. (mod.rs `Drop`)
 (defun session-free (s: JitSession) -> unit
@@ -51,9 +62,11 @@
 ;; The text is lIR with no macros (the session's own modules: the shim, the mailbox, a trampoline, the macro library): a text that may define
 ;; or use macros goes through native.pipeline `check-source` (which expands it, native.macros) and `session-add-checked`.
 (defun session-add-source (s: JitSession name: str src: str) -> (Result unit LairError)
-  (match (front/parse-and-check src)
-    ((Err ds) (Err (ErrInvalid ds)))
-    ((Ok m) (add-checked s name m))))
+  (let ((t0 (sys-clock-now)) (r (front/parse-and-check src)))
+    (do (session-note s "jit.parse-check" t0)
+        (match r
+          ((Err ds) (Err (ErrInvalid ds)))
+          ((Ok m) (add-checked s name m))))))
 
 ;; Adds a module the checker has accepted (native.pipeline `check-source`), without checking it again.
 (defun session-add-checked (s: JitSession name: str m: LModule) -> (Result unit LairError)
@@ -61,9 +74,11 @@
 
 ;; Adds a module: `check`, the names rules, prune, lower, optimise, hand to ORC. (mod.rs `add_module`)
 (defun session-add-module (s: JitSession name: str m: LModule) -> (Result unit LairError)
-  (match (check/check m)
-    ((Err ds) (Err (ErrInvalid ds)))
-    ((Ok _) (add-checked s name m))))
+  (let ((t0 (sys-clock-now)) (r (check/check m)))
+    (do (session-note s "jit.check" t0)
+        (match r
+          ((Err ds) (Err (ErrInvalid ds)))
+          ((Ok _) (add-checked s name m))))))
 
 ;; As `session-add-module`, for a module that is more than the session needs (the emitter's module so far, which holds every function
 ;; of the program): the definitions no exported one reaches are dropped first (`dead-internals`, as lowering drops them anyway), and only
@@ -81,21 +96,91 @@
 
 ;; The libraries, the names rules, prune, lower, optimise and hand-over of a module the checker accepted.
 (defun add-checked :private (s: JitSession name: str m: LModule) -> (Result unit LairError)
-  (match (try-let ((_ (load-libraries m))) (names-check @(. s names) m support/process-defines?))
-    ((Err e) (Err e))
-    ((Ok _) (match (target/target-runnable m)
-     ((Err e) (Err e))
-     ((Ok _) (match (nl/lower (dead-internals m) name (. s triple) (. s data-layout))
-              ((Err e) (Err e))
-              ((Ok o) (hand-over s name m o))))))))
+  (let ((t0 (sys-clock-now)) (r (try-let ((_ (load-libraries m))) (names-check @(. s names) m support/process-defines?))))
+    (do (session-note s "jit.names" t0)
+        (match r
+          ((Err e) (Err e))
+          ((Ok _) (match (target/target-runnable m)
+           ((Err e) (Err e))
+           ((Ok _) (let ((t1 (sys-clock-now)) (o (nl/lower (dead-internals m) name (. s triple) (. s data-layout))))
+                     (do (session-note s "jit.lower" t1)
+                         (match o
+                           ((Err e) (Err e))
+                           ((Ok o) (hand-over s name m o))))))))))))
 
 ;; Optimises the lowered module and gives it to ORC, which then owns the context and the module; the names are recorded when it took it.
 (defun hand-over :private (s: JitSession name: str m: LModule o: owned/Owned) -> (Result unit LairError)
-  (match (passes/optimize (. o module) 0 (. s opt-level))
-    ((Err e) (do (owned/owned-dispose o) (Err e)))
-    ((Ok _) (match (orc/add-module (. s lljit) (. o ctx) (. o module))
-              ((Err msg) (Err (ErrJit msg)))
-              ((Ok _) (do (set! (. s names) (names-record @(. s names) name m)) (Ok ())))))))
+  (let ((t0 (sys-clock-now)) (r (passes/optimize (. o module) 0 (. s opt-level))))
+    (do (session-note s "jit.optimize" t0)
+        (match r
+          ((Err e) (do (owned/owned-dispose o) (Err e)))
+          ((Ok _) (let ((t1 (sys-clock-now)) (added (orc/add-module (. s lljit) (. o ctx) (. o module))))
+                    (do (session-note s "jit.orc-add" t1)
+                        (match added
+                          ((Err msg) (Err (ErrJit msg)))
+                          ((Ok _) (do (set! (. s names) (names-record @(. s names) name m)) (Ok ())))))))))))
+
+;; ---------------------------------------------------------------- through the program's objects (native.jit.objects)
+
+;; As `session-add-source`, through the cache `c`: a text compiled before, in the program or one before it, is added as its object.
+(defun session-add-source-cached (s: JitSession c: objects/ObjCache name: str src: str) -> (Result unit LairError)
+  (let ((key (str "source\n" src)))
+    (match (objects/cache-get c key)
+      ((some o) (add-object s name (. o module) (. o buffer)))
+      (nil (let ((t0 (sys-clock-now)) (r (front/parse-and-check src)))
+             (do (session-note s "jit.parse-check" t0)
+                 (match r
+                   ((Err ds) (Err (ErrInvalid ds)))
+                   ((Ok m) (match (load-stored s c key m)
+                             ((some o) (add-object s name m (. o buffer)))
+                             (nil (compile-object s c key name m)))))))))))
+
+;; As `session-add-module`, through the cache `c`: a module whose text `key` (lir.print's of `m`, which reads back as the module, made by the
+;; caller) was compiled before, in the program or by a program before it (the store on disk, native.jit.store), is added as that object,
+;; without checking, lowering or generating it again (the checker's verdict on a text and the code of it are the text's, for one compiler
+;; and one LLVM); the libraries, the names rules and the target are the session's and are applied to it as to any module.
+(defun session-add-module-keyed (s: JitSession c: objects/ObjCache key: str name: str m: LModule) -> (Result unit LairError)
+  (match (match (objects/cache-get c key) ((some o) (some o)) (nil (load-stored s c key m)))
+    ((some o) (add-object s name m (. o buffer)))
+    (nil (let ((t1 (sys-clock-now)) (r (check/check m)))
+           (do (session-note s "jit.check" t1)
+               (match r
+                 ((Err ds) (Err (ErrInvalid ds)))
+                 ((Ok _) (compile-object s c key name m))))))))
+
+;; The object of `key` in the store on disk, when the cache has one (FIB_TIME: `jit.store-load`).
+(defun load-stored :private (s: JitSession c: objects/ObjCache key: str m: LModule) -> (Option objects/CachedObject)
+  (if (objects/stored? c)
+      (let ((t0 (sys-clock-now)) (r (objects/cache-load c key m))) (do (session-note s "jit.store-load" t0) r))
+      nil))
+
+;; The libraries, the names rules and the target of a module about to join the session (`add-checked`'s first steps).
+(defun admit :private (s: JitSession m: LModule) -> (Result unit LairError)
+  (let ((t0 (sys-clock-now)) (r (try-let ((_ (load-libraries m))) (names-check @(. s names) m support/process-defines?))))
+    (do (session-note s "jit.names" t0)
+        (match r ((Err e) (Err e)) ((Ok _) (target/target-runnable m))))))
+
+;; A checked module admitted, lowered, optimised and generated as an object file at the cache's level (native.jit.objects `cache-level`),
+;; kept in the cache under `key`, and added.
+(defun compile-object :private (s: JitSession c: objects/ObjCache key: str name: str m: LModule) -> (Result unit LairError)
+  (try-let ((_ (admit s m))
+            (o (let ((t0 (sys-clock-now)) (r (nl/lower (dead-internals m) name (. s triple) (. s data-layout))))
+                 (do (session-note s "jit.lower" t0) r)))
+            (buf (let ((t0 (sys-clock-now))
+                       (r (try-let ((tm (objects/cache-machine c)) (_ (passes/optimize (. o module) tm (objects/cache-level c))))
+                            (objects/emit c (. o module)))))
+                   (do (owned/owned-dispose o) (session-note s "jit.codegen" t0) r))))
+    (do (let ((t0 (sys-clock-now))) (do (objects/cache-keep c key (objects/CachedObject buf m)) (session-note s "jit.store-save" t0)))
+        (add-admitted s name m buf))))
+
+;; The object `buf` (the cache's: a copy is given to ORC) added to the session as the module `m`, admitted first.
+(defun add-object :private (s: JitSession name: str m: LModule buf: i64) -> (Result unit LairError)
+  (match (admit s m) ((Err e) (Err e)) ((Ok _) (add-admitted s name m buf))))
+
+(defun add-admitted :private (s: JitSession name: str m: LModule buf: i64) -> (Result unit LairError)
+  (try-let ((_ (let ((t0 (sys-clock-now)) (r (orc/add-object (. s lljit) (objects/buffer-copy buf))))
+                 (do (session-note s "jit.orc-add" t0) (match r ((Err msg) (Err (ErrJit msg))) ((Ok _) (Ok ())))))))
+    (do (set! (. s names) (names-record @(. s names) name m)) (Ok ()))))
 
 ;; The lIR type of an exported function defined in this session. (mod.rs `signature`)
 (defun session-signature (s: JitSession name: str) -> (Result LFnType LairError)
@@ -120,6 +205,8 @@
 (defun session-address (s: JitSession name: str) -> (Result i64 LairError)
   (match (session-signature s name)
     ((Err e) (Err e))
-    ((Ok _) (match (orc/lookup (. s lljit) name)
-              ((Err m) (Err (ErrJit m)))
-              ((Ok a) (Ok a))))))
+    ((Ok _) (let ((t0 (sys-clock-now)) (r (orc/lookup (. s lljit) name)))
+              (do (session-note s "jit.lookup" t0)
+                  (match r
+                    ((Err m) (Err (ErrJit m)))
+                    ((Ok a) (Ok a))))))))

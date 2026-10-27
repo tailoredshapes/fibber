@@ -1,0 +1,207 @@
+;; compiler/native/macros/declares.fib: the declarations of a macro's module (spec/lir.md 4.6, 4.8): the form library's and the stream's
+;; functions, the earlier macros' functions of the session, the macro-imported modules' interfaces. They are items, made once: the library's
+;; read and parsed when the session is made (`library-declares`), a macro's made from its parameters (`macro-declare-items`), an interface
+;; kept as items by native.macros; a macro's module concatenates them before its definition. A macro's module holds the declarations its body
+;; names and the structs those name, not every declaration of the session (`module-declares`): what a body does not name it cannot reach,
+;; and while the session's declarations are a valid module (`Prune`, kept as they grow) any part of them closed over its structs is one,
+;; so the checker, the names rules and the code are the same for the body; when they are not, the macro's module holds them all, as before,
+;; and the checker's error is what it was.
+(ns native.macros.declares
+  (:use lir.diag lir.sexp lir.ast lir.types native.macros.types)
+  (:require [lir.parse.items :as items] [lir.check.env :as cenv] [native.macros.lib :as lib] [native.macros.readlib :as readlib]))
+
+;; The library's and the stream's declarations, parsed: what every macro's module declares of them, at the positions they had when each
+;; macro's module was read from their text (the library's first, the stream's after a newline).
+(defun library-declares () -> (Result (Vec LItem) Diagnostic)
+  (try-let ((forms (read (str (lib/declares-source) "\n" (readlib/declares-source)))))
+    (loop ((i 0) (out []))
+      (if (>= i (count forms))
+          (Ok out)
+          (match (items/parse-item (nth forms i)) ((Err d) (Err d)) ((Ok it) (recur (+ i 1) (conj out it))))))))
+
+(defun newlines :private (s: str) -> i64
+  (loop ((i 0) (n 0))
+    (cond (>= i (str-len s)) n
+          (= (str-byte-at s i) 10i8) (recur (+ i 1) (+ n 1))
+          :else (recur (+ i 1) n))))
+
+;; The line the first macro's declaration had in that text: after the library's lines, a newline, the stream's lines and a newline.
+(defun macro-first-line :private () -> i64
+  (+ 3 (newlines (lib/declares-source)) (newlines (readlib/declares-source))))
+
+;; `(DECLARE lir.macro.NAME PTR (PTR..))` of every macro defined so far in the session `s`, one per line after the library's: a macro's body
+;; may call an earlier macro's function. A macro of an imported module is in that module's session: it is used, not called (spec/lir.md 4.7).
+(defun macro-declare-items (env: Env s: Session) -> (Vec LItem)
+  (let ((ms (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros)))))
+        (line0 (macro-first-line)))
+    (loop ((i 0) (out []))
+      (if (>= i (count ms))
+          out
+          (let ((m (nth ms i)))
+            (recur (+ i 1)
+                   (conj out (ItDeclare (LDeclare (str "lir.macro." (. m name))
+                                                  (LFnType cc-c (some ty-ptr) (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) ty-ptr) false)
+                                                  false (pos-new (+ line0 i) 1))))))))))
+
+;; ---------------------------------------------------------------- the declarations a body names
+
+;; The session's state of its library declarations `decls`, before any interface or macro.
+(defun prune-new (decls: (Vec LItem)) -> Prune
+  (prune-add (Prune {} {} {} #{} true 0) 0 decls))
+
+;; The declarations `items` added at the places from `base` on (the library's from 0, an interface's after the library's and the
+;; interfaces before it): a name declared twice, a name the checker reserves, a struct defined twice or holding itself, or a type with an
+;; owned kind outside a parameter makes the session unclean (env.rs `Env::build` refuses each); a struct named and not defined is missing.
+(defun prune-add (p: Prune base: i64 items: (Vec LItem)) -> Prune
+  (cycles (loop ((i 0) (p p))
+            (if (>= i (count items)) p (recur (+ i 1) (prune-item p (+ base i) (nth items i)))))
+          items))
+
+;; The function `lir.macro.NAME` of a macro compiled into the session, declared in the macros after it.
+(defun prune-macro (p: Prune name: str) -> Prune
+  (let ((q (add-symbol p (str "lir.macro." name) (- -1 (. p macros)))))
+    (Prune (. q symbols) (. q structs) (. q fields) (. q missing) (. q clean) (+ (. q macros) 1))))
+
+(defun prune-item :private (p: Prune at: i64 it: LItem) -> Prune
+  (match it
+    ((ItDeclare d) (refer-fn (add-symbol p (. d name) at) (. d ty)))
+    ((ItDeclareGlobal g) (refer (add-symbol p (. g name) at) (. g ty)))
+    ((ItStruct s) (refer-all (add-struct p s at) (. s fields)))
+    (_ (unclean p))))
+
+(defun unclean :private (p: Prune) -> Prune
+  (Prune (. p symbols) (. p structs) (. p fields) (. p missing) false (. p macros)))
+
+(defun add-symbol :private (p: Prune name: str at: i64) -> Prune
+  (if (or (starts-with? name "llvm.") (contains? (. p symbols) name))
+      (unclean p)
+      (Prune (assoc (. p symbols) name at) (. p structs) (. p fields) (. p missing) (. p clean) (. p macros))))
+
+(defun add-struct :private (p: Prune s: LStructDef at: i64) -> Prune
+  (if (contains? (. p structs) (. s name))
+      (unclean p)
+      (Prune (. p symbols) (assoc (. p structs) (. s name) at) (assoc (. p fields) (. s name) (. s fields)) (disj (. p missing) (. s name))
+             (. p clean) (. p macros))))
+
+(defun refer :private (p: Prune t: LType) -> Prune
+  (match t
+    ((TNamed n) (if (contains? (. p structs) n) p (Prune (. p symbols) (. p structs) (. p fields) (conj (. p missing) n) (. p clean) (. p macros))))
+    ((TAnon fs) (refer-all p fs))
+    ((TVector _ e) (refer p e))
+    ((TArray _ e) (refer p e))
+    ((TOwned) (unclean p))
+    (_ p)))
+
+(defun refer-all :private (p: Prune ts: (Vec LType)) -> Prune
+  (loop ((i 0) (p p)) (if (>= i (count ts)) p (recur (+ i 1) (refer p (nth ts i))))))
+
+(defun refer-fn :private (p: Prune f: LFnType) -> Prune
+  (let ((p2 (refer-all p (mapv type-param-base (. f params)))))
+    (match (. f ret) ((some r) (refer p2 r)) (nil p2))))
+
+;; A struct that holds itself by value, through others or not: a cycle closed by `items` passes through a struct of theirs.
+(defun cycles :private (p: Prune items: (Vec LItem)) -> Prune
+  (let ((env (cenv/LEnv (. p fields) {})))
+    (if (some? (first (filter (fn (it: LItem) (match it ((ItStruct s) (cenv/env-cyclic? env (. s name))) (_ false))) items)))
+        (unclean p)
+        p)))
+
+;; Every name the form spells: an atom's or a symbol's text, and in the old spelling's `@f` and `%struct.s` also the name after the sigil.
+(defun mentions (s: Sexp) -> (Set str)
+  (mention-into #{} s))
+
+(defun mention-into :private (acc: (Set str) s: Sexp) -> (Set str)
+  (match s
+    ((SxList its _ _) (mention-all acc its))
+    ((SxBrace its _ _) (mention-all acc its))
+    ((SxBracket its _ _) (mention-all acc its))
+    ((SxAtom a _ _) (mention-text acc a))
+    ((SxSymbol a _ _) (mention-text acc a))
+    ((SxVecType _ e _ _) (mention-text acc e))
+    (_ acc)))
+
+(defun mention-all :private (acc: (Set str) its: (Vec Sexp)) -> (Set str)
+  (loop ((i 0) (acc acc)) (if (>= i (count its)) acc (recur (+ i 1) (mention-into acc (nth its i))))))
+
+(defun mention-text :private (acc: (Set str) a: str) -> (Set str)
+  (cond (starts-with? a "%struct.") (conj (conj acc a) (str-slice a 8 (str-len a)))
+        (starts-with? a "@") (conj (conj acc a) (str-slice a 1 (str-len a)))
+        :else (conj acc a)))
+
+;; Whether a part of the session's declarations is a valid module: they are clean and name no struct they do not define.
+(defun prunable? (p: Prune) -> bool
+  (and (. p clean) (empty? (. p missing))))
+
+;; The declarations of the module of a macro whose definition spells the names `ns` (`mentions`): while the session is clean and nothing
+;; is missing, those it names, with every struct they name, through their types and the structs' fields; else all of them. Either way in
+;; the order of the module made of all of them: the library's, the earlier macros', the interfaces'.
+(defun module-declares (env: Env s: Session ns: (Set str)) -> (Vec LItem)
+  (let ((p @(. s prune)))
+    (if (prunable? p)
+        (named env s p ns)
+        (into (into (. s decls) (macro-declare-items env s)) @(. s iface)))))
+
+(defun named :private (env: Env s: Session p: Prune ns: (Set str)) -> (Vec LItem)
+  (let ((at (selected p (. s decls) @(. s iface) ns))
+        (macros (vec (sort-by (fn (pr: (Pair i64 str)) (- 0 (. pr fst)))
+                              (vec (keep (fn (n: str) (match (get (. p symbols) n) ((some k) (if (< k 0) (some (Pair k n)) nil)) (nil nil)))
+                                         (vec ns))))))
+        (nlib (count (. s decls))))
+    (into (into (mapv (fn (i: i64) (item-at (. s decls) @(. s iface) i)) (vec (filter (fn (i: i64) (< i nlib)) at)))
+                (vec (keep (fn (pr: (Pair i64 str)) (macro-item env s (- -1 (. pr fst)) (. pr snd))) macros)))
+          (mapv (fn (i: i64) (item-at (. s decls) @(. s iface) i)) (vec (filter (fn (i: i64) (>= i nlib)) at))))))
+
+;; The places, in `decls` then `iface` and in order, of the declarations named in `ns` and of every struct they name, through their types
+;; and the structs' fields, at any depth.
+(defun selected (p: Prune decls: (Vec LItem) iface: (Vec LItem) ns: (Set str)) -> (Vec i64)
+  (let ((names (vec ns))
+        (syms (vec (filter (fn (i: i64) (>= i 0)) (vec (keep (fn (n: str) (get (. p symbols) n)) names)))))
+        (roots (vec (filter (fn (n: str) (contains? (. p structs) n)) names)))
+        (structs (struct-closure p (into roots (types-named decls iface syms)))))
+    (vec (sort (into syms (vec (keep (fn (n: str) (get (. p structs) n)) (vec structs))))))))
+
+;; `(DECLARE lir.macro.NAME PTR (PTR..))` of the session's macro `fname` (`lir.macro.NAME`), the `k`th the session compiled, on the `k`th
+;; line after the library's (in a pruned module the place of a declaration is never reported: they are a valid module).
+(defun macro-item :private (env: Env s: Session k: i64 fname: str) -> (Option LItem)
+  (match (get @(. env macros) (str-slice fname 10 (str-len fname)))
+    ((some m) (if (= (. m take) (. s take))
+                  (some (ItDeclare (LDeclare fname (LFnType cc-c (some ty-ptr) (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) ty-ptr) false)
+                                             false (pos-new (+ (macro-first-line) k) 1))))
+                  nil))
+    (nil nil)))
+
+;; The declaration at place `i`: the library's, then the interfaces'.
+(defun item-at (decls: (Vec LItem) iface: (Vec LItem) i: i64) -> LItem
+  (if (< i (count decls)) (nth decls i) (nth iface (- i (count decls)))))
+
+;; The structs the types of the declarations at `at` name.
+(defun types-named :private (decls: (Vec LItem) iface: (Vec LItem) at: (Vec i64)) -> (Vec str)
+  (loop ((i 0) (out []))
+    (if (>= i (count at))
+        out
+        (recur (+ i 1) (match (item-at decls iface (nth at i))
+                         ((ItDeclare d) (named-in-all out (conj (mapv type-param-base (. (. d ty) params))
+                                                                (match (. (. d ty) ret) ((some r) r) (nil ty-i64)))))
+                         ((ItDeclareGlobal g) (named-in out (. g ty)))
+                         (_ out))))))
+
+(defun named-in :private (out: (Vec str) t: LType) -> (Vec str)
+  (match t
+    ((TNamed n) (conj out n))
+    ((TAnon fs) (named-in-all out fs))
+    ((TVector _ e) (named-in out e))
+    ((TArray _ e) (named-in out e))
+    (_ out)))
+
+(defun named-in-all :private (out: (Vec str) ts: (Vec LType)) -> (Vec str)
+  (loop ((i 0) (out out)) (if (>= i (count ts)) out (recur (+ i 1) (named-in out (nth ts i))))))
+
+;; The structs `roots` and every struct their fields name, through any depth.
+(defun struct-closure :private (p: Prune roots: (Vec str)) -> (Set str)
+  (loop ((work roots) (seen #{}))
+    (if (empty? work)
+        seen
+        (let ((n (nth work (- (count work) 1))) (rest (vec-pop work)))
+          (if (contains? seen n)
+              (recur rest seen)
+              (recur (match (get (. p fields) n) ((some fs) (named-in-all rest fs)) (nil rest)) (conj seen n)))))))

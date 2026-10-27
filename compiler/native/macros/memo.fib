@@ -1,0 +1,64 @@
+;; compiler/native/macros/memo.fib: a macro's function as its module has it (`Def`), compiled into a session with the declarations its
+;; body names (`compile-def`), and the program's memo of the `define-macro` forms of libraries. gloss's macro library is required by
+;; every module of a gloss program and compiled into each module's session (spec/lir.md 4.6): the same forms, read from the same texts,
+;; again and again. A form read with no reader macro, whose blocks start no list with a macro of the module, expands to itself
+;; (native.macros `expand`), so its definition, parsed, its names and its text are the form's: the program keeps them by the form's text
+;; and position (`memo-key`) and the next module that reads it takes them (`FormMemo`), checks its own macros against the form's words
+;; (`heads-free?`) and compiles the definition with its own declarations.
+(ns native.macros.memo
+  (:use lir.diag lir.sexp lir.ast native.error native.macros.types native.macros.helpers)
+  (:require [lir.parse.items :as items] [lir.print :as print] [native.jit :as jit] [native.macros.declares :as decl]))
+
+;; The function `fname` of parameters `ps` and body `blocks` (`macro-define`), parsed, with the names it spells and its text.
+(defun def-of (fname: str ps: Params blocks: (Vec Sexp) pos: i64) -> (Result Def Diagnostic)
+  (let ((d (macro-define fname ps blocks pos)))
+    (match (items/parse-item (sexp-plain d))
+      ((Err e) (Err e))
+      ((Ok it) (Ok (Def it (decl/mentions d) (print/print-module (LModule [it]))))))))
+
+;; The function of `d` compiled into the session `s` with the declarations its body names (native.macros.declares), through the program's
+;; objects, keyed by the module's text (the declarations' and the definition's); its address when `look`, else 0. Errors carry `what`.
+(defun compile-def (env: Env s: Session what: str fname: str d: Def pos: i64 look: bool) -> (Result i64 Diagnostic)
+  (let ((t0 (sys-clock-now)) (decls (decl/module-declares env s (. d mentions))))
+    (do (jit/session-note (. s jit) "macro-module" t0)
+        (let ((t1 (sys-clock-now)) (key (str (print/print-module (LModule decls)) (. d key))))
+          (do (jit/session-note (. s jit) "jit.cache-key" t1)
+              (try-let ((_ (match (jit/session-add-module-keyed (. s jit) (. (. s cache) objects) key (str "macro." fname) (LModule (conj decls (. d item))))
+                             ((Err e) (Err (module-error what e pos)))
+                             ((Ok _) (Ok ()))))
+                        (entry (if look
+                                   (match (jit/session-address (. s jit) fname) ((Err e) (Err (module-error what e pos))) ((Ok a) (Ok a)))
+                                   (Ok 0))))
+                (Ok entry)))))))
+
+;; The key of a library's form read from `env`'s text: its position and its text, which are the form when the module's readtable has
+;; nothing set (the reader is lIR's own); nil when it has, or the form has no span in the text.
+(defun memo-key (env: Env form: Sexp) -> (Option str)
+  (let ((sp (sexp-span form)))
+    (if (or @(. (. (. env readers) table) active) (= sp 0) (> (span-end sp) (str-len (. env text))))
+        nil
+        (some (str (sexp-pos form) " " (str-slice (. env text) (span-start sp) (span-end sp)))))))
+
+;; The words the lists of `forms` start with, at any depth, once each: a list whose word names a macro is a use (native.macros `expand`).
+(defun heads (forms: (Vec Sexp)) -> (Vec str)
+  (vec (heads-all #{} forms)))
+
+(defun heads-all :private (acc: (Set str) its: (Vec Sexp)) -> (Set str)
+  (loop ((i 0) (acc acc)) (if (>= i (count its)) acc (recur (+ i 1) (heads-into acc (nth its i))))))
+
+(defun heads-into :private (acc: (Set str) s: Sexp) -> (Set str)
+  (match s
+    ((SxList its _ _) (heads-all (if (empty? its) acc (match (sexp-atom (nth its 0)) ((some a) (conj acc a)) (nil acc))) its))
+    ((SxBrace its _ _) (heads-all acc its))
+    ((SxBracket its _ _) (heads-all acc its))
+    (_ acc)))
+
+;; Whether no word of `hs` names a macro of the module: blocks whose lists start with them expand to themselves.
+(defun heads-free? (env: Env hs: (Vec str)) -> bool
+  (not (some? (first (filter (fn (h: str) (some? (get @(. env macros) h))) hs)))))
+
+(defun recall (env: Env key: str) -> (Option FormMemo)
+  (get @(. (. env cache) forms) key))
+
+(defun remember (env: Env key: str fm: FormMemo) -> unit
+  (set! (. (. env cache) forms) (assoc @(. (. env cache) forms) key fm)))

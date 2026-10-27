@@ -5,9 +5,11 @@
   (:use lir.diag lir.sexp lir.ast lir.types native.error native.macros.types)
   (:require [lir.parse.names :as names] [lir.words :as words] [native.call :as call] [native.macros.objects :as obj] [llvm.ffi :as ffi]))
 
-;; The environment of a file read for the module of `env` (a library, an included file): the file's own name, everything else the module's.
-(defun env-sub (env: Env path: str) -> Env
-  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq) (. env hook) (. env collected) (. env gensym)))
+;; The environment of a file read for the module of `env` (a library, an included file): the file's own name and text, everything else the
+;; module's.
+(defun env-sub (env: Env path: str text: str) -> Env
+  (Env path (file-cstr path) (. env macros) (. env session) (. env loaded) (. env loading) (. env ns) (. env readers) (. env seq) (. env hook) (. env collected) (. env gensym)
+       (. env cache) text))
 
 ;; The file as the objects carry it: a C string that lives as long as they do, null for none.
 (defun file-cstr (file: str) -> ptr
@@ -83,14 +85,6 @@
                    (SxList (mapv (fn (p: str) (SxList [(SxAtom ptr pos 0) (SxAtom p pos 0)] pos 0)) (. ps names)) pos 0)]
                   blocks)
             pos 0)))
-
-;; `(DECLARE lir.macro.NAME PTR (PTR..))` of every macro defined so far in the session `s`, as text: a macro's body may call an earlier
-;; macro's function. A macro of an imported module is in that module's session: it is used, not called (spec/lir.md 4.7).
-(defun macro-declares (env: Env s: Session) -> str
-  (let ((ptr (words/word-text "ptr")))
-    (str-join-with "\n"
-      (mapv (fn (m: Macro) (str "(" (words/word-text "declare") " lir.macro." (. m name) " " ptr " (" (str-join-with " " (vec-fill (+ (. m fixed) (if (. m rest) 1 0)) ptr)) "))"))
-            (vec (filter (fn (m: Macro) (= (. m take) (. s take))) (vals @(. env macros))))))))
 
 ;; The error of a macro's module the session refused: the checker's first diagnostic, where it is in the file, or the JIT's text.
 (defun module-error (what: str e: LairError pos: i64) -> Diagnostic
