@@ -33,7 +33,7 @@ stage_mode = if [ "$(GATE_PARTITION)" = 1 ] && grep -q FIB_LIRO_PARTITION "$$(co
 # and F would be rebuilt for nothing; a changed rt/*.lir does. A hand-edited runtime.fib is newer than rt/, so it is not regenerated either:
 # build/runtime-drift.ok (which does depend on the generator) is what catches both.
 $(GEN_RUNTIME): compiler/tests/emit/gen-runtime.fib lib/prelude.fib $(BUILDER) | $(BUILD)/
-	$(BUILDER_ENV) $(BUILDER) build $< $(BUILD_ARGS) -o $@
+	$(BUILDER) build $< $(BUILD_ARGS) -o $@
 $(RUNTIME_FIB): $(RT_LIR) | $(GEN_RUNTIME)
 	$(GEN_RUNTIME) rt > $@.new && mv $@.new $@
 $(BUILD)/runtime-drift.ok: $(RUNTIME_FIB) $(RT_LIR) $(GEN_RUNTIME) | $(BUILD)/
@@ -43,7 +43,7 @@ runtime: $(RUNTIME_FIB) $(BUILD)/runtime-drift.ok   ## regenerate compiler/emit/
 # Stage 2: F, built by the seed (or BUILDER); F.lir is what F emits for itself; F3 is built by F; the fixed point is F.lir = F3.lir.
 $(F): $(COMPILER_SRC) $(BUILDER) $(LLVM_DEP) $(FRESH) | $(BUILD)/
 	rm -f $@ $(BUILD)/F3 $(BUILD)/F.lir $(BUILD)/F3.lir $(BUILD)/F3.secs
-	$(call stage_mode,$(BUILDER)) > $(BUILD)/F.mode; t0=$$(date +%s); $(STAGE_ENV) $(BUILDER_ENV) $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
+	$(call stage_mode,$(BUILDER)) > $(BUILD)/F.mode; t0=$$(date +%s); $(STAGE_ENV) $(BUILDER) build compiler/fibc.fib $(BUILD_ARGS) $(LLVM_ARGS) -o $@.new > $(BUILD)/F.log 2>&1 || { tail -n 20 $(BUILD)/F.log; exit 1; }; mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.secs
 $(BUILD)/F.lir: $(F)
 	t0=$$(date +%s); $(F) emit $(BUILD_ARGS) compiler/fibc.fib > $@.new 2> $(BUILD)/F.lir.err && mv $@.new $@; echo "$$(( $$(date +%s) - t0 ))" > $(BUILD)/F.lir.secs
 $(BUILD)/F3: $(F) $(LLVM_DEP)

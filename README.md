@@ -24,7 +24,7 @@ TLS is client-only and **UNAUDITED**; read [security and limits](docs/policy/lim
 
 ## Install
 
-The current release is **0.1.21** (VERSION); the bootstrap seed is 0.1.20 (SEED).
+The current release and bootstrap seed are **0.1.21**, recorded in VERSION and SEED.
 Download your platform's archive and SHA256SUMS from
 [GitHub releases](https://github.com/tailoredshapes/fibber/releases):
 
