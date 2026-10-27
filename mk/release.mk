@@ -22,9 +22,9 @@ release_build = FIB_LIRO_CACHE=off FIB_TARGET_CPU=$(RELEASE_CPU) $(1) build comp
 release_emit = FIB_TARGET_CPU=$(RELEASE_CPU) $(1) emit $(BUILD_ARGS) compiler/fibc.fib
 
 $(RELEASE_DIR)/F: $(COMPILER_SRC) $(BUILDER) $(RELEASE_LLVM_DEP) $(BUILD)/version.ok | $(RELEASE_DIR)/
-	$(call release_build,$(BUILDER_ENV) $(BUILDER),$@.new) && mv $@.new $@
+	$(call release_build,$(BUILDER),$@.new) && mv $@.new $@
 $(RELEASE_DIR)/emit.seed: $(COMPILER_SRC) $(BUILDER) | $(RELEASE_DIR)/
-	$(call release_emit,$(BUILDER_ENV) $(BUILDER)) > $@.new && mv $@.new $@
+	$(call release_emit,$(BUILDER)) > $@.new && mv $@.new $@
 $(RELEASE_DIR)/emit.F: $(RELEASE_DIR)/F
 	$(call release_emit,$<) > $@.new && mv $@.new $@
 $(RELEASE_DIR)/F3: $(RELEASE_DIR)/F $(RELEASE_LLVM_DEP)

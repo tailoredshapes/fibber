@@ -67,11 +67,9 @@ LIMIT_STDLIB ?= 1800
 # The environment every fibc of the build sees: the tree's library, scratch under build/, no LD_LIBRARY_PATH (a stage 2 links LLVM itself).
 export FIB_LIB := $(ROOT)/lib
 # The tree's lIR (rt/, the templates, the tests' .lir, the inline `lir` bodies of lib/) is in the new spelling (spec/lir.md 2): every fibc
-# and lairf of the build refuses the old one, so nothing in the tree leans on the transitional mode.
+# and lairf of the build, the seed included (0.1.21 embeds its runtime in the new spelling), refuses the old one, so nothing in the tree
+# leans on the transitional mode.
 export FIB_LIR_SPELLING := new
-# The one exception is the seed: fibc 0.1.20 embeds its own runtime in the old spelling and parses it in FIB_LIR_SPELLING's mode, so the
-# builder runs with the old spelling admitted (mk/stage2.mk, mk/release.mk). Delete BUILDER_ENV when SEED names a release built from this tree.
-BUILDER_ENV := FIB_LIR_SPELLING=old
 # TMPDIR is outside the tree on purpose: with TMPDIR inside the worktree, cases/stdlib/8283 fails in a shard (expected 0, got 4294967296) and passes
 # with TMPDIR elsewhere (found in MAKE-1; reported, not explained). SCRATCH holds it, and the tool scripts' scratch.
 SCRATCH ?= $(HOME)/.cache/fibber-scratch/mk-$(shell echo $(ROOT) | { md5sum 2> /dev/null || md5 -r; } | cut -c1-8)
