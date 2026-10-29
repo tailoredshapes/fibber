@@ -45,7 +45,7 @@ Generated declaration inventory of [fib.tls](../../../lib/fib/tls.fib). Source l
 | `https-options` | defun | [lib/fib/tls/http.fib:61](../../../lib/fib/tls/http.fib#L61) |
 | `io-of` | defun | [lib/fib/tls/http.fib:11](../../../lib/fib/tls/http.fib#L11) |
 | `make-offer` | defun | [lib/fib/tls/hello.fib:34](../../../lib/fib/tls/hello.fib#L34) |
-| `make-session` | defun | [lib/fib/tls/conn.fib:99](../../../lib/fib/tls/conn.fib#L99) |
+| `make-session` | defun | [lib/fib/tls/conn.fib:100](../../../lib/fib/tls/conn.fib#L100) |
 | `max-cipher` | def | [lib/fib/tls/record.fib:23](../../../lib/fib/tls/record.fib#L23) |
 | `max-hs-message` | def | [lib/fib/tls/record.fib:25](../../../lib/fib/tls/record.fib#L25) |
 | `max-plain` | def | [lib/fib/tls/record.fib:22](../../../lib/fib/tls/record.fib#L22) |
@@ -74,9 +74,9 @@ Generated declaration inventory of [fib.tls](../../../lib/fib/tls.fib). Source l
 | `send-client-hello` | defun | [lib/fib/tls/record.fib:129](../../../lib/fib/tls/record.fib#L129) |
 | `send-range` | defun | [lib/fib/tls/record.fib:125](../../../lib/fib/tls/record.fib#L125) |
 | `seq-bound` | def | [lib/fib/tls/record.fib:24](../../../lib/fib/tls/record.fib#L24) |
-| `sess-close` | defun | [lib/fib/tls/conn.fib:92](../../../lib/fib/tls/conn.fib#L92) |
-| `sess-read` | defun | [lib/fib/tls/conn.fib:73](../../../lib/fib/tls/conn.fib#L73) |
-| `sess-write` | defun | [lib/fib/tls/conn.fib:86](../../../lib/fib/tls/conn.fib#L86) |
+| `sess-close` | defun | [lib/fib/tls/conn.fib:93](../../../lib/fib/tls/conn.fib#L93) |
+| `sess-read` | defun | [lib/fib/tls/conn.fib:74](../../../lib/fib/tls/conn.fib#L74) |
+| `sess-write` | defun | [lib/fib/tls/conn.fib:87](../../../lib/fib/tls/conn.fib#L87) |
 | `set-read-keys` | defun | [lib/fib/tls/record.fib:34](../../../lib/fib/tls/record.fib#L34) |
 | `set-write-keys` | defun | [lib/fib/tls/record.fib:36](../../../lib/fib/tls/record.fib#L36) |
 | `system-trust` | defun | [lib/fib/tls/http.fib:38](../../../lib/fib/tls/http.fib#L38) |

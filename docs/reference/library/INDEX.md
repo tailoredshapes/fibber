@@ -44,7 +44,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.merkle](fib.merkle.md) | 24 |
 | [fib.os](fib.os.md) | 73 |
 | [fib.os.abi](fib.os.abi.md) | 4 |
-| [fib.os.net](fib.os.net.md) | 18 |
+| [fib.os.net](fib.os.net.md) | 19 |
 | [fib.os.platform](fib.os.platform.md) | 4 |
 | [fib.otel](fib.otel.md) | 220 |
 | [fib.parallel](fib.parallel.md) | 71 |

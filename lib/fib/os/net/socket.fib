@@ -36,3 +36,10 @@
       (let [accepted (b/socket-accept fd address size)
             result (try-let [client (checked accepted "accept")] (Ok (Accepted client (addr/peer-at address) (addr/port-at address))))]
         (do (free size) (free address) result))))))
+
+;; Disable Nagle for latency-sensitive protocols; the option is deliberately explicit at the OS boundary.
+(defun set-tcp-nodelay (fd: i64 enabled: bool) -> (Result unit OSError)
+  (unsafe (let [value (alloc 4)]
+    (do (store-i32 value (if enabled 1i32 0i32))
+        (let [r (setsockopt (trunc i32 fd) (trunc i32 (. a/host tcp-level)) (trunc i32 (. a/host tcp-no-delay)) value 4i32) saved (n/errno)]
+          (do (free value) (if (< r 0i32) (Err (error-from-code saved "TCP_NODELAY")) (Ok ()))))))))

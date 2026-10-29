@@ -67,6 +67,8 @@ at most 1024 per connection); **NewSessionTicket** is checked for shape and igno
 **Closing**: the peer's `close_notify` is a clean end (`read` returns the empty array and keeps doing so); the transport ending without it is `Truncated`, an error, because an
 attacker can cut a stream (RFC 8446 6.1). A fatal error sends the alert that names it (best effort), closes the transport and is returned by every later call. `Session.close`
 sends `close_notify`. **Deadlines**: `set-deadline` is the stream's; the handshake runs under `handshake-timeout-ms` (default 10 s) and then the deadline is cleared.
+An established session’s transport read timeout is retryable: buffered partial records and post-handshake state are preserved, so an HTTP idle liveness probe does not close a healthy session.
+Write timeouts remain terminal, including a KeyUpdate reply triggered during a read, because a partially transmitted record cannot safely be replayed. Authentication/protocol failures and truncation remain sticky and close the stream.
 
 **Errors** (`TlsError`): `HandshakeFailure alert message`, `BadCertificate reason message` (reasons: expired, not-yet-valid, untrusted-root, hostname-mismatch, bad-signature,
 path-length, name-constraint, key-usage, weak-algorithm, unknown-critical-extension, parse, bad-chain), `UnsupportedCapability what`, `TlsProtocol alert message`, `TlsAlert desc name`,

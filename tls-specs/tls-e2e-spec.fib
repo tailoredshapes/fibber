@@ -150,6 +150,38 @@
   (match (connect p (cfg "good.example") (Io (fn (n: i64) (Err (TlsTimeout "no data"))) (fn (b: (Array i8)) (Ok ())) (fn () ()) (fn (at: i64) ())))
     ((Err e) (tag e)) ((Ok _) "connected")))
 
+
+;; Interrupt every header/ciphertext/tag position after a real handshake, then resume the same session.
+(defun resume-cut (p: openssl/OpenSsl suite: i64 cut: i64) -> str
+  (let [srv (new-srv (sc suite :none :none nil [(EvData (ascii "abc")) EvClose]))
+        base (client-io p srv) left (cell -1) closed (cell false)
+        io (Io (fn (n: i64)
+                 (if (= @left 0) (do (set! left -1) (Err (TlsTimeout "probe")))
+                   (let [r ((. base read) (if (< @left 0) n (min n @left)))]
+                     (do (match r ((Ok b) (if (> @left 0) (set! left (- @left (array-len b))) ())) (_ ())) r))))
+               (. base write) (fn () (do (set! closed true) ((. base close)))) (. base set-deadline))]
+    (match (connect p (cfg "good.example") io)
+      ((Err e) (tag e))
+      ((Ok sess) (do (set! left cut)
+        (let [first (read-text sess) was-closed @closed second (read-text sess) ending (read-text sess)]
+          (if (and (= first "timeout") (not was-closed) (= second "ok:abc") (= ending "ok:")) ""
+            (str "suite " suite " cut " cut ": " first "/" second "/" ending "; "))))))))
+(defun resume-text (p: openssl/OpenSsl) -> str
+  (reduce (fn (out: str suite: i64)
+    (reduce (fn (acc: str cut: i64) (str acc (resume-cut p suite cut))) out (range 25))) ""
+    [suite-aes-128-gcm-sha256 suite-aes-256-gcm-sha384 suite-chacha20-poly1305-sha256]))
+
+(defun update-timeout-text (p: openssl/OpenSsl) -> str
+  (let [srv (new-srv (plain [(EvKeyUpdate true) (EvData (ascii "x"))])) base (client-io p srv)
+        armed (cell false) closed (cell false)
+        io (Io (. base read) (fn (b: (Array i8)) (if @armed (Err (TlsTimeout "write")) ((. base write) b)))
+               (fn () (do (set! closed true) ((. base close)))) (. base set-deadline))]
+    (match (connect p (cfg "good.example") io)
+      ((Err e) (tag e))
+      ((Ok sess) (do (set! armed true)
+        (let [first (read-text sess) after (read-text sess)]
+          (if (and (= first "timeout") (= after "timeout") @closed) "" (str first "/" after "/closed=" @closed))))))))
+
 (defspecs specs
   (feature "a full handshake and data both ways, in each cipher suite"
     (scenario "TLS_AES_128_GCM_SHA256" (given [p (provider)]) (then (expect = "" (suite-text p suite-aes-128-gcm-sha256 ":aes-128-gcm/:sha-256"))))
@@ -159,6 +191,8 @@
     (scenario "handshake messages in 1-byte records, all in one record, with a CertificateRequest" (given [p (provider)]) (then (expect = "" (shapes-text p))))
     (scenario "a CertificateRequest is answered with an empty Certificate that the server accepts" (given [p (provider)]) (then (expect = "" (cert-request-text p)))))
   (feature "deadlines"
+    (scenario "a timed-out KeyUpdate reply during a read is fatal and sticky" (given [p (provider)]) (then (expect = "" (update-timeout-text p))))
+    (scenario "read timeout at every encrypted-record position resumes in all three suites" (given [p (provider)]) (then (expect = "" (resume-text p))))
     (scenario "the handshake sets a deadline on the stream and clears it afterwards" (given [p (provider)]) (then (expect = "" (deadline-text p))))
     (scenario "a stream that times out during the handshake is a timeout" (given [p (provider)]) (then (expect = "timeout" (timeout-text p)))))
   (feature "a server that breaks its flight"

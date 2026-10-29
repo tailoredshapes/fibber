@@ -42,6 +42,8 @@ A Transport is a value of closures over private state (the pattern of `fib.os.me
 (case 8038). A deadline that passes makes a read or write fail with `(Timeout "io" ..)`; the client renames it `read` or `total`, the server answers 408.
 `Error` is the engine's, so a transport reports its own failures in HTTP's terms (`ConnectError`, `Timeout "connect"`, `DnsError`, `TransportError`).
 
+Native HTTP TCP dials enable TCP_NODELAY through `fib.os.net/set-tcp-nodelay`; setup failure closes the descriptor and returns a typed error. Generic OS TCP connections keep their existing default. This is a latency policy for HTTP, including the TCP transport beneath TLS.
+
 `Target.dial` (HTTP-2) is `(fn :send (str i64 i64) (Result Transport Error))`: the client's way to a host and port with ITS resolver (and, for https through a proxy, the CONNECT tunnel). The `tcp`
 factory is `dial` itself; a TLS factory calls `dial` and runs its handshake over the result (`fib.tls.http` does: one line changed there, `((. t dial) host port ms)` for `tcp/connect`).
 

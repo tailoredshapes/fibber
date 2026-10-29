@@ -1,0 +1,25 @@
+;; spec: design/tls.md (read deadlines), HTTP keep-alive liveness probes
+;; expect: accept
+;; result: 42
+;; stage: 2
+;; roots: ../../lib ../../specs
+;; audit: clean
+(ns main (:use fib.core fib.seq fib.coll fib.tls.types fib.tls.record fib.tls.conn fib.tls.keys fib.tls.buf tls-stub))
+(defun check-cut (cut: i64) -> bool
+  (let [bytes (str-bytes "\u{17}\u{3}\u{3}\0\u{4}data") phase (cell 0) closed (cell 0)
+        io (Io (fn (n: i64)
+                 (let [p @phase] (do (set! phase (+ p 1))
+                   (cond (and (= p 0) (> cut 0)) (Ok (array-copy bytes 0 cut))
+                         (or (= p 0) (= p 1)) (Err (TlsTimeout "probe"))
+                         (= p 2) (Ok (array-copy bytes cut (array-len bytes)))
+                         :else (Ok (array 0 0i8))))))
+               (fn (b: (Array i8)) (Ok ())) (fn () (set! closed (+ @closed 1))) (fn (at: i64) ()))
+        rec (new-rec io) traffic (Traffic (array 0 0i8) (array 0 0i8) (array 0 0i8))
+        c (Conn rec (Suite 4865 :aes-128-gcm :sha-256 16 32) (buf-new 16) (cell traffic) (cell traffic) (cell false) (cell false) (cell nil) (cell 0))
+        p (stub-accepts) first (sess-read p c 8) second (sess-read p c 8)
+        resumed (if (= cut 0) (sess-read p c 8) second)
+        before @closed ending (sess-read p c 8) again (sess-read p c 8)]
+    (and (match first ((Err (TlsTimeout _)) true) (_ false))
+         (= before 0) (match resumed ((Ok b) (= (str-from-bytes b) "data")) (_ false))
+         (match ending ((Err (Truncated)) true) (_ false)) (match again ((Err (Truncated)) true) (_ false)) (= @closed 1))))
+(defun main () -> i64 (if (every? check-cut (range 0 9)) 42 0))

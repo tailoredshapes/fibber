@@ -101,7 +101,9 @@
 (defun connect-via (resolve: (fn :send (str) (Result (Vec str) Error)) host: str port: i64 connect-timeout-ms: i64) -> (Result Transport Error)
   (let [deadline (+ (time/clock-now) (* (max 1 (if (= connect-timeout-ms 0) 3600000 connect-timeout-ms)) 1000000))]
     (try-let [xs (resolve host) fd (connect-any xs host port deadline)]
-      (Ok (socket-transport fd (str host ":" port) (atom false))))))
+      (match (net/set-tcp-nodelay fd true)
+        ((Ok _) (Ok (socket-transport fd (str host ":" port) (atom false))))
+        ((Err e) (do (io/close-fd fd) (Err (connect-error e host port))))))))
 ;; Connects with the native resolver and no cache (a resolver per call). The client's own dial (Target.dial) shares one resolver and its cache.
 (defun connect (host: str port: i64 connect-timeout-ms: i64) -> (Result Transport Error)
   (connect-via (resolve-fn NativeDns) host port connect-timeout-ms))

@@ -14,6 +14,7 @@ Generated declaration inventory of [fib.os.net](../../../lib/fib/os/net.fib). So
 | `ready?` | defun | [lib/fib/os/net/poll.fib:4](../../../lib/fib/os/net/poll.fib#L4) |
 | `resolve-host` | defun | [lib/fib/os/net/resolve.fib:15](../../../lib/fib/os/net/resolve.fib#L15) |
 | `send-all` | defun | [lib/fib/os/net/write.fib:20](../../../lib/fib/os/net/write.fib#L20) |
+| `set-tcp-nodelay` | defun | [lib/fib/os/net/socket.fib:41](../../../lib/fib/os/net/socket.fib#L41) |
 | `shutdown-write` | defun | [lib/fib/os/net/write.fib:18](../../../lib/fib/os/net/write.fib#L18) |
 | `udp-bind` | defun | [lib/fib/os/net/udp.fib:50](../../../lib/fib/os/net/udp.fib#L50) |
 | `udp-open` | defun | [lib/fib/os/net/udp.fib:16](../../../lib/fib/os/net/udp.fib#L16) |
