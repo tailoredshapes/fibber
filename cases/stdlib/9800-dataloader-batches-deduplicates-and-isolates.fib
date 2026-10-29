@@ -1,0 +1,29 @@
+;; spec: docs/design/dataloader.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.dataloader :as d]))
+(defun must (r: (Result a str)) -> a (match r ((Ok v) v) ((Err m) (trap m))))
+(defun main () -> i64
+  (let [c (checks) seen (cell [])
+        fetch (fn (keys: (Vec i64)) -> (Result (Vec (Result i64 str)) str)
+                (do (set! seen (conj @seen keys)) (Ok (mapv (fn (k: i64) (if (= k 3) (Err "missing") (Ok (* k 10)))) keys))))
+        l (must (d/loader 2 fetch))]
+    (do (check c (= (must (d/load-many l [2 1 2 3 4 1])) [(Ok 20) (Ok 10) (Ok 20) (Err "missing") (Ok 40) (Ok 10)]))
+        (check c (= @seen [[2 1] [3 4]]))
+        (check c (= (must (d/load-many l [])) []))
+        (check c (= (must (d/load-many l [3 2])) [(Err "missing") (Ok 20)]))
+        (check c (= (count @seen) 2))
+        (d/clear-key! l 2) (d/load-many l [2])
+        (check c (= (count @seen) 3))
+        (d/clear! l) (d/load-many l [1])
+        (check c (= (count @seen) 4))
+        (d/load-many (must (d/loader 2 fetch)) [1])
+        (check c (= (count @seen) 5))
+        (check c (match (d/loader 0 fetch) ((Err _) true) (_ false)))
+        (check c (match (d/loader -1 fetch) ((Err _) true) (_ false)))
+        (check c (match (d/load-many (with l (max 0)) [9]) ((Err _) true) (_ false)))
+        (check c (= (count @seen) 5))
+        (checks-result c))))

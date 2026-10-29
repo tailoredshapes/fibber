@@ -17,6 +17,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.compress.lz4](fib.compress.lz4.md) | 53 |
 | [fib.core](fib.core.md) | 91 |
 | [fib.crypto](fib.crypto.md) | 59 |
+| [fib.dataloader](fib.dataloader.md) | 4 |
 | [fib.datum](fib.datum.md) | 11 |
 | [fib.db](fib.db.md) | 27 |
 | [fib.db.contract](fib.db.contract.md) | 7 |

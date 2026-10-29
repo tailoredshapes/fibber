@@ -1,0 +1,42 @@
+;; Explicit, coordinator-owned batch loading. Create one loader per request/group;
+;; collect keys before load-many, rather than waiting on futures in resolver tasks.
+(ns fib.dataloader (:use fib.core fib.seq fib.coll))
+(defstruct (Loader k v e)
+  (fetch: (fn ((Vec k)) (Result (Vec (Result v e)) str))
+   cache: (Cell (Map k (Result v e))) max: i64))
+
+(defun loader (max: i64 fetch: (fn ((Vec k)) (Result (Vec (Result v e)) str))) -> (Result (Loader k v e) str)
+  (if (<= max 0) (Err "dataloader batch size must be positive") (Ok (Loader fetch (cell {}) max))))
+
+;; Stable first-occurrence order, excluding keys already cached.
+(defun missing :private (l: (Loader k v e) keys: (Vec k)) :where ((Hash k) (Eq k)) -> (Vec k)
+  (. (reduce (fn (acc: (Pair (Set k) (Vec k)) key: k)
+                (if (or (contains? @(. l cache) key) (contains? (. acc fst) key)) acc
+                  (Pair (conj (. acc fst) key) (conj (. acc snd) key))))
+              (Pair (set-empty) []) keys) snd))
+
+;; Publish new cache entries only after every chunk succeeds and has the right
+;; cardinality. Batch failures/protocol errors are retryable; per-key Errs cache.
+(defun fetch-missing :private (l: (Loader k v e) keys: (Vec k)) :where ((Hash k) (Eq k)) -> (Result (Map k (Result v e)) str)
+  (loop [from 0 cache @(. l cache)]
+    (cond (<= (. l max) 0) (Err "dataloader batch size must be positive")
+          (>= from (count keys)) (Ok cache)
+          :else (let [end (+ from (min (. l max) (- (count keys) from)))
+                      chunk (mapv (fn (i: i64) (nth keys i)) (range from end))]
+        (match ((. l fetch) chunk)
+          ((Err message) (Err message))
+          ((Ok values)
+           (if (!= (count values) (count chunk)) (Err "dataloader batch result count differs from key count")
+             (recur (+ from (count chunk))
+               (reduce (fn (out: (Map k (Result v e)) i: i64) (assoc out (nth chunk i) (nth values i)))
+                       cache (range (count chunk)))))))))))
+
+(defun load-many (l: (Loader k v e) keys: (Vec k)) :where ((Hash k) (Eq k)) -> (Result (Vec (Result v e)) str)
+  (match (fetch-missing l (missing l keys))
+    ((Err message) (Err message))
+    ((Ok cache) (do (set! (. l cache) cache)
+                   (Ok (mapv (fn (key: k) (match (get cache key) ((some value) value) (nil (trap "dataloader missing cached key")))) keys))))))
+
+(defun clear! (l: (Loader k v e)) -> unit (set! (. l cache) {}))
+(defun clear-key! (l: (Loader k v e) key: k) :where ((Hash k) (Eq k)) -> unit
+  (set! (. l cache) (dissoc @(. l cache) key)))

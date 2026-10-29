@@ -1,0 +1,24 @@
+;; spec: docs/design/dataloader.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:use fib.core fib.seq fib.coll tl.check) (:require [fib.dataloader :as d]))
+(defun must (r: (Result a str)) -> a (match r ((Ok v) v) ((Err m) (trap m))))
+(defun main () -> i64
+  (let [c (checks) bad (cell true) calls (cell 0)
+        fetch (fn (keys: (Vec i64)) -> (Result (Vec (Result i64 str)) str)
+                (do (set! calls (+ @calls 1))
+                    (if (and @bad (= (nth keys 0) 2)) (Ok []) (Ok (mapv (fn (k: i64) (Ok k)) keys)))))
+        l (must (d/loader 1 fetch))]
+    (do (check c (match (d/load-many l [1 2]) ((Err _) true) (_ false)))
+        (set! bad false)
+        (check c (= (must (d/load-many l [1 2])) [(Ok 1) (Ok 2)]))
+        (check c (= @calls 4))
+        (let [retry (cell true)
+              failing (must (d/loader 1 (fn (keys: (Vec i64)) -> (Result (Vec (Result i64 str)) str)
+                         (if @retry (Err "offline") (Ok [(Ok (nth keys 0))])))))]
+          (do (check c (= (d/load-many failing [1]) (Err "offline")))
+              (set! retry false) (check c (= (must (d/load-many failing [1])) [(Ok 1)]))))
+        (checks-result c))))
