@@ -30,6 +30,7 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.gpu.contract](fib.gpu.contract.md) | 13 |
 | [fib.gpu.device](fib.gpu.device.md) | 24 |
 | [fib.gpu.sim](fib.gpu.sim.md) | 7 |
+| [fib.gunshoe](fib.gunshoe.md) | 56 |
 | [fib.http](fib.http.md) | 31 |
 | [fib.http.client](fib.http.client.md) | 34 |
 | [fib.http.native](fib.http.native.md) | 9 |

@@ -1131,6 +1131,17 @@ externs and the raw-pointer builtins (`ptr+`, `load-i8` ... `load-ptr`,
 else changes inside `unsafe`: counting and type checking still apply to
 fibber objects (**Decided**, §9).
 
+**Developer-responsibility library** (owner, 2026-10-31). `fib.gunshoe`
+is an explicit module for raw storage and addresses, uninitialized arrays,
+unchecked SIMD memory, raw atomics and inline LIR. It is imported with
+ordinary `:require`/`:use` syntax, has no reader extension, and its
+operations require the caller's lexical `unsafe`. Its public operations
+are ordinary macros, not runtime function values. Types, ownership and
+the forwarded primitives' existing checks continue to apply. Defined
+wrapping arithmetic, checked SIMD and typed Atom operations remain safe
+APIs. The API and memory obligations are in `docs/design/gunshoe.md`.
+Existing raw builtin and `fib.atomic` spellings retain their contracts.
+
 **Native floating memory extension** (stage 2, 2026-10-04, numerical-library work).
 `load-f32`, `load-f64`, `load-f32x4`, `load-f64x4`, and `load-f32x8` take a
 `ptr` and return `f32`, `f64`, `(Simd f32 4)`, `(Simd f64 4)`, and
@@ -1736,7 +1747,8 @@ variant constant, a protocol method, a `def`, an `extern`) exactly as the
 symbol `name` would in expression position, with two differences: a
 `:private` definition of another module is visible to it (§5), and a
 local binding of the same name is not (it names a top-level definition
-only). It evaluates to what the symbol would; in the head of a call it
+only). The resolved definition's unsafe requirement still applies to
+`var`, including raw builtins and externs. It evaluates to what the symbol would; in the head of a call it
 is a direct call, as the symbol is (types §2.2), so `((var m/helper) x)`
 is the call `(m/helper x)` would be if `helper` were exported. It names
 values only: a type or a protocol has no `var`, since a macro template

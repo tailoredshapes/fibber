@@ -20,6 +20,8 @@ has 16 exercises, deliberate failures and a native-command capstone.
 Collections, JSON/JSON Schema, LZ4, HTTP/DNS, OS services and database/crypto
 contracts are in the library. SIMD, tensors, autodiff, GPU protocols and relational
 search are explicit modules. See the [library index](docs/reference/library/INDEX.md).
+[`fib.gunshoe`](docs/design/gunshoe.md) provides explicit raw-memory and other
+developer-responsibility operations; its macros require caller `unsafe`.
 TLS is client-only and **UNAUDITED**; read [security and limits](docs/policy/limits.md).
 
 ## Install

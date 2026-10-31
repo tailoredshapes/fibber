@@ -1,0 +1,38 @@
+;; spec: docs/design/gunshoe.md; explicit caller unsafe boundary
+;; expect: accept
+;; result: 42
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+
+(ns main (:require [fib.gunshoe :as g]))
+(defun main () -> i64
+  (unsafe
+    (let [q (g/allocate 16) r (g/offset q 8) p 7 value 77 expected 42 new 99
+          gunshoe-p 1000 gunshoe-value 2000 gunshoe-expected 3000 order (cell 0)]
+      (do (g/atomic-write-release-i64! (do (set! order 1) q)
+            (do (set! order (+ (* @order 10) 2)) (+ p (- gunshoe-p 965))))
+          (let [a (= (g/atomic-read-acquire-i64 q) 42)
+                b (= (g/atomic-read-relaxed-i64 q) 42)
+                c (= (g/atomic-read-seq-cst-i64 q) 42)]
+            (do (g/atomic-write-relaxed-i64! q 41) (g/atomic-write-seq-cst-i64! q 42)
+                (let [cas (g/compare-exchange-i64!
+                            (do (set! order (+ (* @order 10) 3)) q)
+                            (do (set! order (+ (* @order 10) 4)) (- gunshoe-p 958))
+                            (do (set! order (+ (* @order 10) 5)) (- gunshoe-expected 2923)))
+                      old (g/fetch-add-i64! (do (set! order (+ (* @order 10) 6)) q)
+                                            (do (set! order (+ (* @order 10) 7)) (- gunshoe-p 989)))
+                      before (g/exchange-i64! (do (set! order (+ (* @order 10) 8)) q)
+                                              (do (set! order (+ (* @order 10) 9)) new))
+                      no (g/compare-exchange-i64! q 0 999)]
+                  (do (g/atomic-write-release-i32! r 120i32)
+                      (g/atomic-write-relaxed-i32! r 121i32) (g/atomic-write-seq-cst-i32! r 122)
+                      (g/acquire-fence) (g/release-fence) (g/seq-cst-fence) (g/pause)
+                      (let [ok (and a b c cas (= old 77) (= before 88) (not no)
+                                    (= (g/atomic-read-acquire-i64 q) 99) (= @order 123456789)
+                                    (= gunshoe-p 1000) (= gunshoe-value 2000) (= gunshoe-expected 3000)
+                                    (= (g/atomic-read-acquire-i32 r) 122i32)
+                                    (= (g/atomic-read-relaxed-i32 r) 122i32)
+                                    (= (g/atomic-read-seq-cst-i32 r) 122i32)
+                                    (> (g/cache-line-bytes) 0))]
+                        (do (g/deallocate q) (if ok 42 1)))))))))))

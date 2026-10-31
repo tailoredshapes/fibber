@@ -4,6 +4,8 @@ Status: accepted
 Date: 2026-10-21
 Source: the owner, 2026-10-20 ("best practices should be the easiest thing, foot gunning is always allowed as long as the hoops make it obvious thats what you're doing");
 docs/design/inline-lir.md; spec/syntax.md 3.15a; ADR 0011 (native access) and 0015 (the in-place primitives) are the same shape.
+Amended: owner, 2026-10-31, explicit `fib.gunshoe` imports and caller `unsafe`
+for developer-responsibility operations, with no reader macro.
 
 ## Context
 
@@ -14,17 +16,27 @@ code should not need it: `fib.atomic` has the loads, stores, swaps, fences, `spi
 
 ## Decision
 
-In the library (`lib/`, `scripts/`, `editors/`) the form is written in `lib/fib/atomic.fib` and nowhere else. A new library file that writes one is a decision to write down here, with its
+In the library (`lib/`, `scripts/`, `editors/`) the form is written in exactly `lib/fib/atomic.fib` and `lib/fib/gunshoe.fib`. A new library file that writes one is a decision to write down here, with its
 reason. The list is exact: an entry that no longer matches is a finding. Code outside the library (an application, a package such as fib-disruptor, the cases and the compiler's tests) may
 write the form, and `fibc explain unsafe FILE` lists every such site of a program, the library's included, with the atomics each one uses: that listing is the hoop for code the rule does not
 cover. The form stays defined: spec/syntax.md 3.15a names it, and the cases of `cases/stdlib` 8800 to 8806 and 8810 check it.
+
+`fib.gunshoe` is the owner's explicit developer-responsibility toolbox
+(docs/design/gunshoe.md). Its ordinary macros emit the operations at the
+caller, where lexical `unsafe` is required. This includes raw atomics and
+an empty inline-LIR marker for forwarded primitive aliases; the marker
+keeps the caller boundary even under deliberate namespace rebinding and
+optimizes away. Public names do not collide with runtime primitives or
+imported functions, so value lookup cannot bypass the macro boundary.
+The existing `fib.atomic` functions remain for compatibility. The exact
+two-file list does not permit inline LIR in ordinary collection libraries.
 
 A body may not call a function. Native access belongs to the platform layer and the drivers (ADR 0011): a `lir` body that called `sched_yield` or `malloc` would be an `extern` written
 where the rule cannot see it. The platform layer provides the call (`fib.os.time/thread-yield`), and a body is for what the language itself lacks.
 
 ## Consequences
 
-- A queue, a flag or a counter shared between threads is written with `fib.atomic`; the author of a new atomic operation adds it there, to the list of one file.
+- Raw shared-memory code can use `fib.gunshoe` with caller `unsafe`; existing `fib.atomic` users retain their interface. New library atomic operations stay within the exact permitted files and require their own ordering evidence.
 - A reviewer who sees `lir` in a library diff knows it is a decision, and finds the reason here.
 
 ## Governance
@@ -33,9 +45,9 @@ where the rule cannot see it. The platform layer provides the call (`fib.os.time
 (defun lir-uses (repo: Repo globs: (Vec str)) -> (Vec Finding)
   (mapv (fn (f: Finding) (Finding (. f file) (. f line) "lir is written here")) (grep-live repo globs "(lir [")))
 
-(rule "in the library, the lir form is written only in lib/fib/atomic.fib"
+(rule "in the library, lir is written only in the approved atomic and gunshoe modules"
   (allowing (lir-uses repo ["lib/**.fib" "scripts/**.fib" "editors/**.fib"])
-            ["lib/fib/atomic.fib:lir"])
+            ["lib/fib/atomic.fib:lir" "lib/fib/gunshoe.fib:lir"])
   (plant "lib/fib/json/buffer.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))\")))\n")
   (plant "lib/fib/tensor/storage.fib" "\n(defun peek (p: ptr) -> i64 (unsafe (lir [p: ptr] -> i64 \"(BLOCK entry (RET (ATOMIC-LOAD ACQUIRE I64 p)))\")))\n"))
 

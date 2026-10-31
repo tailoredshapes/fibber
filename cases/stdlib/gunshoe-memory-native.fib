@@ -1,0 +1,21 @@
+;; spec: docs/design/gunshoe.md; explicit caller unsafe boundary
+;; expect: accept
+;; result: 42
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib
+
+(ns main (:require [fib.gunshoe :as g]))
+(defun main () -> i64
+  (unsafe
+    (let [p (g/allocate 80) q (g/offset p 32)]
+      (do (g/write-i8! p -7i8) (g/write-i16! (g/offset p 8) -300i16)
+          (g/write-i32! (g/offset p 16) -40000i32) (g/write-i64! (g/offset p 24) 42)
+          (g/write-ptr! q p) (g/write-f32! (g/offset p 41) 1.5f32)
+          (g/write-f64! (g/offset p 49) 2.5)
+          (let [ok (and (= (g/read-i8 p) -7i8) (= (g/read-i16 (g/offset p 8)) -300i16)
+                        (= (g/read-i32 (g/offset p 16)) -40000i32) (= (g/read-i64 (g/offset p 24)) 42)
+                        (= (g/address->i64 (g/read-ptr q)) (g/address->i64 p))
+                        (= (g/read-i8 (g/i64->address (g/address->i64 p))) -7i8)
+                        (= (g/read-f32 (g/offset p 41)) 1.5f32) (= (g/read-f64 (g/offset p 49)) 2.5))]
+            (do (g/deallocate p) (if ok 42 1)))))))
