@@ -1,0 +1,90 @@
+;; A bounded OTLP log batch worker. Producer locks protect queue state only: never HTTP, flush waits or worker joins.
+;; DropOldest replaces an existing accepted slot; only Queued increments accepted. Completed advances only after worker processing,
+;; so an eviction cannot satisfy a flush while an older batch is still in flight. Flush captures one fixed accepted count.
+(ns fib.otel.otlp-log (:use fib.core fib.seq fib.coll fib.otel.trace fib.log.core fib.otel.otlp-options fib.otel.otlp-http)
+  (:require [fib.otel.queue :as q] [fib.otel.otlp-json :as wire] [fib.log.async :as async] [fib.os :as os] [fib.ex :as ex]))
+
+(defstruct OtlpLogCore (queue: (q/BQueue LogRecord) guard: (Atom bool) closing: (Atom bool) wanted: (Atom bool)
+                       accepted: (Atom i64) completed: (Atom i64) dropped: (Atom i64) failed: (Atom i64)
+                       done: (Atom bool) joined: (Atom bool) max-batch: i64 overflow: async/Overflow
+                       options: OtlpOptions resource: Resource state: OtlpState))
+(defstruct OtlpLogSink (core: OtlpLogCore worker: (Task unit)))
+
+(defun lock! :private (core: OtlpLogCore) -> unit
+  (loop [] (when (not (compare-and-set! (. core guard) false true)) (recur))))
+(defun bump! :private (value: (Atom i64) n: i64) -> unit (do (swap! value (fn (old: i64) (+ old n))) ()))
+
+;; Closed/enqueue/accepted are one short critical section; BlockProducer releases it before waiting.
+(defun offer :private (core: OtlpLogCore record: LogRecord) -> i64
+  (do (lock! core)
+      (let [result (if @(. core closing) -1
+                     (match (q/queue-offer (. core queue) record (. core overflow))
+                       ((q/Queued) (do (bump! (. core accepted) 1) 0))
+                       ((q/QueueDropped) (do (bump! (. core dropped) 1) 1))
+                       ((q/QueueFull) 2)))]
+        (do (reset! (. core guard) false) result))))
+
+(defun enqueue :private (core: OtlpLogCore record: LogRecord) -> (Result unit str)
+  (loop [] (let [result (offer core record)]
+    (cond (= result -1) (Err "OTLP log sink is shut down")
+          (= result 2) (do (os/sleep-ns 50000) (recur))
+          :else (Ok ())))))
+
+(defun take-ready :private (core: OtlpLogCore last: i64) -> (Pair (Vec LogRecord) bool)
+  (do (lock! core)
+      (let [n (q/queue-len (. core queue))
+            due (or @(. core closing) @(. core wanted) (>= n (. core max-batch))
+                    (and (> n 0) (>= (- (os/clock-now) last) 100000000)))
+            records (if due (q/queue-take-all (. core queue)) [])
+            stop (and @(. core closing) (= (q/queue-len (. core queue)) 0))]
+        (do (when due (reset! (. core wanted) false)) (reset! (. core guard) false) (Pair records stop)))))
+
+(defun export-chunk :private (core: OtlpLogCore records: (Vec LogRecord)) -> unit
+  (let [result (ex/try (send-batch (. core state) (. core options) (wire/logs-json (. core resource) records)
+                                 (count records) "rejectedLogRecords") (catch e (Err "OTLP log batch failed")))]
+    (do (match result
+          ((Ok _) ())
+          ((Err _) (let [failed (swap! (. core failed) (fn (n: i64) (+ n (count records))))]
+                     (when (= failed (count records)) (eprintln "fib.otel.otlp: log batch delivery failed (see exporter stats)")))))
+        (bump! (. core completed) (count records)))))
+
+(defun export-chunks :private (core: OtlpLogCore records: (Vec LogRecord)) -> unit
+  (loop [i 0] (when (< i (count records))
+    (do (export-chunk core (vec (take (. core max-batch) (drop i records)))) (recur (+ i (. core max-batch)))))))
+
+(defun worker-loop :private (core: OtlpLogCore) -> unit
+  (loop [last (os/clock-now)]
+    (let [ready (take-ready core last) records (. ready fst)]
+      (do (when (> (count records) 0) (export-chunks core records))
+          (cond (. ready snd) (do (state-close (. core state)) (reset! (. core done) true) ())
+                (> (count records) 0) (recur (os/clock-now))
+                :else (do (os/sleep-ns 50000) (recur last)))))))
+
+;; Batches contain at most 256 records. The queue capacity is independent of an in-flight bounded queue drain.
+(defun log-sink (options: OtlpOptions resource: Resource capacity: i64 overflow: async/Overflow) -> OtlpLogSink
+  (let [core (OtlpLogCore (q/queue-new capacity) (atom false) (atom false) (atom false)
+                         (atom 0) (atom 0) (atom 0) (atom 0) (atom false) (atom false)
+                         (min 256 (max 1 capacity)) overflow options resource (new-state))
+        worker (spawn (fn () (worker-loop core)))]
+    (OtlpLogSink core worker)))
+
+(defun flush-target :private (core: OtlpLogCore) -> i64
+  (do (lock! core)
+      (let [target @(. core accepted)] (do (reset! (. core wanted) true) (reset! (. core guard) false) target))))
+(defun flush-logs :private (core: OtlpLogCore) -> (Result unit str)
+  (let [target (flush-target core)]
+    (do (loop [] (when (< @(. core completed) target) (do (os/sleep-ns 50000) (recur)))) (Ok ()))))
+
+(defun close-logs :private (sink: OtlpLogSink) -> (Result unit str)
+  (let [core (. sink core)]
+    (do (lock! core) (reset! (. core closing) true) (reset! (. core wanted) true) (reset! (. core guard) false)
+        (if (compare-and-set! (. core joined) false true) (do (join (. sink worker)) ())
+          (loop [] (when (not @(. core done)) (do (os/sleep-ns 50000) (recur))))) (Ok ()))))
+
+(defun log-dropped (sink: OtlpLogSink) -> i64 @(. (. sink core) dropped))
+(defun log-failed (sink: OtlpLogSink) -> i64 @(. (. sink core) failed))
+(impl Sink OtlpLogSink
+  (sink-write (self record) (enqueue (. self core) record))
+  (sink-flush (self) (flush-logs (. self core)))
+  (sink-close (self) (close-logs self)))
+(impl Diagnostics OtlpLogSink (stats (self) (state-stats (. (. self core) state))))

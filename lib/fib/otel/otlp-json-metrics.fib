@@ -1,0 +1,36 @@
+;; Cumulative OTLP metric data points; every protobuf 64-bit integer is a string.
+(ns fib.otel.otlp-json-metrics (:use fib.core fib.seq fib.coll fib.datum fib.otel.metrics)
+  (:require [fib.otel.otlp-json-common :as j]))
+
+(defun number-point-json :private (point: NumberPoint) -> str
+  (str "{\"attributes\":" (j/attributes-json (. point attributes))
+    ",\"startTimeUnixNano\":" (j/json-i64 (. point start-ns))
+    ",\"timeUnixNano\":" (j/json-i64 (. point time-ns)) ",\"asInt\":" (j/json-i64 (. point value)) "}"))
+
+(defun gauge-point-json :private (point: GaugePoint) -> str
+  (str "{\"attributes\":" (j/attributes-json (. point attributes))
+    ",\"timeUnixNano\":" (j/json-i64 (. point time-ns)) ",\"asDouble\":" (j/json-double (. point value)) "}"))
+
+(defun histogram-point-json :private (point: HistogramPoint) -> str
+  (str "{\"attributes\":" (j/attributes-json (. point attributes))
+    ",\"startTimeUnixNano\":" (j/json-i64 (. point start-ns)) ",\"timeUnixNano\":" (j/json-i64 (. point time-ns))
+    ",\"count\":" (j/json-i64 (. point count)) ",\"sum\":" (j/json-double (. point sum))
+    ",\"bucketCounts\":" (j/json-array (mapv j/json-i64 (. point counts)))
+    ",\"explicitBounds\":" (j/json-array (mapv j/json-double (. point bounds)))
+    ",\"min\":" (j/json-double (. point min)) ",\"max\":" (j/json-double (. point max)) "}"))
+
+(defun metric-data-json :private (data: MetricData) -> str
+  (match data
+    ((SumData points monotonic) (str "\"sum\":{\"dataPoints\":" (j/json-array (mapv number-point-json points))
+      ",\"aggregationTemporality\":2,\"isMonotonic\":" monotonic "}"))
+    ((HistogramData points) (str "\"histogram\":{\"dataPoints\":" (j/json-array (mapv histogram-point-json points))
+      ",\"aggregationTemporality\":2}"))
+    ((GaugeData points) (str "\"gauge\":{\"dataPoints\":" (j/json-array (mapv gauge-point-json points)) "}"))))
+
+(defun metric-json :private (metric: Metric) -> str
+  (str "{\"name\":" (json-quote (. metric name)) ",\"description\":" (json-quote (. metric description))
+    ",\"unit\":" (json-quote (. metric unit)) "," (metric-data-json (. metric data)) "}"))
+
+(defun encode-metrics (metrics: (Vec Metric)) -> str
+  (j/group-json "resourceMetrics" "scopeMetrics" "metrics"
+    (mapv (fn (metric: Metric) (j/OtlpJsonItem (. metric resource) (. metric scope) (metric-json metric))) metrics)))

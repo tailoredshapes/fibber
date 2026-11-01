@@ -1,0 +1,49 @@
+;; A real TCP delivery fixture, also usable against an official collector's OTLP/HTTP receiver.
+(ns main (:use fib.core fib.seq fib.coll fib.datum fib.print otel-exporter-contract)
+  (:require [fib.otel :as otel] [fib.otel.otlp :as o] [fib.log.core :as log] [fib.log.async :as async] [fib.os :as os]))
+
+(defun config (endpoint: str timeout: i64) -> o/OtlpOptions
+  (with (o/options endpoint) (headers {"authorization" ["fixture-secret"]}) (timeout-ms timeout)
+    (initial-backoff-ms 1) (max-backoff-ms 2)))
+(defun okay? (r: (Result unit str)) -> bool (match r ((Ok _) true) (_ false)))
+(defun summary (e: o/OtlpTraceExporter r: (Result unit str)) -> i64
+  (let [s (o/stats e)]
+    (do (println (str "{\"ok\":" (okay? r) ",\"requests\":" (. s requests) ",\"retries\":" (. s retries)
+      ",\"failed\":" (. s failed) ",\"partial\":" (. s partial) ",\"rejected\":" (. s rejected) "}")) 0)))
+
+(defun metrics (resource: otel/Resource) -> (Vec otel/Metric)
+  [(otel/Metric "requests" "{request}" "total" "fixture.metrics"
+     (otel/SumData [(otel/NumberPoint [] 9223372036854775807 1000 2000)] true) resource)
+   (otel/Metric "active" "{request}" "signed" "fixture.metrics"
+     (otel/SumData [(otel/NumberPoint [] -7 1000 2000)] false) resource)
+   (otel/Metric "latency" "ms" "distribution" "fixture.metrics"
+     (otel/HistogramData [(otel/HistogramPoint [] [1.0 2.0] [1 2 1] 4 7.0 0.5 3.0 1000 2000)]) resource)
+   (otel/Metric "temperature" "Cel" "reading" "fixture.metrics"
+     (otel/GaugeData [(otel/GaugePoint [] 12.5 2000)]) resource)])
+
+(defun deliver (base: str) -> i64
+  (let [resource (otel/Resource [(Pair "service.name" (DStr "otlp-fixture"))])
+        a (with (sample-span "root" 0) (resource resource))
+        b (with (sample-span "child" 1) (resource resource) (scope "other.scope") (parent-remote true)
+              (attributes [(Pair "huge" (DInt 9223372036854775807)) (Pair "bytes" (DBytes (str-bytes "hi"))) (Pair "nil" DNil)]))
+        tr (o/trace-exporter (config (str base "/v1/traces") 2000))
+        mt (o/metric-exporter (config (str base "/v1/metrics") 2000))
+        lg (o/log-sink (config (str base "/v1/logs") 2000) resource 8 async/DropNewest)
+        sink (dyn log/Sink :send lg)
+        rec (log/LogRecord log/INFO "fixture.log" "hello \"collector\""
+              [(Pair :trace_id (DStr "1234567890ABCDEF0000000000000001")) (Pair :span_id (DStr "0000000000000065")) (Pair :answer (DInt 42))] 2000)
+        trace-ok (okay? (otel/export-spans (dyn otel/Exporter :send tr) [a b]))
+        metric-ok (okay? (otel/export-metrics (dyn otel/MetricExporter :send mt) (metrics resource)))
+        log-ok (and (okay? (log/sink-write sink rec)) (okay? (log/sink-flush sink)) (okay? (log/sink-close sink)))
+        shut-ok (and (okay? (otel/exporter-shutdown (dyn otel/Exporter :send tr)))
+                     (okay? (otel/metric-exporter-shutdown (dyn otel/MetricExporter :send mt))))]
+    (do (println (str "{\"ok\":" (and trace-ok metric-ok log-ok shut-ok) ",\"logFailed\":" (o/log-failed lg)
+                     ",\"traceRequests\":" (. (o/stats tr) requests) ",\"metricRequests\":" (. (o/stats mt) requests) "}"))
+        (if (and trace-ok metric-ok log-ok shut-ok (= (o/log-failed lg) 0)) 0 1))))
+
+(defun main () -> i64
+  (let [base (unwrap-or (os/getenv "OTLP_TEST_BASE") "http://127.0.0.1:4318") mode (unwrap-or (os/getenv "OTLP_TEST_MODE") "delivery")]
+    (if (= mode "delivery") (deliver base)
+      (let [e (o/trace-exporter (config (str base "/" mode) (if (= mode "timeout") 100 2500)))
+            r (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])]
+        (do (otel/exporter-shutdown (dyn otel/Exporter :send e)) (summary e r))))))

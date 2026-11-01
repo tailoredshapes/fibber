@@ -1,0 +1,105 @@
+;; HTTP instrumentation stays opt-in and carries Context explicitly.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.parallel)
+  (:require [fib.otel :as o] [fib.otel.http :as t] [fib.http :as h] [fib.ex :as ex]))
+
+(defstruct Rig (tracer: o/Tracer mem: o/MemoryExporter))
+(defun rig-with (sampler: (dyn o/Sampler :send)) -> Rig
+  (let [m (o/memory-exporter)
+        p (o/tracer-provider-with (o/make-resource "http-spec" []) sampler
+            [(dyn o/SpanProcessor :send (o/simple-processor (dyn o/Exporter :send m)))] (o/id-gen-seeded 71))]
+    (Rig (o/get-tracer p "http-spec") m)))
+(defun rig () -> Rig (rig-with (o/parent-based (o/always-on))))
+(defun spans (r: Rig) -> (Vec o/SpanData) (o/memory-spans (. r mem)))
+(defun req (headers: (Map str (Vec str))) -> h/Request
+  (h/Request "GET" "/secret/123" (some "password=secret") headers (str-bytes "") {} "HTTP/1.1" "127.0.0.1" 80))
+(defun response (code: i64) -> h/Response (h/Response code {} (str-bytes "")))
+(defun creq () -> h/ClientRequest
+  (h/ClientRequest "GET" "http://user:password@host/private?token=secret" {} (str-bytes "")))
+(defun attr (d: o/SpanData name: str) -> str
+  (match (o/attribute-of d name) (nil "-") ((some v) (o/datum-text v))))
+
+(defstruct BrokenExporter (dummy: i64))
+(impl o/Exporter BrokenExporter
+  (export-spans (self values) (trap "broken exporter"))
+  (exporter-flush (self) (Ok ()))
+  (exporter-shutdown (self) (Ok ())))
+
+(defspecs specs
+  (feature "explicit HTTP context"
+    (scenario "client injects its child and server extracts remote parent without recording request secrets"
+      (given [r (rig)])
+      (upon [result (t/request (. r tracer) (o/empty-context)
+              (fn (request: h/ClientRequest)
+                (Ok ((t/wrap-server-route (. r tracer) "/items/{id}"
+                       (fn (ctx: o/Context incoming: h/Request) (response 200))) (req (. request headers))))) (creq))])
+      (then (expect = true (match result ((Ok _) true) (_ false)))
+            (expect = 2 (count (spans r)))
+            (expect = "GET /items/{id}" (. (nth (spans r) 0) name))
+            (expect = true (. (nth (spans r) 0) parent-remote))
+            (expect = (. (nth (spans r) 1) span-id) (. (nth (spans r) 0) parent-span-id))
+            (expect = "-" (attr (nth (spans r) 1) "url.full"))
+            (expect = "-" (attr (nth (spans r) 0) "url.path"))))
+    (scenario "server 404 is unset, server 500 and client 404 are errors"
+      (given [r (rig)])
+      (upon [_ ((t/wrap-server (. r tracer) (fn (ctx: o/Context request: h/Request) (response 404))) (req {}))
+             _ ((t/wrap-server (. r tracer) (fn (ctx: o/Context request: h/Request) (response 500))) (req {}))
+             _ (t/request (. r tracer) (o/empty-context) (fn (request: h/ClientRequest) (Ok (response 404))) (creq))])
+      (then (expect = "UNSET" (o/status-name (. (nth (spans r) 0) status)))
+            (expect = "ERROR" (o/status-name (. (nth (spans r) 1) status)))
+            (expect = "404" (attr (nth (spans r) 2) "error.type"))))
+    (scenario "duplicate and malformed traceparent start a new trace"
+      (given [r (rig)
+              header "00-11111111111111111111111111111111-2222222222222222-01"])
+      (upon [_ ((t/wrap-server (. r tracer) (fn (ctx: o/Context request: h/Request) (response 200)))
+                  (req {"TraceParent" [header] "traceparent" [header]}))
+             _ ((t/wrap-server (. r tracer) (fn (ctx: o/Context request: h/Request) (response 200)))
+                  (req {"traceparent" ["malformed"]}))])
+      (then (expect = 0 (. (nth (spans r) 0) parent-span-id))
+            (expect = 0 (. (nth (spans r) 1) parent-span-id))))
+    (scenario "transport errors and traps finish exactly once and propagate"
+      (given [r (rig)])
+      (upon [answer (t/request (. r tracer) (o/empty-context) (fn (request: h/ClientRequest) (Err (h/Timeout "read" "secret"))) (creq))
+             caught (ex/try (do ((t/wrap-server (. r tracer) (fn (ctx: o/Context request: h/Request) (trap "boom"))) (req {})) false)
+                            (catch e true))])
+      (then (expect = true (match answer ((Err _) true) (_ false)))
+            (expect = true caught)
+            (expect = 2 (count (spans r)))
+            (expect = "timeout" (attr (nth (spans r) 0) "error.type"))
+            (expect = 1 (count (. (nth (spans r) 1) events)))))
+    (scenario "sampled-out remote parents still propagate flags and replace stale headers"
+      (given [r (rig)
+              incoming {"traceparent" ["00-11111111111111111111111111111111-2222222222222222-00"]
+                        "tracestate" ["one=a" "two=b"]}
+              captured (atom {})])
+      (upon [_ ((t/wrap-server (. r tracer)
+                  (fn (ctx: o/Context request: h/Request)
+                    (do (t/request (. r tracer) ctx
+                          (fn (request: h/ClientRequest)
+                            (do (reset! captured (. request headers)) (Ok (response 200))))
+                          (with (creq) (headers {"TraceParent" ["stale"] "tracestate" ["stale"]})))
+                        (response 200)))) (req incoming))])
+      (then (expect = 0 (count (spans r)))
+            (expect = 1 (count (h/header-values @captured "traceparent")))
+            (expect = "one=a,two=b" (unwrap-or (h/header @captured "tracestate") ""))
+            (expect = "00" (let [v (unwrap-or (h/header @captured "traceparent") "")]
+                              (str-slice v (- (str-len v) 2) (str-len v))))))
+    (scenario "explicit context captured by a task parents its client span"
+      (given [r (rig)])
+      (upon [_ ((t/wrap-server (. r tracer)
+                  (fn (ctx: o/Context request: h/Request)
+                    (let [task (spawn (fn () (t/request (. r tracer) ctx
+                                              (fn (request: h/ClientRequest) (Ok (response 201))) (creq))))]
+                      (do (join task) (response 202))))) (req {}))])
+      (then (expect = 2 (count (spans r)))
+            (expect = (. (nth (spans r) 1) span-id) (. (nth (spans r) 0) parent-span-id))
+            (expect = false (. (nth (spans r) 0) parent-remote))))
+    (scenario "exporter failure cannot change HTTP response status headers or bytes"
+      (given [provider (o/tracer-provider-with (o/make-resource "broken" []) (o/always-on)
+                         [(dyn o/SpanProcessor :send (o/simple-processor (dyn o/Exporter :send (BrokenExporter 0))))]
+                         (o/id-gen-seeded 1))
+              tracer (o/get-tracer provider "http")
+              expected (h/Response 418 {"test" ["preserved"]} (str-bytes "bytes"))])
+      (upon [actual ((t/wrap-server tracer (fn (ctx: o/Context request: h/Request) expected)) (req {}))])
+      (then (expect = true (= expected actual))))))
+
+(defun main () -> i64 (run-main (specs)))

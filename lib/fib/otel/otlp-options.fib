@@ -1,0 +1,90 @@
+;; OTLP/HTTP JSON configuration. Signal endpoints are exact URLs; the generic endpoint is a base URL.
+;; https://opentelemetry.io/docs/specs/otel/protocol/exporter/ (checked 2026-11-01).
+;; HTTPS is explicit: register fib.tls.http's factory in http-options. No HTTP middleware is installed here.
+(ns fib.otel.otlp-options (:use fib.core fib.seq fib.coll)
+  (:require [fib.http.client :as http] [fib.http.headers :as h] [fib.http.types :as ht]
+            [fib.http.uri :as uri] [fib.http.tcp :as tcp] [fib.string :as s] [fib.os :as os]))
+
+(defstruct OtlpOptions (endpoint: str headers: (Map str (Vec str)) timeout-ms: i64 max-attempts: i64
+                        initial-backoff-ms: i64 max-backoff-ms: i64 http-options: http/Options))
+
+(defun options (endpoint: str) -> OtlpOptions
+  (OtlpOptions endpoint {} 10000 3 100 1000
+    (with (http/default-options) (max-response-bytes 1048576) (throw-exceptions false) (follow-redirects false))))
+
+;; Bounded unsigned parsing: malicious environment values cannot overflow checked arithmetic.
+(defun unsigned (text: str limit: i64) -> (Option i64)
+  (if (= text "") nil
+    (loop [i 0 n 0]
+      (if (= i (str-len text)) (some n)
+        (let [d (- (zext i64 (str-byte-at text i)) 48)]
+          (if (or (< d 0) (> d 9) (> n (quot (- limit d) 10))) nil
+            (let [next (+ (* n 10) d)] (if (> next limit) nil (recur (+ i 1) next)))))))))
+
+(defun signal-prefix :private (signal: str) -> str
+  (cond (= signal "traces") "OTEL_EXPORTER_OTLP_TRACES_" (= signal "metrics") "OTEL_EXPORTER_OTLP_METRICS_"
+        :else "OTEL_EXPORTER_OTLP_LOGS_"))
+
+(defun setting :private (lookup: (fn (str) (Option str)) signal: str key: str) -> (Option str)
+  (match (nonempty (lookup (str (signal-prefix signal) key)))
+    ((some v) (some v)) (nil (nonempty (lookup (str "OTEL_EXPORTER_OTLP_" key))))))
+
+(defun nonempty :private (value: (Option str)) -> (Option str)
+  (match value ((some v) (if (= v "") nil (some v))) (nil nil)))
+
+(defun trim-slash :private (path: str) -> str
+  (loop [end (str-len path)]
+    (if (and (> end 0) (= (str-byte-at path (- end 1)) 47i8)) (recur (- end 1)) (str-slice path 0 end))))
+
+(defun endpoint-for (base: str signal: str) -> (Result str str)
+  (match (uri/parse-url base)
+    ((Err _) (Err "invalid OTLP endpoint URL"))
+    ((Ok u) (Ok (uri/url-string (with u (path (str (trim-slash (. u path)) "/v1/" signal))))))))
+
+;; W3C Baggage-style comma-separated headers. Percent decoding preserves a literal '+' (not form encoding).
+(defun parse-headers (text: str) -> (Result (Map str (Vec str)) str)
+  (loop [parts (s/split text ",") i 0 out: (Map str (Vec str)) {}]
+    (if (= i (count parts)) (Ok out)
+      (let [part (s/trim (nth parts i)) eq (str-find part "=" 0)]
+        (if (= part "") (recur parts (+ i 1) out)
+          (match eq
+            (nil (Err "OTLP header lacks '='"))
+            ((some at)
+              (match (uri/percent-decode (s/trim (str-slice part (+ at 1) (str-len part))))
+                ((Err _) (Err "invalid percent encoding in OTLP header"))
+                ((Ok bytes) (let [key (s/trim (str-slice part 0 at)) value (str-from-bytes bytes)]
+                  (if (or (not (h/token? key)) (not (h/header-value? value))) (Err "invalid OTLP header")
+                    (recur parts (+ i 1) (h/header-set out key value)))))))))))))
+
+(defun validate-options (o: OtlpOptions) -> (Result unit str)
+  (match (uri/parse-url (. o endpoint))
+    ((Err _) (Err "invalid OTLP endpoint URL"))
+    ((Ok u)
+      (cond (not (or (= (. u scheme) "http") (= (. u scheme) "https"))) (Err "OTLP requires an http or https endpoint")
+            (or (some? (. u userinfo)) (some? (. u fragment))) (Err "OTLP endpoint must not contain userinfo or a fragment")
+            (or (<= (. o timeout-ms) 0) (> (. o timeout-ms) 3600000)) (Err "invalid OTLP timeout")
+            (or (< (. o max-attempts) 1) (> (. o max-attempts) 10)) (Err "invalid OTLP attempt bound")
+            (or (< (. o initial-backoff-ms) 0) (> (. o max-backoff-ms) 3600000)
+                (< (. o max-backoff-ms) (. o initial-backoff-ms))) (Err "invalid OTLP backoff bounds")
+            (not (http/valid-options? (. o http-options))) (Err "invalid OTLP HTTP options")
+            (not (match (. (. o http-options) resolver) ((tcp/NativeDns) true) (_ false))) (Err "OTLP requires deadline-bound native DNS")
+            :else (match (h/validate-headers (. o headers)) ((Err _) (Err "invalid OTLP headers")) ((Ok _) (Ok ())))))))
+
+(defun env-endpoint :private (lookup: (fn (str) (Option str)) signal: str) -> (Result str str)
+  (match (nonempty (lookup (str (signal-prefix signal) "ENDPOINT")))
+    ((some v) (Ok v))
+    (nil (endpoint-for (unwrap-or (nonempty (lookup "OTEL_EXPORTER_OTLP_ENDPOINT")) "http://localhost:4318") signal))))
+
+;; Testable environment resolution. Only this library's supported transport is accepted; no protobuf or gzip fallback is invented.
+(defun options-with-env (signal: str lookup: (fn (str) (Option str))) -> (Result OtlpOptions str)
+  (cond (not (includes? signal ["traces" "metrics" "logs"])) (Err "unknown OTLP signal")
+        (!= (unwrap-or (setting lookup signal "PROTOCOL") "http/json") "http/json") (Err "OTLP exporter supports http/json only")
+        (not (includes? (unwrap-or (setting lookup signal "COMPRESSION") "none") ["" "none"])) (Err "OTLP compression is not supported")
+        :else
+          (try-let [endpoint (env-endpoint lookup signal) headers (parse-headers (unwrap-or (setting lookup signal "HEADERS") ""))]
+            (match (unsigned (unwrap-or (setting lookup signal "TIMEOUT") "10000") 3600000)
+              (nil (Err "invalid OTLP timeout"))
+              ((some ms) (let [o (with (options endpoint) (headers headers) (timeout-ms ms))]
+                (try-let [_ (validate-options o)] (Ok o))))))))
+
+(defun options-from-env (signal: str) -> (Result OtlpOptions str) (options-with-env signal (fn (key: str) (os/getenv key))))

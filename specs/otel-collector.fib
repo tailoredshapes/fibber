@@ -1,0 +1,47 @@
+;; Real collector fixture. Every signal uses the native OTLP HTTP implementation.
+(ns main (:use fib.core fib.seq fib.coll fib.datum fib.print)
+  (:require [fib.otel :as o] [fib.otel.otlp :as wire] [fib.os :as os]
+            [fib.log.core :as log] [fib.log.async :as async]))
+
+(defun config (base: str signal: str) -> wire/OtlpOptions
+  (with (wire/options (str base "/v1/" signal)) (timeout-ms 2000) (max-attempts 1)))
+(defun okay? (answer: (Result unit str)) -> bool (match answer ((Ok _) true) (_ false)))
+(defun resource () -> o/Resource (o/Resource [(Pair "service.name" (DStr "fibber-collector-acceptance"))]))
+(defun attrs () -> (Vec (Pair str Datum))
+  [(Pair "huge" (DInt 9223372036854775807)) (Pair "bytes" (DBytes (str-bytes "hi"))) (Pair "label" (DStr "collector"))])
+(defun span (name: str id: i64 parent: i64) -> o/SpanData
+  (o/SpanData name o/KindServer (o/TraceId 1229782938247303441 1229782938247303441) id parent (!= parent 0) 1
+    "vendor=value" "fixture.trace" 1700000000000000000 1700000000000000100 (attrs)
+    [(o/SpanEvent "ready" 1700000000000000050 [])] [] (o/StatusError "fixture failure") (resource)))
+(defun metrics () -> (Vec o/Metric)
+  [(o/Metric "requests" "{request}" "exact integer" "fixture.metrics"
+     (o/SumData [(o/NumberPoint [] 9223372036854775807 1700000000000000000 1700000000000000100)] true) (resource))
+   (o/Metric "latency" "ms" "buckets" "fixture.metrics"
+     (o/HistogramData [(o/HistogramPoint [] [1.0 2.0] [1 2 1] 4 7.0 0.5 3.0 1700000000000000000 1700000000000000100)]) (resource))])
+
+(defun deliver (base: str) -> i64
+  (let [tr (wire/trace-exporter (config base "traces"))
+        mt (wire/metric-exporter (config base "metrics"))
+        logs (wire/log-sink (config base "logs") (resource) 8 async/DropNewest)
+        sink (dyn log/Sink :send logs)
+        record (log/LogRecord log/INFO "fixture.log" "collector accepted"
+                 [(Pair :trace_id (DStr "11111111111111111111111111111111"))
+                  (Pair :span_id (DStr "0000000000000022")) (Pair :huge (DInt 9223372036854775807))
+                  (Pair :bytes (DBytes (str-bytes "hi")))] 1700000000000000100)
+        traces (okay? (o/export-spans (dyn o/Exporter :send tr) [(span "root" 17 0) (span "child" 34 17)]))
+        measured (okay? (o/export-metrics (dyn o/MetricExporter :send mt) (metrics)))
+        logged (okay? (log/sink-write sink record))
+        flushed (okay? (log/sink-flush sink))
+        closed (okay? (log/sink-close sink))
+        _ (o/exporter-shutdown (dyn o/Exporter :send tr))
+        _ (o/metric-exporter-shutdown (dyn o/MetricExporter :send mt))
+        good (and traces measured logged flushed closed (= (wire/log-failed logs) 0)
+                  (= (. (wire/stats tr) partial) 0) (= (. (wire/stats mt) partial) 0) (= (. (wire/stats logs) partial) 0))]
+    (do (println (str "{\"ok\":" good ",\"tracePartial\":" (. (wire/stats tr) partial)
+                     ",\"metricPartial\":" (. (wire/stats mt) partial) ",\"logPartial\":" (. (wire/stats logs) partial) "}"))
+        (if good 0 1))))
+
+(defun main () -> i64
+  (match (os/getenv "OTLP_TEST_BASE")
+    (nil (do (eprintln "OTLP_TEST_BASE required") 2))
+    ((some base) (deliver base))))

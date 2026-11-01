@@ -1,0 +1,40 @@
+;; Log correlation fields are promoted only when they contain valid nonzero hex
+;; IDs. Invalid values remain attributes; promoted IDs are lower-case hex.
+(ns fib.otel.otlp-json-logs (:use fib.core fib.seq fib.coll fib.datum fib.otel.trace fib.log.core)
+  (:require [fib.otel.metrics :as m] [fib.otel.otlp-json-common :as j]))
+
+(defun hex-digit-value :private (byte: i64) -> i64
+  (cond (and (>= byte 48) (<= byte 57)) (- byte 48)
+        (and (>= byte 97) (<= byte 102)) (- byte 87)
+        (and (>= byte 65) (<= byte 70)) (- byte 55) :else -1))
+
+(defun valid-hex-id :private (text: str digits: i64) -> (Option str)
+  (if (!= (str-len text) digits) nil
+    (loop [i 0 out "" nonzero false]
+      (if (= i digits) (if nonzero (some out) nil)
+        (let [digit (hex-digit-value (zext i64 (str-byte-at text i)))]
+          (if (< digit 0) nil
+            (recur (+ i 1) (str out (str-slice "0123456789abcdef" digit (+ digit 1))) (or nonzero (!= digit 0)))))))))
+
+(defun log-attributes :private (record: LogRecord) -> (Vec (Pair str Datum))
+  (m/canonical-attributes (mapv (fn (p: (Pair keyword Datum)) (Pair (keyword-text (. p fst)) (. p snd))) (. record fields))))
+
+(defun correlation-id :private (attributes: (Vec (Pair str Datum)) key: str digits: i64) -> (Option str)
+  (match (find-attribute attributes key) ((some (DStr text)) (valid-hex-id text digits)) (_ nil)))
+
+(defun id-field :private (name: str value: (Option str)) -> str
+  (match value (nil "") ((some text) (str "," (json-quote name) ":" (json-quote text)))))
+
+(defun log-json :private (record: LogRecord) -> str
+  (let [attributes (log-attributes record) trace (correlation-id attributes "trace_id" 32) span (correlation-id attributes "span_id" 16)
+        kept (vec (filter (fn (p: (Pair str Datum))
+          (not (or (and (= (. p fst) "trace_id") (some? trace)) (and (= (. p fst) "span_id") (some? span))))) attributes))
+        level (. record level) severity (if (and (>= level 0) (<= level 5)) (+ (* level 4) 1) 0)]
+    (str "{\"timeUnixNano\":" (j/json-i64 (. record time-ns)) ",\"observedTimeUnixNano\":" (j/json-i64 (. record time-ns))
+      ",\"severityNumber\":" severity ",\"severityText\":" (json-quote (level-name level))
+      ",\"body\":{\"stringValue\":" (json-quote (. record message)) "},\"attributes\":" (j/attributes-json kept)
+      (id-field "traceId" trace) (id-field "spanId" span) "}")))
+
+(defun encode-logs (resource: Resource records: (Vec LogRecord)) -> str
+  (j/group-json "resourceLogs" "scopeLogs" "logRecords"
+    (mapv (fn (record: LogRecord) (j/OtlpJsonItem resource (. record logger) (log-json record))) records)))

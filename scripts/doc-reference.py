@@ -109,7 +109,7 @@ def library():
     facades = sorted({re.search(r'^\(ns ([^\s()]+)', f.read_text(), re.M)[1]
                       for f in (ROOT / 'lib/fib').glob('*.fib')}
                      | {name for name, (_, source) in modules.items() if '(:export-from' in source}
-                     | ({'fib.json.schema', 'fib.logic.fd', 'fib.test.core', 'fib.test.run',
+                     | ({'fib.json.schema', 'fib.logic.fd', 'fib.test.core', 'fib.test.run', 'fib.otel.http',
                          'fib.db.contract', 'fib.db.memory', 'fib.gpu.device', 'fib.gpu.sim',
                          'fib.gpu.contract', 'fib.view.tiles'} & modules.keys()))
     pages = {}

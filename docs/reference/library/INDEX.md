@@ -48,6 +48,8 @@ All exports are pre-1.0; proposed S/E/I classes and “since” versions await e
 | [fib.os.net](fib.os.net.md) | 19 |
 | [fib.os.platform](fib.os.platform.md) | 4 |
 | [fib.otel](fib.otel.md) | 220 |
+| [fib.otel.http](fib.otel.http.md) | 5 |
+| [fib.otel.otlp](fib.otel.otlp.md) | 27 |
 | [fib.parallel](fib.parallel.md) | 71 |
 | [fib.print](fib.print.md) | 13 |
 | [fib.regex](fib.regex.md) | 31 |

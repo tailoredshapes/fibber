@@ -1,0 +1,32 @@
+;; Bind native DNS and every socket used by a collector request (including TLS handshakes) to the overall export deadline.
+;; Caller-supplied Transport factories must honour their dial/read/write deadline contract; no arbitrary callback can be preempted safely.
+(ns fib.otel.otlp-deadline (:use fib.core fib.seq fib.coll)
+  (:require [fib.dns :as dns] [fib.http.client :as http] [fib.http.tcp :as tcp]
+            [fib.http.types :as ht] [fib.http.transport :as t] [fib.os :as os]))
+
+(defun remaining :private (deadline: i64) -> i64 (max 0 (quot (- deadline (os/clock-now)) 1000000)))
+(defun capped :private (stream: t/Transport deadline: i64) -> t/Transport
+  (do (t/t-deadline stream deadline)
+      (t/Transport (fn (n: i64) (if (>= (os/clock-now) deadline) (Err (ht/Timeout "total" "OTLP deadline")) (t/t-read stream n)))
+        (fn (bytes: (Array i8)) (if (>= (os/clock-now) deadline) (Err (ht/Timeout "total" "OTLP deadline")) (t/t-write stream bytes)))
+        (fn () (t/t-close stream)) (fn (at: i64) (t/t-deadline stream (if (= at 0) deadline (min deadline at)))) (. stream peer))))
+
+(defun resolve-before :private (host: str deadline: i64) -> (Result (Vec str) ht/Error)
+  (let [conf (dns/load-resolv-conf "/etc/resolv.conf") hosts (dns/load-hosts "/etc/hosts") ms (remaining deadline)]
+    (if (= ms 0) (Err (ht/Timeout "total" "OTLP DNS deadline"))
+      (let [resolver (dns/new-resolver (with (dns/default-dns-config conf hosts) (total-ms ms)))]
+        (match (dns/resolve-host resolver host) ((Ok ips) (Ok ips)) ((Err _) (Err (ht/DnsError "OTLP collector resolution failed"))))))))
+
+(defun factory-before :private (factory: t/Factory deadline: i64) -> t/Factory
+  (t/Factory (. factory name)
+    (fn (target: t/Target)
+      (let [dial (fn (host: str port: i64 ms: i64)
+                   (let [left (min ms (remaining deadline))]
+                     (if (<= left 0) (Err (ht/Timeout "total" "OTLP connect deadline"))
+                       (try-let [stream ((. target dial) host port left)] (Ok (capped stream deadline))))))]
+        (try-let [stream ((. factory open) (with target (dial dial)))] (Ok (capped stream deadline)))))))
+
+(defun before (options: http/Options deadline: i64) -> http/Options
+  (with options (resolver (tcp/CustomResolver (fn (host: str) (resolve-before host deadline))))
+    (factories (reduce (fn (out: (Map str t/Factory) entry: (Pair str t/Factory))
+                        (assoc out (. entry fst) (factory-before (. entry snd) deadline))) {} (. options factories)))))

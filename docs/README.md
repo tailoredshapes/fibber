@@ -26,6 +26,7 @@ then ship a tested file-processing command. The short tutorial below is a tour.
 - [Macros](guide/macros.md)
 - [Modules and namespaces](guide/modules-and-namespaces.md)
 - [Numerics, SIMD and tensors](guide/numerics-simd-tensors.md)
+- [Logging, traces, metrics and OTLP](guide/observability.md)
 - [Ownership and borrowing](guide/ownership-and-borrowing.md)
 - [Packages and dependencies](guide/packages-and-dependencies.md)
 - [Protocols, records and enums](guide/protocols-records-and-enums.md)

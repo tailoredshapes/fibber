@@ -14,6 +14,7 @@
 #  12  with F3 out of date only fixed-point and jit-selfhosted-threads rerun: the second wave of the gate waits for F alone (and a planted F3 prerequisite is seen)
 #  10  `make mac-check`'s stamps are the full gate's less the tools and stages of compiler/tests/expected-macos.txt (a listed tool is not run, an unlisted one is; the check
 #      fails on a planted extra line and on a listed name that is no tool)
+#  13  observability fixtures track helper sources, reuse a current binary for a stale result, and invalidate results before a failed build
 # usage: compiler/tests/make/graph.sh [SCRATCH]     (run anywhere; make 4 is needed)
 set -u
 # The test runs as a tool of the gate, inside make's environment (-j, GATE_FRESH, FIBC=F): none of it belongs to the graph under test.
@@ -28,20 +29,26 @@ fail() { echo "FAIL $*"; bad=$((bad + 1)); }
 M() { make --no-print-directory -o compiler/emit/runtime.fib BUILD="$B" MAC_QUICK= "$@"; }   # the real Makefile against the scratch build directory   # MAC_QUICK= : the graph is the full one even when the gate that runs this test is `mac-check MAC_QUICK=1`
 make --version | grep -q '^GNU Make 4\|^GNU Make 5' || { echo "graph.sh: GNU Make 4 is needed"; exit 2; }
 
+# External integration binaries are products, not stamps. Keep their fake mtimes after F/config/recipe inputs and before their results.
+obs_products() { touch "$B/observability/otlp-client" "$B/observability/collector-fixture"; }
+all_stamps() { touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok "$B"/observability/*.ok; }
+
 # fake products: the seed, F and every stamp of the full gate, newer than everything in the tree (and older than nothing)
 fake_all() {
   rm -rf "$B"; mkdir -p "$B"
-  seed=$(M -s -f Makefile -p 2> /dev/null | sed -n 's/^SEED_FIBC := //p' | head -n 1)
+  # Name the full goal even for the first database read: collector.cfg is deliberately created only for collector-bearing goals.
+  seed=$(M -n -p gate-stamps 2> /dev/null | sed -n 's/^SEED_FIBC := //p' | head -n 1)
   mkdir -p "$(dirname "$seed")"; : > "$seed"; chmod +x "$seed"
-  for f in $(M -n -p 2> /dev/null | sed -n 's/^FULL_STAMPS := //p' | head -n 1); do mkdir -p "$(dirname "$f")"; echo 1 > "$f"; done
+  for f in $(M -n -p gate-stamps 2> /dev/null | sed -n 's/^FULL_STAMPS := //p' | head -n 1); do mkdir -p "$(dirname "$f")"; echo 1 > "$f"; done
   for f in F F.lir F3 F3.lir gen-runtime adr; do : > "$B/$f"; done; chmod +x "$B/F" "$B/F3" "$B/gen-runtime" "$B/adr"
+  mkdir -p "$B/observability"; obs_products
   # LLVM_LINK=static (CI) makes the merged-LLVM args file a prerequisite of F and the golden tools, and the ThinLTO shim's args file is one
   # in every mode (scripts/thinlto-shim.sh): they are products too
   mkdir -p "$B/llvm-static" "$B/thinlto" "$B/golden/tools" "$B/tools" "$B/cases"; : > "$B/llvm-static/args"; : > "$B/thinlto/args"; for t in read expand types own explain emit lairf; do : > "$B/golden/tools/$t"; done
   for f in $(M -n -p 2> /dev/null | grep -o "^$B/cases/[a-z]*\.[0-9]*\.txt" | sort -u); do echo "1 cases: 1 pass" > "$f"; done
   # products now (newer than any file of the tree), the stamps a moment later (newer than the products)
   touch "$seed" "$B"/llvm-static/args "$B"/thinlto/args "$B"/F "$B"/F.lir "$B"/F3 "$B"/F3.lir "$B"/gen-runtime "$B"/adr "$B"/golden/tools/* "$B"/cases/*.txt
-  sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
+  obs_products; sleep 0.05; all_stamps
 }
 fake_all
 # the full gate's stamps, from the Makefile itself
@@ -72,7 +79,7 @@ for want in 'build compiler/fibc.fib' 'cases cases/stdlib' 'golden.sh' 'tests/ge
   echo "$run" | grep -q -- "$want" || { fail "4 with F out of date, nothing runs for: $want"; want=; }
   [ -n "$want" ] && ok "4 with F out of date the dry run has: $want"
 done
-touch "$B/F"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok "$B"/cases/*.txt
+touch "$B/F"; obs_products; sleep 0.05; all_stamps; touch "$B"/cases/*.txt
 
 # 5 one stdlib case newer than its shard's table: that shard reruns, no other
 first=$(M -n -p 2> /dev/null | sed -n 's/^NAMES_stdlib.3 := //p' | head -n 1 | awk '{print $1}')
@@ -90,7 +97,7 @@ real=$(M -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true
 planted=$(make --no-print-directory -f "$S/Makefile" BUILD="$B" -n "$B/tools/gen-skeleton.ok" | grep -c 'tests/gen/skeleton.sh' || true)
 if [ "$real" -eq 1 ] && [ "$planted" -eq 0 ]; then ok "6 a tool stamp without its F prerequisite is caught: the real graph reruns it after F, the planted copy does not"
 else fail "6 real graph reran the tool stamp $real times, the planted copy $planted (want 1 and 0)"; fi
-touch "$B/F"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
+touch "$B/F"; obs_products; sleep 0.05; all_stamps
 
 # 7 a failing command leaves no stamp; a target a failed recipe wrote is removed
 printf 'tool_zz-fail := false | \nTOOLS_FULL += zz-fail\n$(eval $(call tool_target,zz-fail))\n$(BUILD)/zz-partial:\n\techo partial > $$@; false\n' > "$S/mk/zz.mk"
@@ -159,9 +166,33 @@ got=$(M -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_AL
 if [ "$got" = "$(echo "$want" | LC_ALL=C sort)" ]; then ok "12 with F3 out of date only fixed-point and jit-selfhosted-threads rerun"; else fail "12 stamps that wait for F3: $(echo $got) (want fixed-point and jit-selfhosted-threads)"; fi
 # a clean copy: check 6 left a mutated tools.mk and zz.mk in $S/mk, and the planted make takes the same -o and MAC_QUICK= as M
 rm -rf "$S/mk"; mkdir -p "$S/mk"; cp Makefile "$S/Makefile"; cp mk/*.mk "$S/mk/"; printf '$(BUILD)/wasm.ok: $(BUILD)/F3\n' > "$S/mk/zz3.mk"; printf '\ninclude $(MK)/zz3.mk\n' >> "$S/Makefile"
+# The copy is a new recipe identity for the external fixtures: fake those products current before testing only the planted F3 edge.
+obs_products; sleep 0.05; touch "$B"/observability/*.ok
 got=$(make --no-print-directory -o compiler/emit/runtime.fib -f "$S/Makefile" BUILD="$B" MAC_QUICK= -n gate-stamps | grep -o '^rm -f [^ ;]*\.ok' | sed 's/^rm -f //' | LC_ALL=C sort)
 if [ "$got" = "$(printf '%s\n' $want "$B/wasm.ok" | LC_ALL=C sort)" ]; then ok "12 plant: a stamp made to depend on F3 reruns with F3 (the check above sees it)"; else fail "12 plant: wasm.ok with an F3 prerequisite did not show: $(echo $got)"; fi
-touch "$B/F3" "$B/F3.lir"; sleep 0.05; touch "$B"/*.ok "$B"/golden/*.ok "$B"/tools/*.ok "$B"/cases/*.ok
+touch "$B/F3" "$B/F3.lir"; sleep 0.05; all_stamps
+
+# 13 external integration: dirty binary/helper rebuilds the fixture, but a stale result reuses it. Nothing is compiled here.
+fake_all
+touch -t 200001010000 "$B/observability/otlp-client"
+run=$(M -n "$B/observability/otlp-http.ok" 2>&1)
+if echo "$run" | grep -q 'build scripts/tests/otlp/client.fib' && echo "$run" | grep -q 'otlp/integration.py'; then
+  ok "13a an old OTLP client rebuilds before its HTTP integration result"
+else fail "13a an old OTLP client did not schedule its build and integration result"; fi
+obs_products; sleep 0.05; all_stamps
+run=$(M -n -W specs/otel-exporter-contract.fib "$B/observability/otlp-http.ok" 2>&1)
+if echo "$run" | grep -q 'build scripts/tests/otlp/client.fib'; then ok "13b a changed exporter-contract helper rebuilds the OTLP client"
+else fail "13b the OTLP client ignores its exporter-contract helper"; fi
+touch -t 200001010000 "$B/observability/otlp-http.ok"
+run=$(M -n "$B/observability/otlp-http.ok" 2>&1)
+if echo "$run" | grep -q 'otlp/integration.py' && ! echo "$run" | grep -q ' build '; then
+  ok "13c a stale HTTP result reuses its current compiled client"
+else fail "13c a stale HTTP result failed to reuse its current compiled client"; fi
+printf '#!/bin/sh\nexit 1\n' > "$S/obs-fail"; chmod +x "$S/obs-fail"; echo 1 > "$B/observability/otlp-http.ok"
+if M OBS_FIBC="$S/obs-fail" "$B/observability/otlp-client" > "$S/obs-fail.log" 2>&1; then
+  fail "13d a deliberately failing fake compiler unexpectedly succeeded"
+elif [ ! -e "$B/observability/otlp-http.ok" ]; then ok "13d a failed OTLP fixture build removes its old integration result"
+else fail "13d a failed OTLP fixture build retained its old integration result"; fi
 
 [ -n "${KEEP:-}" ] || rm -rf "$S"
 echo "graph: $bad failed"

@@ -1,0 +1,161 @@
+;; OTLP log queue/worker contracts over HTTP pipes. Every gate is released before
+;; task joins, including when the pre-release nonblocking checks fail.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run)
+  (:require [fib.otel.otlp :as o] [fib.log.core :as log] [fib.log.async :as async]
+            [fib.http.types :as ht] [fib.http.client :as http] [fib.http.testing :as testing]
+            [fib.http.server.types :as server] [fib.json :as json] [fib.os :as os]
+            [otel-otlp-fixtures :as fixture]))
+
+(defstruct LogReceiver (options: o/OtlpOptions first-gate: (Atom bool) second-gate: (Atom bool)
+                        entered: (Atom i64) payloads: (Atom (Vec str))))
+(defstruct LogProbe (steps: (Map str bool) payloads: (Vec str) dropped: i64 failed: i64 stats: o/OtlpStats))
+
+(defun wait-until (f: (fn () bool) ms: i64) -> bool
+  (loop [i 0] (cond (f) true (>= i ms) false :else (do (os/sleep-ns 1000000) (recur (+ i 1))))))
+(defun wait-gate (gate: (Atom bool)) -> unit
+  (loop [] (when (not @gate) (do (os/sleep-ns 100000) (recur)))))
+(defun ok? (result: (Result unit str)) -> bool (match result ((Ok _) true) (_ false)))
+(defun record (message: str) -> log/LogRecord (log/LogRecord log/INFO "worker.spec" message [] 1700000000000000123))
+(defun write (sink: o/OtlpLogSink message: str) -> (Result unit str) (log/sink-write (dyn log/Sink :send sink) (record message)))
+(defun flush (sink: o/OtlpLogSink) -> (Result unit str) (log/sink-flush (dyn log/Sink :send sink)))
+(defun close (sink: o/OtlpLogSink) -> (Result unit str) (log/sink-close (dyn log/Sink :send sink)))
+(defun held (probe: LogProbe key: str) -> bool (unwrap-or (get (. probe steps) key) false))
+
+(defun receiver (codes: (Vec i64) hold-first: bool hold-second: bool) -> LogReceiver
+  (let [a (atom (not hold-first)) b (atom (not hold-second)) entered (atom 0) payloads (atom [])
+        factory (testing/loopback-factory
+          (fn (request: ht/Request)
+            (let [n (swap! entered (fn (n: i64) (+ n 1))) code (nth codes (min (- n 1) (- (count codes) 1)))]
+              (do (swap! payloads (fn (old: (Vec str)) (conj old (str-from-bytes (. request body)))))
+                  (cond (= n 1) (wait-gate a) (= n 2) (wait-gate b) :else ())
+                  (server/Whole (ht/Response code {"content-type" ["application/json"]} (str-bytes "{}"))))))
+          (server/default-options))
+        options (with (o/options "http://collector.test/v1/logs") (timeout-ms 4000) (max-attempts 1)
+          (initial-backoff-ms 0) (max-backoff-ms 0)
+          (http-options (http/with-factory (http/default-options) "http" factory)))]
+    (LogReceiver options a b entered payloads)))
+
+(defun release (receiver: LogReceiver) -> unit
+  (do (reset! (. receiver first-gate) true) (reset! (. receiver second-gate) true) ()))
+(defun new-sink (receiver: LogReceiver capacity: i64 overflow: async/Overflow) -> o/OtlpLogSink
+  (o/log-sink (. receiver options) (fixture/sample-resource) capacity overflow))
+
+(defun finish (receiver: LogReceiver sink: o/OtlpLogSink steps: (Map str bool)) -> LogProbe
+  (let [closed (close sink) again (close sink) late (write sink "after-close")]
+    (LogProbe (assoc (assoc (assoc steps "closed" (ok? closed)) "repeat-close" (ok? again)) "late-rejected" (not (ok? late)))
+      @(. receiver payloads) (o/log-dropped sink) (o/log-failed sink) (o/stats sink))))
+
+(defun parsed (text: str) -> json/Json
+  (match (json/parse text) ((Ok value) value) ((Err error) (trap (str "invalid collector JSON: " (. error message))))))
+(defun field (value: json/Json name: str) -> json/Json (unwrap-or (json/get-key value name) json/JNull))
+(defun elements (value: json/Json) -> (Vec json/Json) (match value ((json/JArr items) items) (_ [])))
+(defun body-records (body: str) -> (Vec json/Json)
+  (vec (mapcat (fn (resource: json/Json)
+    (mapcat (fn (scope: json/Json) (elements (field scope "logRecords"))) (elements (field resource "scopeLogs"))))
+    (elements (field (parsed body) "resourceLogs")))))
+(defun messages (probe: LogProbe) -> (Vec str)
+  (vec (mapcat (fn (body: str) (mapv (fn (record: json/Json)
+    (match (field (field record "body") "stringValue") ((json/JStr text) text) (_ "<missing body>"))) (body-records body))) (. probe payloads))))
+(defun batch-sizes (probe: LogProbe) -> (Vec i64) (mapv (fn (body: str) (count (body-records body))) (. probe payloads)))
+
+(defun nonblocking-flush () -> LogProbe
+  (let [r (receiver [200] true false) sink (new-sink r 2 async/DropNewest)
+        first (write sink "first") entered (wait-until (fn () (= @(. r entered) 1)) 2000)
+        second (write sink "second") third (write sink "third")
+        flushing (atom false) flushed (atom false) produced (atom false)
+        f (spawn (fn () (do (reset! flushing true) (let [answer (flush sink)] (do (reset! flushed true) answer)))))
+        flush-started (wait-until (fn () (and @flushing @(. (. sink core) wanted))) 200)
+        p (spawn (fn () (let [answer (write sink "dropped")] (do (reset! produced true) answer))))
+        producer-free (wait-until (fn () @produced) 200) flush-waited (not @flushed)
+        _ (release r) producer-result (join p) flush-result (join f)]
+    (finish r sink {"entered" entered "writes" (and (ok? first) (ok? second) (ok? third) (ok? producer-result))
+      "flush-started" flush-started "producer-free" producer-free "flush-waited" flush-waited "flushed" (ok? flush-result)})))
+
+(defun fixed-flush-target () -> LogProbe
+  (let [r (receiver [200] true true) sink (new-sink r 4 async/DropNewest)
+        first (write sink "before-flush") entered (wait-until (fn () (= @(. r entered) 1)) 2000)
+        started (atom false) done (atom false)
+        f (spawn (fn () (do (reset! started true) (let [answer (flush sink)] (do (reset! done true) answer)))))
+        flushing (wait-until (fn () (and @started @(. (. sink core) wanted))) 200)
+        produced (atom false) p (spawn (fn () (let [answer (write sink "after-flush")] (do (reset! produced true) answer))))
+        producer-free (wait-until (fn () @produced) 200)
+        _ (reset! (. r first-gate) true)
+        second-entered (wait-until (fn () (= @(. r entered) 2)) 2000)
+        flush-free (wait-until (fn () @done) 200)
+        _ (release r) producer-result (join p) flush-result (join f)]
+    (finish r sink {"entered" entered "flushing" flushing "producer-free" producer-free "second-entered" second-entered
+      "fixed-target" flush-free "writes" (and (ok? first) (ok? producer-result)) "flushed" (ok? flush-result)})))
+
+(defun drop-oldest () -> LogProbe
+  (let [r (receiver [200] true false) sink (new-sink r 2 async/DropOldest)
+        first (write sink "first") entered (wait-until (fn () (= @(. r entered) 1)) 2000)
+        second (write sink "oldest") third (write sink "kept") fourth (write sink "replacement")
+        _ (release r) result (flush sink)]
+    (finish r sink {"entered" entered "writes" (and (ok? first) (ok? second) (ok? third) (ok? fourth)) "flushed" (ok? result)})))
+
+(defun concurrent-close () -> LogProbe
+  (let [r (receiver [200] true false) sink (new-sink r 2 async/DropNewest)
+        first (write sink "first") entered (wait-until (fn () (= @(. r entered) 1)) 2000)
+        second (write sink "queued") a-started (atom false) b-started (atom false) a-done (atom false) b-done (atom false)
+        a (spawn (fn () (do (reset! a-started true) (let [answer (close sink)] (do (reset! a-done true) answer)))))
+        b (spawn (fn () (do (reset! b-started true) (let [answer (close sink)] (do (reset! b-done true) answer)))))
+        closing (wait-until (fn () (and @a-started @b-started @(. (. sink core) closing))) 200)
+        produced (atom false) p (spawn (fn () (let [answer (write sink "late")] (do (reset! produced true) answer))))
+        producer-free (wait-until (fn () @produced) 200) both-waited (and (not @a-done) (not @b-done))
+        _ (release r) late-result (join p) a-result (join a) b-result (join b)]
+    (finish r sink {"entered" entered "writes" (and (ok? first) (ok? second)) "closing" closing
+      "producer-free" producer-free "both-waited" both-waited "late-error" (not (ok? late-result))
+      "both-closed" (and (ok? a-result) (ok? b-result))})))
+
+(defun bounded-batches () -> LogProbe
+  (let [r (receiver [200] true false) sink (new-sink r 512 async/DropNewest)
+        first (write sink "first") entered (wait-until (fn () (= @(. r entered) 1)) 2000)
+        accepted (every? (fn (n: i64) (ok? (write sink (str "queued-" n)))) (range 0 300))
+        _ (release r) result (flush sink)]
+    (finish r sink {"entered" entered "writes" (and (ok? first) accepted) "flushed" (ok? result)})))
+
+(defun recovering-failure () -> LogProbe
+  (let [r (receiver [400 200] false false) sink (new-sink r 4 async/DropNewest)
+        first (write sink "failed") first-flush (flush sink) second (write sink "recovered") second-flush (flush sink)]
+    (finish r sink {"writes" (and (ok? first) (ok? second)) "flushed" (and (ok? first-flush) (ok? second-flush))})))
+
+(defspecs specs
+  (feature "OTLP log worker"
+    (scenario "a concurrent flush never holds a producer through collector I/O; DropNewest capacity and batching remain exact"
+      (given [probe (nonblocking-flush)])
+      (then (expect = true (every? (fn (key: str) (held probe key))
+                  ["entered" "writes" "flush-started" "producer-free" "flush-waited" "flushed" "closed" "repeat-close" "late-rejected"]))
+            (expect = 1 (. probe dropped)) (expect = 0 (. probe failed))
+            (expect = [1 2] (batch-sizes probe))
+            (expect = ["first" "second" "third"] (messages probe))
+            (expect = 3 (. (. probe stats) exported-items))
+            (expect = true (. (. probe stats) closed))))
+    (scenario "flush completes its fixed accepted-record snapshot while a later batch is still blocked in HTTP"
+      (given [probe (fixed-flush-target)])
+      (then (expect = true (every? (fn (key: str) (held probe key))
+                  ["entered" "flushing" "producer-free" "second-entered" "fixed-target" "writes" "flushed" "closed"]))
+            (expect = ["before-flush" "after-flush"] (messages probe)) (expect = 0 (. probe dropped))))
+    (scenario "DropOldest replaces one accepted slot without making flush await a nonexistent completion"
+      (given [probe (drop-oldest)])
+      (then (expect = true (every? (fn (key: str) (held probe key)) ["entered" "writes" "flushed" "closed"]))
+            (expect = 1 (. probe dropped)) (expect = [1 2] (batch-sizes probe))
+            (expect = ["first" "kept" "replacement"] (messages probe)) (expect = 3 (. (. probe stats) exported-items))))
+    (scenario "concurrent closes both wait for delivery, and a late producer is rejected without waiting on network"
+      (given [probe (concurrent-close)])
+      (then (expect = true (every? (fn (key: str) (held probe key))
+                  ["entered" "writes" "closing" "producer-free" "both-waited" "late-error" "both-closed" "closed" "repeat-close" "late-rejected"]))
+            (expect = ["first" "queued"] (messages probe)) (expect = true (. (. probe stats) closed))))
+    (scenario "queued records retain FIFO order exactly once and no HTTP batch exceeds 256 records"
+      (given [probe (bounded-batches)])
+      (then (expect = true (every? (fn (key: str) (held probe key)) ["entered" "writes" "flushed" "closed"]))
+            (expect = [1 256 44] (batch-sizes probe))
+            (expect = (into ["first"] (mapv (fn (n: i64) (str "queued-" n)) (range 0 300))) (messages probe))
+            (expect = 301 (. (. probe stats) exported-items)) (expect = 0 (. probe dropped))))
+    (scenario "a rejected delivery is counted without failing application writes or preventing the next batch"
+      (given [probe (recovering-failure)])
+      (then (expect = true (every? (fn (key: str) (held probe key)) ["writes" "flushed" "closed" "repeat-close" "late-rejected"]))
+            (expect = ["failed" "recovered"] (messages probe))
+            (expect = 1 (. probe failed)) (expect = 1 (. (. probe stats) failed))
+            (expect = 1 (. (. probe stats) exported-items)) (expect = [1 1] (batch-sizes probe))))))
+
+(defun main () -> i64 (run-main (specs)))

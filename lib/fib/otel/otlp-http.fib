@@ -1,0 +1,129 @@
+;; Raw, uninstrumented collector transport. No dependency on fib.otel or instrumented middleware.
+;; OTLP 1.11.1: https://opentelemetry.io/docs/specs/otlp/ (checked 2026-11-01).
+;; An attempt limit AND an overall deadline bound retries, including Retry-After waits. Exporters serialize their own calls.
+(ns fib.otel.otlp-http (:use fib.core fib.seq fib.coll fib.otel.otlp-options)
+  (:require [fib.http.client :as http] [fib.http.types :as ht] [fib.http.headers :as h]
+            [fib.http.cookies :as dates] [fib.json :as json] [fib.os :as os] [fib.ex :as ex] [fib.otel.otlp-deadline :as bounded]))
+
+(defstruct OtlpStats (requests: i64 retries: i64 exported-batches: i64 exported-items: i64 failed: i64 partial: i64
+                      rejected: i64 last-status: i64 closed: bool))
+(defprotocol Diagnostics (stats (self) -> OtlpStats))
+(defstruct OtlpState (snapshot: (Atom OtlpStats) busy: (Atom bool)))
+
+(defun new-state () -> OtlpState (OtlpState (atom (OtlpStats 0 0 0 0 0 0 0 0 false)) (atom false)))
+(defun state-stats (s: OtlpState) -> OtlpStats @(. s snapshot))
+(defun fail :private (s: OtlpState message: str) -> (Result unit str)
+  (do (swap! (. s snapshot) (fn (v: OtlpStats) (with v (failed (+ (. v failed) 1))))) (Err message)))
+
+(defun lock-until :private (s: OtlpState deadline: i64) -> bool
+  (loop []
+    (cond (compare-and-set! (. s busy) false true) true
+          (>= (os/clock-now) deadline) false
+          :else (do (os/sleep-ns 100000) (recur)))))
+
+;; Flush and close are barriers for an in-flight synchronous export. Queue draining belongs to the supplied processor/reader/async sink.
+(defun state-flush (s: OtlpState) -> (Result unit str)
+  (do (loop [] (when (not (compare-and-set! (. s busy) false true)) (do (os/sleep-ns 100000) (recur))))
+      (reset! (. s busy) false) (Ok ())))
+(defun state-close (s: OtlpState) -> (Result unit str)
+  (do (loop [] (when (not (compare-and-set! (. s busy) false true)) (do (os/sleep-ns 100000) (recur))))
+      (swap! (. s snapshot) (fn (v: OtlpStats) (with v (closed true)))) (reset! (. s busy) false) (Ok ())))
+
+(defun retryable-status? (status: i64) -> bool (includes? status [429 502 503 504]))
+(defun retryable-error? :private (e: ht/Error) -> bool
+  (match e ((ht/Timeout _ _) true) ((ht/TransportError _ _) true) ((ht/ConnectError _) true)
+           ((ht/DnsError _) true) ((ht/Closed) true) (_ false)))
+
+;; Return milliseconds, -1 for malformed. HTTP-date uses the existing RFC date parser; absurd dates never overflow milliseconds.
+(defun decimal? :private (text: str) -> bool
+  (and (> (str-len text) 0) (every? (fn (i: i64) (let [b (str-byte-at text i)] (and (>= b 48i8) (<= b 57i8)))) (range (str-len text)))))
+(defun retry-after-ms (text: str now-seconds: i64) -> i64
+  (let [t (h/trim-ows text)]
+    (match (unsigned t 9223372036854775)
+      ((some seconds) (* seconds 1000))
+      (nil (if (decimal? t) 9223372036854775807 (let [at (dates/parse-date t)]
+        (cond (< at 0) -1 (<= at now-seconds) 0 (> (- at now-seconds) 9223372036854775) -1
+              :else (* (- at now-seconds) 1000))))))))
+
+(defun jitter :private (backoff: i64) -> i64
+  (+ (quot backoff 2) (rem (os/clock-now) (+ 1 (- backoff (quot backoff 2))))))
+
+(defun retry-delay :private (r: ht/Response backoff: i64) -> i64
+  (let [after (match (h/header (. r headers) "retry-after")
+                (nil -1) ((some text) (retry-after-ms text (quot (os/wall-now) 1000000000))))]
+    (if (>= after 0) after (jitter backoff))))
+
+(defun rejected-items :private (partial: json/Json key: str) -> (Result i64 str)
+  (match (json/get-key partial key)
+    (nil (Ok 0))
+    ((some value) (match value
+      ((json/JStr text) (match (unsigned text 9223372036854775807) ((some n) (Ok n)) (nil (Err "invalid partial count"))))
+      ((json/JInt n) (if (>= n 0) (Ok n) (Err "invalid partial count")))
+      ((json/JNull) (Ok 0)) (_ (Err "invalid partial count"))))))
+
+(defstruct ExportOutcome :private (partial: bool rejected: i64))
+(defun valid-message? :private (partial: json/Json) -> bool
+  (match (json/get-key partial "errorMessage") (nil true) ((some value) (match value ((json/JStr _) true) ((json/JNull) true) (_ false)))))
+(defun warning? :private (partial: json/Json) -> bool
+  (match (json/get-key partial "errorMessage") ((some (json/JStr text)) (!= text "")) (_ false)))
+(defun outcome :private (body: json/Json key: str) -> (Result ExportOutcome str)
+  (match (json/get-key body "partialSuccess")
+    (nil (Ok (ExportOutcome false 0)))
+    ((some p) (match p
+      ((json/JNull) (Ok (ExportOutcome false 0)))
+      ((json/JObj _ _) (if (valid-message? p) (try-let [n (rejected-items p key)] (Ok (ExportOutcome (or (> n 0) (warning? p)) n))) (Err "invalid partial message")))
+      (_ (Err "invalid partial success"))))))
+
+;; A populated partialSuccess is terminal even when it only carries a warning; never retry accepted telemetry.
+(defun success :private (s: OtlpState response: ht/Response items: i64 rejected-key: str) -> (Result unit str)
+  (match (json/parse-bytes (. response body))
+    ((Err _) (fail s "OTLP collector returned invalid JSON"))
+    ((Ok body) (match body
+      ((json/JObj _ _)
+        (match (outcome body rejected-key)
+          ((Err _) (fail s "OTLP collector returned invalid partial success"))
+          ((Ok result) (let [rejected (min items (. result rejected))
+                            snapshot (swap! (. s snapshot) (fn (v: OtlpStats)
+                              (with v (exported-batches (+ (. v exported-batches) 1)) (exported-items (+ (. v exported-items) (- items rejected)))
+                                      (partial (+ (. v partial) (if (. result partial) 1 0))) (rejected (+ (. v rejected) rejected)))))]
+            (do (when (and (. result partial) (= (. snapshot partial) 1))
+                  (eprintln "fib.otel.otlp: collector reported partial success (see exporter stats)")) (Ok ()))))))
+      (_ (fail s "OTLP collector returned a non-object response"))))))
+
+(defun attempt :private (s: OtlpState o: OtlpOptions payload: str remaining-ms: i64 n: i64 deadline: i64) -> (Result ht/Response ht/Error)
+  (do (swap! (. s snapshot) (fn (v: OtlpStats) (with v (requests (+ (. v requests) 1)) (retries (+ (. v retries) (if (> n 0) 1 0))))))
+      (let [cfg (with (bounded/before (. o http-options) deadline) (timeout-ms remaining-ms) (connect-timeout-ms remaining-ms) (read-timeout-ms remaining-ms)
+                       (throw-exceptions false) (follow-redirects false) (decompress false) (max-response-bytes 1048576))]
+        (http/request (ht/ClientRequest "POST" (. o endpoint)
+          (h/header-set (h/header-set (. o headers) "content-type" "application/json") "accept" "application/json") (str-bytes payload)) cfg))))
+
+(defun wait-retry :private (delay: i64 deadline: i64) -> bool
+  (let [left (quot (- deadline (os/clock-now)) 1000000)]
+    (if (>= delay left) false (do (os/sleep-ns (* delay 1000000)) true))))
+
+(defun exchange :private (s: OtlpState o: OtlpOptions payload: str items: i64 key: str deadline: i64) -> (Result unit str)
+  (loop [n 0 backoff (. o initial-backoff-ms)]
+    (let [remaining (quot (- deadline (os/clock-now)) 1000000)]
+      (if (<= remaining 0) (fail s "OTLP export timed out")
+        (match (attempt s o payload remaining n deadline)
+          ((Err e)
+            (do (swap! (. s snapshot) (fn (v: OtlpStats) (with v (last-status 0))))
+                (if (and (retryable-error? e) (< (+ n 1) (. o max-attempts)) (wait-retry (jitter backoff) deadline))
+                  (recur (+ n 1) (min (. o max-backoff-ms) (* 2 backoff))) (fail s "OTLP transport failed"))))
+          ((Ok r)
+            (do (swap! (. s snapshot) (fn (v: OtlpStats) (with v (last-status (. r status)))))
+                (cond (= (. r status) 200) (success s r items key)
+                      (and (retryable-status? (. r status)) (< (+ n 1) (. o max-attempts)) (wait-retry (retry-delay r backoff) deadline))
+                        (recur (+ n 1) (min (. o max-backoff-ms) (* 2 backoff)))
+                      :else (fail s (str "OTLP collector rejected export (HTTP " (. r status) ")"))))))))))
+
+(defun send-batch (s: OtlpState o: OtlpOptions payload: str items: i64 rejected-key: str) -> (Result unit str)
+  (try-let [_ (validate-options o)]
+    (let [deadline (+ (os/clock-now) (* (. o timeout-ms) 1000000))]
+      (if (not (lock-until s deadline)) (fail s "OTLP exporter is busy past its deadline")
+        (let [r (ex/try
+                  (cond (. (state-stats s) closed) (Err "OTLP exporter is shut down")
+                        (= items 0) (Ok ())
+                        :else (exchange s o payload items rejected-key deadline))
+                  (catch e (fail s "OTLP export failed")))]
+          (do (reset! (. s busy) false) r))))))

@@ -1,0 +1,70 @@
+;; Opt-in HTTP tracing. Context is explicit, never global/task-local. Exporters
+;; keep their plain transport: importing this module does not instrument HTTP.
+;; Bounded route templates are supplied by the application, never request URIs.
+;; Stable HTTP span conventions: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+;; Privacy policy: no URL/path/query/body/header values are recorded by default.
+(ns fib.otel.http (:use fib.core fib.seq fib.coll)
+  (:require [fib.otel :as o] [fib.http :as h] [fib.string :as string] [fib.os :as os]))
+
+(defun method-name :private (method: str) -> str
+  (let [known (match (os/getenv "OTEL_INSTRUMENTATION_HTTP_KNOWN_METHODS")
+                (nil ["CONNECT" "DELETE" "GET" "HEAD" "OPTIONS" "PATCH" "POST" "PUT" "QUERY" "TRACE"])
+                ((some value) (vec (string/split value ","))))]
+    (if (includes? method known) method "_OTHER")))
+
+(defun span-method :private (method: str) -> str (if (= method "_OTHER") "HTTP" method))
+
+(defun parent-context (headers: (Map str (Vec str))) -> o/Context
+  (let [parents (h/header-values headers "traceparent")
+        states (h/header-values headers "tracestate")]
+    (if (= (count parents) 1)
+        (o/Context (o/extract-span-context (some (nth parents 0))
+                    (if (= (count states) 0) nil (some (string/join "," states)))))
+        (o/empty-context))))
+
+(defun inject-context (ctx: o/Context headers: (Map str (Vec str))) -> (Map str (Vec str))
+  (reduce (fn (out: (Map str (Vec str)) p: (Pair str str)) (h/header-set out (. p fst) (. p snd)))
+          (dissoc (dissoc (h/normalize-headers headers) "traceparent") "tracestate") (o/inject-headers ctx)))
+
+(defun response-status! :private (span: o/Span kind: o/SpanKind code: i64) -> unit
+  (do (o/set-attribute! span "http.response.status_code" (o/->datum code))
+      (when (if (= kind o/KindServer) (>= code 500) (>= code 400))
+        (o/set-status! span (o/StatusError "")))
+      (when (if (= kind o/KindServer) (>= code 500) (>= code 400))
+        (o/set-attribute! span "error.type" (o/->datum (str code))))))
+
+(defun serve :private (tracer: o/Tracer route: (Option str) handler: (fn (o/Context h/Request) h/Response)
+                       request: h/Request) -> h/Response
+  (let [method (method-name (. request request-method))
+        attrs (match route (nil [(Pair "http.request.method" (o/->datum method))])
+                ((some path) [(Pair "http.request.method" (o/->datum method)) (Pair "http.route" (o/->datum path))]))]
+    (o/with-span-kind tracer (parent-context (. request headers)) (o/http-span-name (span-method method) route) o/KindServer attrs
+      (fn (span: o/Span ctx: o/Context)
+        (let [response (handler ctx request)]
+          (do (response-status! span o/KindServer (. response status)) response))))))
+
+(defun wrap-server (tracer: o/Tracer handler: (fn (o/Context h/Request) h/Response)) -> (fn (h/Request) h/Response)
+  (fn (request: h/Request) (serve tracer nil handler request)))
+
+(defun wrap-server-route (tracer: o/Tracer route: str handler: (fn (o/Context h/Request) h/Response)) -> (fn (h/Request) h/Response)
+  (fn (request: h/Request) (serve tracer (some route) handler request)))
+
+(defun error-type :private (error: h/Error) -> str
+  (match error ((h/Timeout _ _) "timeout") ((h/Cancelled) "cancelled") ((h/Closed) "closed")
+    ((h/DnsError _) "dns") ((h/ConnectError _) "connect") ((h/TransportError _ _) "transport")
+    ((h/ProtocolError _) "protocol") ((h/InvalidRequest _) "invalid_request") ((h/LimitError _) "limit")
+    ((h/TlsUnsupported _) "tls_unsupported") ((h/RedirectLoop _) "redirect_loop")
+    ((h/RedirectRefused _) "redirect_refused") ((h/StatusError response) (str (. response status)))))
+
+(defun request (tracer: o/Tracer parent: o/Context send: (fn (h/ClientRequest) (Result h/Response h/Error))
+                input: h/ClientRequest) -> (Result h/Response h/Error)
+  (let [method (method-name (. input method))]
+    (o/with-span-kind tracer parent (span-method method) o/KindClient [(Pair "http.request.method" (o/->datum method))]
+      (fn (span: o/Span ctx: o/Context)
+        (let [answer (send (with input (headers (inject-context ctx (. input headers)))))]
+          (do (match answer
+                ((Ok response) (response-status! span o/KindClient (. response status)))
+                ((Err error) (do (o/set-status! span (o/StatusError (error-type error)))
+                                 (o/set-attribute! span "error.type" (o/->datum (error-type error)))
+                                 (match error ((h/StatusError response) (response-status! span o/KindClient (. response status))) (_ ())))))
+              answer))))))

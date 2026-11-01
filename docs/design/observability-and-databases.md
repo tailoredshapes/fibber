@@ -8,6 +8,11 @@ tie-breaker is the project's: Clojure's ergonomics unless they break memory safe
 Status: design, with a prototype of the thinnest slice of three of the four libraries (section 8). Everything called "measured" or
 "passes" below was run on 2026-10-06 on this machine (28 threads) with stage 2 built from `main` at `5bd4a7a` by the v0.1.7 seed.
 
+**Update, 2026-11-01:** O3 now has an implementation in `fib.otel.otlp` and opt-in
+`fib.otel.http` wrappers. The current APIs, bounds and acceptance commands are in
+[the observability guide](../guide/observability.md). The measurements and original
+implementation sequence below retain their dates; they are not new performance claims.
+
 ## 0. The short answer
 
 - **One shared value type, `Datum`** (`fib.datum`): null, bool, i64, f64, str, bytes. Log fields, span attributes and database columns are
@@ -330,7 +335,7 @@ about 1 us (the canonical sort, the key string, the map lookup): a hot path bind
 returned the series from a helper, which retains a shared object with an atomic increment per add, and 8 tasks cost 81 ns each; reading the
 fields by borrow all the way gave 11 ns. The same trap awaits any hot path that returns a shared struct.
 
-### 3.8 O3 (not built): where the exporter plugs in, and the OTLP JSON mapping
+### 3.8 O3: original hooks and OTLP JSON mapping
 
 **Hooks that exist.**
 
@@ -364,7 +369,7 @@ exceptions: ids are lower-case hex strings, not base64, and enums are integers).
 | `GaugeData` | `"gauge":{"dataPoints":[{"attributes":[..],"timeUnixNano":..,"asDouble":f}]}` |
 | `LogRecord` | `{"resourceLogs":[{"resource":R,"scopeLogs":[{"scope":{"name":logger},"logRecords":[{"timeUnixNano":"ns","observedTimeUnixNano":"ns","severityNumber":N,"severityText":"INFO","body":{"stringValue":msg},"attributes":[..],"traceId":hex32,"spanId":hex16}]}]}]}`; severity TRACE 1, DEBUG 5, INFO 9, WARN 13, ERROR 17, FATAL 21 |
 
-**Behaviour to implement**: a 200 with `partialSuccess` is logged and counted, not retried; 429, 502, 503 and 504 are retried with exponential
+**Export behaviour**: a 200 with populated `partialSuccess` is logged and counted, not retried; an empty/default-only object is full success. 429, 502, 503 and 504 are retried with exponential
 backoff and `Retry-After`; other 4xx drop the batch; a timeout is 10 s; the worker task is the only caller, so nothing blocks the application. The
 collector integration test starts the collector with a file exporter (6.3) and compares ids, parents, attributes, status and metric totals with the
 in-process spans.
@@ -711,12 +716,14 @@ Planted faults (each applied alone with `sed`, run, restored; scripts in `~/.cac
 
 ## 10. Not done
 
-- `fib.otel` O3 is not built: no OTLP exporter, no `traceparent` middleware in `fib.http` (3.8 lists the hooks and the JSON mapping). No
-  baggage in the Context, no delta temporality, no views, no exemplars, no synchronous gauge, no instrument registry by name (a name
+- O3 OTLP/HTTP JSON and explicit-context HTTP wrappers were added on 2026-11-01
+  ([guide](../guide/observability.md)). Remaining: no baggage in the Context,
+  no delta temporality, no views, no exemplars, no synchronous gauge, no instrument registry by name (a name
   registered twice is two instruments).
 - A sampled span costs 2 to 3 times its 150 ns budget, and an async sink does not lower the caller's cost per call (3.7, 2.6.1).
 - No PostgreSQL driver, no `fib.crypto` in this library (the protocol is in `fib.crypto`, drivers in their own repos), no pool, no `try-transact` (not needed since catch exists); `plan`, the statement cache and `with-connection` are done (4.10); no containers were started
   by this work (docker works; the host runs other, unrelated containers, which were not touched).
-- No OTLP log exporter; log-to-trace correlation is `logger-with-trace` only. No daily rotation (size only), no compression of archives.
+- OTLP logs use a bounded batch worker and `logger-with-trace` correlation.
+  Remaining: no daily rotation (size only), no compression of archives.
 - fib.sql: only the clauses in the corpus; no `:inline`, `:cast`, `:case`, upsert, `Formatter` registry, or format timing.
 - No stdlib rows in `spec/stdlib.md` for the new modules (the libraries are explicit, not implicit; the rows come with L1/D1 proper).

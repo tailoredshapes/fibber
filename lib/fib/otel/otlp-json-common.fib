@@ -1,0 +1,57 @@
+;; OTLP/JSON scalar encoding and resource/scope grouping (design 3.8).
+;; https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
+;; https://protobuf.dev/programming-guides/json/
+(ns fib.otel.otlp-json-common (:use fib.core fib.seq fib.coll fib.datum fib.otel.trace)
+  (:require [fib.otel.metrics :as m] [fib.http.url :as url]
+            [fib.json.types :as jt] [fib.json.write :as jw]))
+
+(defstruct OtlpJsonItem (resource: Resource scope: str body: str))
+
+(defun json-array (items: (Vec str)) -> str (str "[" (str-join (vec (interpose "," items))) "]"))
+(defun json-i64 (value: i64) -> str (json-quote (str value)))
+
+;; Test IEEE infinity exactly: large finite doubles must remain numbers.
+(defun json-double (value: f64) -> str
+  (cond (!= value value) "\"NaN\""
+        (infinite? value) (if (< value 0.0) "\"-Infinity\"" "\"Infinity\"")
+        :else (jw/write (jt/JFloat value))))
+
+(defun any-value (value: Datum) -> str
+  (match value
+    ((DNil) "{}")
+    ((DStr s) (str "{\"stringValue\":" (json-quote s) "}"))
+    ((DBool b) (str "{\"boolValue\":" b "}"))
+    ((DInt i) (str "{\"intValue\":" (json-i64 i) "}"))
+    ((DFloat f) (str "{\"doubleValue\":" (json-double f) "}"))
+    ((DBytes b) (str "{\"bytesValue\":" (json-quote (url/base64-encode b)) "}"))))
+
+;; Canonicalize before omitting nil, so a final nil also removes an earlier value.
+(defun attributes-json (attributes: (Vec (Pair str Datum))) -> str
+  (json-array (reduce (fn (out: (Vec str) p: (Pair str Datum))
+    (match (. p snd)
+      ((DNil) out)
+      (_ (conj out (str "{\"key\":" (json-quote (. p fst)) ",\"value\":" (any-value (. p snd)) "}")))))
+    [] (m/canonical-attributes attributes))))
+
+;; Its canonical JSON is also the resource grouping key: order and duplicate keys
+;; cannot split equivalent resources, and omitted nil values do not create a group.
+(defun resource-json (resource: Resource) -> str
+  (str "{\"attributes\":" (attributes-json (. resource attributes)) "}"))
+
+(defun flags-json (flags: i64 remote: bool) -> str
+  (str (bit-or (bit-and flags 255) (if remote 768 256))))
+
+(defun add-item :private (groups: (Map str (Map str (Vec str))) item: OtlpJsonItem) -> (Map str (Map str (Vec str)))
+  (let [key (resource-json (. item resource)) scopes (unwrap-or (get groups key) {})
+        values (unwrap-or (get scopes (. item scope)) [])]
+    (assoc groups key (assoc scopes (. item scope) (conj values (. item body))))))
+
+(defun scope-json :private (values-key: str scope: (Pair str (Vec str))) -> str
+  (str "{\"scope\":{\"name\":" (json-quote (. scope fst)) "}," (json-quote values-key) ":" (json-array (. scope snd)) "}"))
+
+(defun group-json (resources-key: str scopes-key: str values-key: str items: (Vec OtlpJsonItem)) -> str
+  (let [groups (reduce add-item {} items)]
+    (str "{" (json-quote resources-key) ":"
+      (json-array (vec (map (fn (group: (Pair str (Map str (Vec str))))
+        (str "{\"resource\":" (. group fst) "," (json-quote scopes-key) ":"
+          (json-array (vec (map (fn (scope: (Pair str (Vec str))) (scope-json values-key scope)) (. group snd)))) "}")) groups))) "}")))

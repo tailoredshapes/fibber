@@ -1,0 +1,38 @@
+;; OTLP/HTTP JSON exporters: import explicitly, never through fib.otel (which must not depend on HTTP).
+;;
+;; (let [e (trace-exporter opts)]
+;;   (batch-processor (dyn Exporter :send e) ...))
+;; (let [e (metric-exporter opts)] (periodic-reader p (dyn MetricExporter :send e) ...))
+;; (let [s (log-sink opts resource 2048 fib.log.async/DropNewest)] (dyn Sink :send s))
+;;
+;; Traces/metrics are synchronous protocol adapters: their existing processors/readers supply background work and queue bounds.
+;; Logs get a bounded async sink. Flush/shutdown that processor, reader or sink before returning from main.
+;; stats returns a snapshot; log-dropped/log-failed additionally expose async queue drops and delivery failures.
+;; HTTP options may install an explicit native TLS factory. Collector requests use the raw HTTP client and cannot recursively trace/log.
+(ns fib.otel.otlp (:use fib.core fib.seq fib.coll fib.otel.trace fib.otel.metrics fib.otel.export fib.otel.reader fib.log.core
+                          fib.otel.otlp-options fib.otel.otlp-http)
+  (:export-from fib.otel.otlp-options fib.otel.otlp-http fib.otel.otlp-log)
+  (:require [fib.otel.otlp-json :as wire]))
+
+(defstruct OtlpTraceExporter (options: OtlpOptions state: OtlpState))
+(defstruct OtlpMetricExporter (options: OtlpOptions state: OtlpState))
+
+(defun trace-exporter (o: OtlpOptions) -> OtlpTraceExporter (OtlpTraceExporter o (new-state)))
+(defun metric-exporter (o: OtlpOptions) -> OtlpMetricExporter (OtlpMetricExporter o (new-state)))
+
+(defun metric-items :private (metrics: (Vec Metric)) -> i64
+  (reduce (fn (n: i64 m: Metric)
+            (+ n (match (. m data) ((SumData ps _) (count ps)) ((HistogramData ps) (count ps)) ((GaugeData ps) (count ps))))) 0 metrics))
+
+(impl Exporter OtlpTraceExporter
+  (export-spans (self spans) (send-batch (. self state) (. self options) (wire/spans-json spans) (count spans) "rejectedSpans"))
+  (exporter-flush (self) (state-flush (. self state)))
+  (exporter-shutdown (self) (state-close (. self state))))
+
+(impl MetricExporter OtlpMetricExporter
+  (export-metrics (self metrics) (send-batch (. self state) (. self options) (wire/metrics-json metrics) (metric-items metrics) "rejectedDataPoints"))
+  (metric-exporter-flush (self) (state-flush (. self state)))
+  (metric-exporter-shutdown (self) (state-close (. self state))))
+
+(impl Diagnostics OtlpTraceExporter (stats (self) (state-stats (. self state))))
+(impl Diagnostics OtlpMetricExporter (stats (self) (state-stats (. self state))))

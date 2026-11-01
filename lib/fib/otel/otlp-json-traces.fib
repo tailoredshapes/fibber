@@ -1,0 +1,40 @@
+;; Trace fields follow opentelemetry-proto/trace/v1/trace.proto, including
+;; the low eight trace-flag bits and the known/is-remote bits 0x100/0x200.
+(ns fib.otel.otlp-json-traces (:use fib.core fib.seq fib.coll fib.datum fib.otel.ids fib.otel.trace)
+  (:require [fib.otel.otlp-json-common :as j]))
+
+(defun span-kind-number :private (kind: SpanKind) -> i64
+  (match kind ((KindInternal) 1) ((KindServer) 2) ((KindClient) 3) ((KindProducer) 4) ((KindConsumer) 5)))
+
+(defun span-status-json :private (status: SpanStatus) -> str
+  (match status ((StatusUnset) "{\"code\":0}") ((StatusOk) "{\"code\":1}")
+    ((StatusError message) (str "{\"code\":2,\"message\":" (json-quote message) "}"))))
+
+(defun span-event-json :private (event: SpanEvent) -> str
+  (str "{\"timeUnixNano\":" (j/json-i64 (. event time-ns)) ",\"name\":" (json-quote (. event name))
+    ",\"attributes\":" (j/attributes-json (. event attributes)) "}"))
+
+(defun span-link-json :private (link: SpanLink) -> str
+  (let [context (. link context)]
+    (str "{\"traceId\":" (json-quote (trace-id-hex (. context trace-id)))
+      ",\"spanId\":" (json-quote (span-id-hex (. context span-id)))
+      ",\"traceState\":" (json-quote (. context tracestate))
+      ",\"attributes\":" (j/attributes-json (. link attributes))
+      ",\"flags\":" (j/flags-json (. context flags) (. context remote)) "}")))
+
+(defun span-json :private (span: SpanData) -> str
+  (str "{\"traceId\":" (json-quote (trace-id-hex (. span trace-id)))
+    ",\"spanId\":" (json-quote (span-id-hex (. span span-id)))
+    (if (= (. span parent-span-id) 0) "" (str ",\"parentSpanId\":" (json-quote (span-id-hex (. span parent-span-id)))))
+    ",\"traceState\":" (json-quote (. span tracestate)) ",\"name\":" (json-quote (. span name))
+    ",\"kind\":" (span-kind-number (. span kind))
+    ",\"startTimeUnixNano\":" (j/json-i64 (. span start-ns)) ",\"endTimeUnixNano\":" (j/json-i64 (. span end-ns))
+    ",\"attributes\":" (j/attributes-json (. span attributes))
+    ",\"events\":" (j/json-array (mapv span-event-json (. span events)))
+    ",\"links\":" (j/json-array (mapv span-link-json (. span links)))
+    ",\"status\":" (span-status-json (. span status))
+    ",\"flags\":" (j/flags-json (. span flags) (. span parent-remote)) "}"))
+
+(defun encode-spans (spans: (Vec SpanData)) -> str
+  (j/group-json "resourceSpans" "scopeSpans" "spans"
+    (mapv (fn (span: SpanData) (j/OtlpJsonItem (. span resource) (. span scope) (span-json span))) spans)))

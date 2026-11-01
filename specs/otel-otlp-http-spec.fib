@@ -1,0 +1,88 @@
+;; OTLP exporter configuration and retry protocol, over the real HTTP parser/server on pipes.
+(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run otel-exporter-contract)
+  (:require [fib.otel :as otel] [fib.otel.otlp :as o] [fib.http.types :as ht] [fib.http.client :as http]
+            [fib.http.testing :as testing] [fib.http.server.types :as server] [fib.os :as os]))
+
+(defun config (values: (Map str str)) -> (Result o/OtlpOptions str)
+  (o/options-with-env "traces" (fn (key: str) (get values key))))
+(defun endpoint (r: (Result o/OtlpOptions str)) -> str (match r ((Ok v) (. v endpoint)) ((Err e) e)))
+(defun error? (r: (Result o/OtlpOptions str)) -> bool (match r ((Err _) true) (_ false)))
+(defun ok? (r: (Result unit str)) -> bool (match r ((Ok _) true) (_ false)))
+
+(defun receiver (status: i64 body: str headers: (Map str (Vec str)) attempts: (Atom i64)) -> o/OtlpOptions
+  (let [factory (testing/loopback-factory (fn (r: ht/Request)
+                   (do (swap! attempts (fn (n: i64) (+ n 1))) (server/Whole (ht/Response status headers (str-bytes body))))) (server/default-options))]
+    (with (o/options "http://collector.test/v1/traces") (initial-backoff-ms 0) (max-backoff-ms 0)
+      (http-options (http/with-factory (http/default-options) "http" factory)))))
+
+(defspecs specs
+  (feature "OTLP environment precedence and validation"
+    (scenario "generic endpoint adds signal path before the query"
+      (then (expect = "http://localhost:4318/v1/traces" (endpoint (config {})))
+            (expect = "http://host/base/v1/traces?q=1" (endpoint (config {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://host/base/?q=1"})))) )
+    (scenario "a signal endpoint is exact and overrides generic"
+      (then (expect = "http://host/custom" (endpoint (config {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://ignored/"
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" "http://host/custom"})))))
+    (scenario "empty environment values are unset"
+      (then (expect = "http://localhost:4318/v1/traces" (endpoint (config {"OTEL_EXPORTER_OTLP_ENDPOINT" "" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" ""
+               "OTEL_EXPORTER_OTLP_PROTOCOL" "" "OTEL_EXPORTER_OTLP_TIMEOUT" "" "OTEL_EXPORTER_OTLP_HEADERS" ""})))
+            (expect = "http://host/v1/traces" (endpoint (config {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://host" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" ""})))))
+    (scenario "only HTTP JSON and finite positive timeouts are supported"
+      (then (expect = true (error? (config {"OTEL_EXPORTER_OTLP_PROTOCOL" "grpc"})))
+            (expect = true (error? (config {"OTEL_EXPORTER_OTLP_TIMEOUT" "0"})))
+            (expect = true (error? (config {"OTEL_EXPORTER_OTLP_TIMEOUT" "999999999999999999999999999999"})))
+            (expect = true (error? (config {"OTEL_EXPORTER_OTLP_ENDPOINT" "ftp://host"})))))
+    (scenario "headers percent-decode but retain plus; signal headers replace generic headers"
+      (given [c (config {"OTEL_EXPORTER_OTLP_HEADERS" "ignored=x" "OTEL_EXPORTER_OTLP_TRACES_HEADERS" "authorization=Bearer%20abc,x-plus=a+b"})])
+      (then (expect = {"authorization" ["Bearer abc"] "x-plus" ["a+b"]} (match c ((Ok v) (. v headers)) (_ {})))
+            (expect = true (error? (config {"OTEL_EXPORTER_OTLP_HEADERS" "x=bad%0D%0Ainjected"}))))))
+  (feature "OTLP terminal and retry responses"
+    (scenario "every retryable status is bounded by max-attempts"
+      (then (expect = true (every? (fn (code: i64)
+        (let [attempts (atom 0) e (o/trace-exporter (receiver code "{}" {} attempts))]
+          (and (not (ok? (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])))
+               (= @attempts 3) (= (. (o/stats e) retries) 2) (= (. (o/stats e) failed) 1)))) [429 502 503 504]))))
+    (scenario "400 and 500 are not retried"
+      (then (expect = true (every? (fn (code: i64)
+        (let [attempts (atom 0) e (o/trace-exporter (receiver code "{}" {} attempts))]
+          (and (not (ok? (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)]))) (= @attempts 1)))) [400 500]))))
+    (scenario "partial success is counted and never retried"
+      (given [attempts (atom 0) e (o/trace-exporter (receiver 200 "{\"partialSuccess\":{\"rejectedSpans\":\"1\",\"errorMessage\":\"SECRET\"}}" {} attempts))])
+      (upon [r (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])])
+      (then (expect = true (ok? r)) (expect = 1 @attempts) (expect = 1 (. (o/stats e) partial))
+            (expect = 1 (. (o/stats e) rejected)) (expect = 0 (. (o/stats e) exported-items))))
+    (scenario "empty partial success is full success, but a nonempty warning is partial; neither is retried"
+      (then (expect = true (every? (fn (entry: (Pair str i64))
+        (let [attempts (atom 0) e (o/trace-exporter (receiver 200 (. entry fst) {} attempts))
+              result (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])]
+          (and (ok? result) (= @attempts 1) (= (. (o/stats e) retries) 0)
+               (= (. (o/stats e) partial) (. entry snd)) (= (. (o/stats e) exported-items) 1))))
+        [(Pair "{\"partialSuccess\":{}}" 0)
+         (Pair "{\"partialSuccess\":{\"rejectedSpans\":\"0\",\"errorMessage\":\"\"}}" 0)
+         (Pair "{\"partialSuccess\":{\"rejectedSpans\":\"0\",\"errorMessage\":\"warning\"}}" 1)]))))
+    (scenario "Retry-After beyond deadline terminates without retrying early"
+      (given [attempts (atom 0) cfg (with (receiver 429 "{}" {"retry-after" ["120"]} attempts) (timeout-ms 100))
+              e (o/trace-exporter cfg)])
+      (upon [r (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])])
+      (then (expect = false (ok? r)) (expect = 1 @attempts)))
+    (scenario "malformed partial-success fields fail without retrying"
+      (then (expect = true (every? (fn (body: str)
+        (let [attempts (atom 0) e (o/trace-exporter (receiver 200 body {} attempts))]
+          (and (not (ok? (otel/export-spans (dyn otel/Exporter :send e) [(sample-span "test" 1)])))
+               (= @attempts 1) (= (. (o/stats e) failed) 1))))
+          ["{\"partialSuccess\":7}" "{\"partialSuccess\":{\"rejectedSpans\":\"oops\"}}" "{\"partialSuccess\":{\"errorMessage\":42}}"])))) )
+  (feature "OTLP lifecycle and Retry-After parsing"
+    (scenario "empty export makes no request and repeated flush/shutdown are safe"
+      (given [attempts (atom 0) e (o/trace-exporter (receiver 200 "{}" {} attempts)) x (dyn otel/Exporter :send e)])
+      (then (expect = true (ok? (otel/export-spans x []))) (expect = 0 @attempts)
+            (expect = true (ok? (otel/exporter-flush x))) (expect = true (ok? (otel/exporter-flush x)))
+            (expect = true (ok? (otel/exporter-shutdown x))) (expect = true (ok? (otel/exporter-shutdown x)))
+            (expect = false (ok? (otel/export-spans x [(sample-span "late" 1)]))) (expect = 0 @attempts)))
+    (scenario "delay-seconds and HTTP-date are accepted, invalid values rejected"
+      (then (expect = 2000 (o/retry-after-ms "2" 0))
+            (expect = 9223372036854775807 (o/retry-after-ms "999999999999999999999999999999999999" 0))
+            (expect = 1000 (o/retry-after-ms "Thu, 01 Jan 1970 00:00:01 GMT" 0))
+            (expect = 0 (o/retry-after-ms "Thu, 01 Jan 1970 00:00:01 GMT" 2))
+            (expect = -1 (o/retry-after-ms "bad" 0))))))
+
+(defun main () -> i64 (run-main (specs)))

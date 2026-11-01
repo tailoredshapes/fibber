@@ -1,0 +1,38 @@
+;; Fixed, hand-authored telemetry for OTLP wire and collector specifications.
+;; Constructors only: no serializer calls, clocks, IDs or network state.
+(ns otel-otlp-fixtures (:use fib.core fib.seq fib.coll)
+  (:require [fib.otel :as o] [fib.log.core :as log]))
+
+(defun sample-resource () -> o/Resource
+  (o/Resource [(Pair "service.name" (o/DStr "otlp-wire")) (Pair "zone" (o/DStr "east"))]))
+
+(defun scalar-attributes () -> (Vec (Pair str o/Datum))
+  [(Pair "text" (o/DStr "a \"quote\"\nλ")) (Pair "bool" (o/DBool true))
+   (Pair "int" (o/DInt 9007199254740993)) (Pair "float" (o/DFloat 1.25))
+   (Pair "bytes" (o/DBytes (str-bytes "hello"))) (Pair "nil" o/DNil) (Pair "finite" (o/DFloat 1.5e308))])
+
+(defun sample-span (name: str n: i64) -> o/SpanData
+  (o/SpanData name o/KindServer (o/TraceId 1 2) (+ 42 n) (if (= n 0) 0 7) false 1153
+    "vendor=value" "fixture.scope" 1700000000000000123 1700000000000000456 (scalar-attributes)
+    [(o/SpanEvent "checkpoint" 1700000000000000300 [(Pair "event" (o/DBool true))])]
+    [(o/SpanLink (o/SpanContext (o/TraceId 3 4) 5 1153 "link=state" true) [(Pair "link" (o/DStr "remote"))])]
+    (if (= n 0) o/StatusUnset (o/StatusError "bad \"quote\"")) (sample-resource)))
+
+(defun sample-metrics () -> (Vec o/Metric)
+  (let [r (sample-resource) attrs [(Pair "method" (o/DStr "GET"))]]
+    [(o/Metric "requests" "{request}" "request count" "fixture.meter"
+       (o/SumData [(o/NumberPoint attrs 9007199254740993 1700000000000000123 1700000000000000456)] true) r)
+     (o/Metric "inflight" "{request}" "active requests" "fixture.meter"
+       (o/SumData [(o/NumberPoint [] -3 1700000000000000123 1700000000000000456)] false) r)
+     (o/Metric "latency" "ms" "request latency" "fixture.meter"
+       (o/HistogramData [(o/HistogramPoint attrs [10.0 20.0] [2 1 2] 5 79.5 0.5 30.0
+                          1700000000000000123 1700000000000000456)]) r)
+     (o/Metric "temperature" "Cel" "ambient temperature" "fixture.meter"
+       (o/GaugeData [(o/GaugePoint [] 12.5 1700000000000000456)]) r)]))
+
+(defun sample-logs () -> (Vec log/LogRecord)
+  (mapv (fn (level: i64)
+    (log/LogRecord level "fixture.logs" (str "message " level)
+      [(Pair :trace_id (o/DStr "111111111111111111111111111111AF"))
+       (Pair :span_id (o/DStr "00000000000000AB")) (Pair :keep (o/DInt 9))]
+      (+ 1700000000000000123 level))) (range 0 6)))
