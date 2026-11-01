@@ -2,6 +2,7 @@
 ;; expect: accept
 ;; result: 111111
 ;; audit:  clean
+;; roots:  ../../lib
 ;; read-file is nil whenever the file cannot be read, and (some "") only
 ;; for a file that is really empty. A directory opens and then fails to
 ;; read (EISDIR): nil, not an empty string (1). A path that does not
@@ -11,17 +12,22 @@
 ;; (1000). A path with a NUL in it names no file: read-file of it is nil
 ;; (10000), not the empty file just before the NUL, and write-file of it
 ;; is false (100000), not a write to the file before the NUL.
+(ns main (:require [fib.os.environment :as env] [fib.os.process :as proc]
+                  [fib.os.directories :as dirs] [fib.os.files :as files]))
 (defun repo-file (rel: str) -> (Option str)
   (match (read-file rel)
     ((some t) (some t))
     (nil (read-file (str-concat "../../" rel)))))
 
 (defun main () -> i64
-  (let ((empty "/tmp/fibber-case-188-empty.txt")
-        (nul (str-join ["/tmp/fibber-case-188-empty.txt" "\0" "x"]))
-        (nul-w (str-join ["/tmp/fibber-case-188-nul-w.txt" "\0" "x"])))
-    (+ (match (read-file "/") ((some _) -1) (nil 1))
-       (+ (match (read-file "/tmp/fibber-no-such-dir/x") ((some _) -10) (nil 10))
+  (let ((dir (match (dirs/create-temp-directory (str (env/temp-directory) "/fibber-case-188-" (proc/process-id) "-XXXXXX"))
+               ((Ok d) d) ((Err _) (trap "case 188 fixture directory failed"))))
+        (empty (str dir "/empty.txt"))
+        (missing (str dir "/missing/x"))
+        (nul (str-join [empty "\0" "x"]))
+        (nul-w (str-join [(str dir "/nul-w.txt") "\0" "x"])))
+    (let ((result (+ (match (read-file "/") ((some _) -1) (nil 1))
+       (+ (match (read-file missing) ((some _) -10) (nil 10))
           (+ (match (repo-file "spec/method.md")
                ((some t) (if (starts-with? t "# Method\n") 100 -100))
                (nil -100))
@@ -30,3 +36,4 @@
                     -1000)
                 (+ (match (read-file nul) ((some _) -10000) (nil 10000))
                    (if (write-file nul-w "a") -100000 100000))))))))
+      (do (files/remove-file empty) (files/remove-directory dir) result))))

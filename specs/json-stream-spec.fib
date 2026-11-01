@@ -1,17 +1,25 @@
 ;; fib.json.stream and the rest of JSON-3: the lazy seq of documents over a file (any chunking, a document that spans lines, errors as values), the parallel fold with the work in the task,
 ;; any sink for a write, the hash index of an object, and the tolerant reading options (comments, trailing commas, NaN and Infinity: off by default).
-(ns main (:use fib.core fib.seq fib.coll fib.test.core fib.test.run fib.json.types fib.json.parse fib.json.write fib.json.stream fib.json.access fib.json.io) (:require [fib.os :as os]))
+(ns main (:use fib.core fib.seq fib.coll fib.ex fib.test.core fib.test.run fib.json.types fib.json.parse fib.json.write fib.json.stream fib.json.access fib.json.io) (:require [fib.os :as os]))
 
-(def path: str "/tmp/fib-json-stream-spec")
+;; Each operation owns an exclusive runtime directory, even when scenarios run
+;; concurrently in one process or fork after the spec program was initialized.
+;; Callbacks materialize their Vec, bool or sum before this helper removes it.
+(defun with-stream-fixture (bytes: (Array i8) run: (fn (str) a)) -> a
+  (match (os/create-temp-directory (str (os/temp-directory) "/fib-json-stream-XXXXXX"))
+    ((Err _) (trap "json-stream fixture directory creation failed"))
+    ((Ok directory)
+      (let [path (str directory "/documents.json")]
+        (try (match (os/write-file-bytes path bytes)
+               ((Ok _) (run path)) ((Err _) (trap "json-stream fixture write failed")))
+             (finally (os/remove-file path) (os/remove-directory directory) ()))))))
 
 (defun long-line (i: i64) -> str (str "{\"id\":" i ",\"pad\":\"" (str-join (vec (map (fn (k: i64) "0123456789") (range 70)))) "\"}"))
 (defun long-text (n: i64) -> str (str-join (vec (map (fn (i: i64) (str (long-line i) "\n")) (range n)))))
 (defun vec->array (v: (Vec i8)) -> (Array i8) (let [a (cell (array (count v) 0i8))] (do (dotimes (i (count v)) (array-set! &a i (nth v i))) @a)))
 (defun bad-utf8 (bs: (Vec i64)) -> bool
-  (do (os/write-file-bytes path (vec->array (vec (concat [34i8] (concat (map (fn (b: i64) (trunc i8 b)) bs) [34i8])))))
-      (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false))))
-
-(defun put-file (text: str) -> unit (do (os/write-file-bytes path (str-bytes text)) ()))
+  (with-stream-fixture (vec->array (vec (concat [34i8] (concat (map (fn (b: i64) (trunc i8 b)) bs) [34i8]))))
+    (fn (path: str) (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false)))))
 
 (defun doc-line (i: i64) -> str (str "{\"id\":" i ",\"name\":\"n" i "\",\"tags\":[" i "," (+ i 1) "],\"é\":\"日本語" i "\"}"))
 (defun lines-text (n: i64) -> str (str-join (vec (map (fn (i: i64) (str (doc-line i) "\n")) (range n)))))
@@ -19,11 +27,14 @@
 (defun id-of (r: (Result Json JsonError)) -> i64
   (match r ((Ok j) (match (json-get j "id") ((some (JInt i)) i) (_ -2))) ((Err _) -1)))
 (defun ids-of (sq: (LSeq (Result Json JsonError))) -> (Vec i64) (vec (map id-of sq)))
-(defun seq-ids (text: str) -> (Vec i64) (do (put-file text) (match (lines-seq path (default-options)) ((Ok sq) (ids-of sq)) ((Err _) [-9]))))
+(defun seq-ids (text: str) -> (Vec i64)
+  (with-stream-fixture (str-bytes text) (fn (path: str) (match (lines-seq path (default-options)) ((Ok sq) (ids-of sq)) ((Err _) [-9])))))
 (defun par-sum (text: str) -> i64
-  (do (put-file text) (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: i64 x: i64) (+ a x)) 0) ((Ok n) n) ((Err _) -99))))
+  (with-stream-fixture (str-bytes text) (fn (path: str)
+    (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: i64 x: i64) (+ a x)) 0) ((Ok n) n) ((Err _) -99)))))
 (defun par-ids (text: str) -> (Vec i64)
-  (do (put-file text) (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: (Vec i64) x: i64) (conj a x)) []) ((Ok v) v) ((Err _) [-99]))))
+  (with-stream-fixture (str-bytes text) (fn (path: str)
+    (match (reduce-lines-par-map path (default-options) (fn (r: (Result Json JsonError)) (id-of r)) (fn (a: (Vec i64) x: i64) (conj a x)) []) ((Ok v) v) ((Err _) [-99])))))
 
 (defun opt (c: bool t: bool n: bool) -> JsonOptions (tolerant-options c t n))
 (defun ok-of (s: str o: JsonOptions) -> (Option Json) (match (parse-with s o) ((Ok j) (some j)) ((Err _) nil)))
@@ -41,10 +52,13 @@
       (then (expect = [1 -1 3] (seq-ids "{\"id\":1}\n{\"id\":x}\n{\"id\":3}\n")) (expect = [] (seq-ids ""))))
     (scenario "a document longer than a chunk is read whole (a pretty-printed one of 780000 lines)"
       (given [big (write-pretty (JArr (vec (map (fn (i: i64) (JObj ["id"] [(JInt i)])) (range 20000)))))])
-      (then (expect = true (do (put-file (str big "\n{\"id\":5}\n")) (match (lines-seq path (default-options)) ((Ok sq) (= 2 (count sq))) ((Err _) false))))))
+      (then (expect = true (with-stream-fixture (str-bytes (str big "\n{\"id\":5}\n"))
+        (fn (path: str) (match (lines-seq path (default-options)) ((Ok sq) (= 2 (count sq))) ((Err _) false)))))))
     (scenario "invalid UTF-8 is an Err (code 6), not a trap; a missing file is an Err"
-      (then (expect = true (do (os/write-file-bytes path (array 5 -1i8)) (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false))))
-            (expect = true (match (lines-seq "/tmp/fib-json-no-such-file" (default-options)) ((Err e) (= (. e code) 15)) ((Ok _) false))))))
+      (then (expect = true (with-stream-fixture (array 5 -1i8)
+        (fn (path: str) (match (lines-seq path (default-options)) ((Ok sq) (match (first sq) ((some (Err e)) (= (. e code) 6)) (_ false))) ((Err _) false)))))
+            (expect = true (with-stream-fixture (array 0 0i8)
+        (fn (path: str) (match (lines-seq (str path ".missing") (default-options)) ((Err e) (= (. e code) 15)) ((Ok _) false))))))))
   (feature "lines of 512 bytes and more (the DOM builder, not the scalar reader)"
     (scenario "in the lazy seq and in the parallel fold, over one chunk and over several"
       (then (expect = (vec (range 3000)) (seq-ids (long-text 3000))) (expect = (vec (range 9000)) (seq-ids (long-text 9000)))
