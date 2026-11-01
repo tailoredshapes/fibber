@@ -21,7 +21,7 @@ the previously published 0.1.21 bundle predates the OTLP and HTTP-wrapper additi
 Build an exporter, give it to a batch processor, and give that processor to a
 provider. The provider owns the processor's lifetime:
 
-```clojure
+```fib check
 (ns main (:use fib.core fib.seq fib.coll)
   (:require [fib.otel :as otel] [fib.otel.otlp :as otlp] [fib.log :as log]))
 
