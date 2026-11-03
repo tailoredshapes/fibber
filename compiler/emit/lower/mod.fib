@@ -304,6 +304,16 @@
     ((LitKeyword k) (Ok (v-int LirI64 (statics-keyword (. (. cx p) statics) k))))
     ((LitUnit) (Ok VUnit))))
 
+;; `(size-of T)` at the instance (spec/types.md 1.9): the bytes of T in memory; `ptr` is the target's pointer width.
+(defun lcx-size-of :private (cx: LowerCx id: i64) -> (Result V str)
+  (try-let ((t (program-ty-of (. cx p) (. cx inst) id)))
+    (match t
+      ((TCon (KScalar s) _)
+       (cond (= s SPtr) (Ok (v-int LirI64 @(. (. cx p) pb)))
+             (or (scalar-is-int s) (scalar-is-float s)) (Ok (v-int LirI64 (quot (scalar-bits s) 8)))
+             :else (Err "size-of: the instance type is not a number or ptr")))
+      (_ (Err "size-of: the instance type is not a number or ptr")))))
+
 ;; What an expression yields, without the plan's operations after it. Rust: lower/mod.rs:361 form
 (defun form :private (cx: LowerCx e: Expr) -> (Result Flow str)
   (match (. e kind)
@@ -337,7 +347,8 @@
     ((EConcat es) (val-flow (lcx-concat cx e es)))
     ;; lane vectors (types 1.9; emit.lower.simd)
     ((ESimd _ es) (val-flow (lcx-simd cx e es)))
-    ((ESplat _ x) (val-flow (lcx-splat cx e x)))))
+    ((ESplat _ x) (val-flow (lcx-splat cx e x)))
+    ((ESizeOf _ id) (val-flow (lcx-size-of cx id)))))
 
 ;; Lowers an expression: its value, then the plan's operations (the hub's `expr`); `at` is the expression being lowered (E11: a trap
 ;; of a macro module carries its position, lcx-trap-c). Rust: lower/mod.rs:333 Cx::expr
