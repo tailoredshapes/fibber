@@ -206,18 +206,8 @@
          ((ASimd _ _) (Ok (ESplat ann e)))   ; a lane count that is a variable of the definition is the instance's, as in `(Simd f64 n)`
          (_ (Err (type-error-other (. (nth items 1) pos)
                    "splat's first operand is a vector type with a known lane count, as f64x4"))))))
-    ((SfNativeLanes)
-     (try-let ((_ (arity items pos 1))
-               (ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
-       (match ann
-         ((AScalar s) (if (simd-elem-scalar? s)
-                          (Ok (ELit (LitInt (target-lanes (g-target (. lw g)) (scalar-bits s)) I64)))
-                          (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))
-         (_ (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))))
-    ((SfSizeOf)
-     (try-let ((_ (arity items pos 1))
-               (ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
-       (size-of-form lw ann (. (nth items 1) pos) pos)))
+    ((SfNativeLanes) (native-lanes-form lw items pos))
+    ((SfSizeOf) (size-of-call lw items pos))
     ((SfHasFma)
      (try-let ((_ (arity items pos 0)))
        (Ok (ELit (LitBool (. (g-target (. lw g)) has-fma))))))
@@ -225,9 +215,24 @@
      (try-let ((_ (arity items pos 2)))
        (convert lw op items)))))
 
+;; `(native-lanes T)`: the target's lane count, a literal.
+(defun native-lanes-form :private (lw: Lowerer items: (Vec Stx) pos: Pos) -> (Result ExprKind TypeError)
+  (try-let ((_ (arity items pos 1))
+            (ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
+    (match ann
+      ((AScalar s) (if (simd-elem-scalar? s)
+                       (Ok (ELit (LitInt (target-lanes (g-target (. lw g)) (scalar-bits s)) I64)))
+                       (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))
+      (_ (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))))
+
+(defun size-of-call :private (lw: Lowerer items: (Vec Stx) pos: Pos) -> (Result ExprKind TypeError)
+  (try-let ((_ (arity items pos 1))
+            (ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
+    (size-of-form lw ann (. (nth items 1) pos))))
+
 ;; `(size-of T)` (spec/types.md 1.9): a written Num scalar is its literal; `ptr` and a type variable are the emitter's, with the type
 ;; recorded under a fresh expression id.
-(defun size-of-form :private (lw: Lowerer ann: TypeAnn tpos: Pos pos: Pos) -> (Result ExprKind TypeError)
+(defun size-of-form :private (lw: Lowerer ann: TypeAnn tpos: Pos) -> (Result ExprKind TypeError)
   (match ann
     ((AScalar s)
      (cond (= s SPtr) (Ok (ESizeOf ann (g-next-expr (. lw g))))
