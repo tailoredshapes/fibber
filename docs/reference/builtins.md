@@ -164,6 +164,8 @@ Generated from the maintained [stage-2 table](../../compiler/types/builtins.fib)
 | `finally-leave` | `(fn (i64) unit)` | `` | false |
 | `load-simd` | `(fn (ptr) (Simd t n))` | `((Num t))` | true |
 | `store-simd` | `(fn (ptr (Simd t n)) unit)` | `((Num t))` | true |
+| `load-scalar` | `(fn (ptr) t)` | `((Num t))` | true |
+| `store-scalar` | `(fn (ptr t) unit)` | `((Num t))` | true |
 | `simd/movemask` | `(fn ((Simd bool n)) i64)` | `` | false |
 | `ctz` | `(fn (t) t)` | `((Bits t))` | false |
 | `clz` | `(fn (t) t)` | `((Bits t))` | false |
