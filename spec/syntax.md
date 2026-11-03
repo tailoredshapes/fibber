@@ -1173,7 +1173,7 @@ their stores for every such type, with the rules of `load-simd`: lexical `unsafe
 bounds or ownership checks, native stage only, and not in a `defkernel` (a kernel keeps the named pairs and their alignment). In a
 function generic over `a` the instance at `f64` reads and writes as `load-f64` and `store-f64` do, and the one at `f32` as
 `load-f32` and `store-f32`. A type the context does not fix is the checker's ambiguity error (`ambiguous constraint Num ..; add an
-annotation`), as for `load-simd`. Cases 9805 to 9809.
+annotation`), as for `load-simd`. Cases 9805 to 9809 and 9820.
 
 `array-uninit-f32`, `array-uninit-f64` and `array-uninit-i8` take an `i64` length and return
 `(Array f32)`, `(Array f64)` and `(Array i8)`, respectively, only inside lexical `unsafe`

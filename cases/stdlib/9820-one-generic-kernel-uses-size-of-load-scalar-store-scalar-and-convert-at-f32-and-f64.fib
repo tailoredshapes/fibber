@@ -1,0 +1,54 @@
+;; spec: spec/syntax.md (Width-generic scalar memory) and spec/types.md 1.9 (size-of, convert): one function generic over `a` walks raw memory with (size-of a), reads with load-scalar, computes with (convert ..) constants and writes with store-scalar
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The shape signal-fib needs. `kern` computes y = x * 0.7071 + 1 over n elements and returns the sum of the y. It is called at f32 (the pointers sit one element past the payload start, 4 mod 8: unaligned)
+;; and at f64. The f32 instance must step 4 bytes and compute in f32: a stride of 8, or f64 arithmetic rounded at the end, fails the exact comparisons. The inputs 3.7, 5.9 and -4.1 are such that
+;; (f32 (+ (* x 0.7071) 1.0)) computed in f64 and rounded differs from (+ (* x 0.7071f32) 1.0f32) (3.7 and 5.9 differ in the last bit; checked outside fibber), so the f32 results below
+;; are only equal to the expectation if the multiply and the add are f32 operations on the converted constants. The cells before the first and after the last element keep their sentinel.
+(ns main (:use tl.check))
+
+(defun width (x: a) -> i64 (size-of a))
+
+(defun kern (src: ptr dst: ptr n: i64) :where ((Num a) (Float a)) -> a
+  (unsafe
+    (loop ((i 0) (s: a (convert 0)))
+      (if (< i n)
+        (let ((x: a (load-scalar (ptr+ src (* i (size-of a)))))
+              (y: a (+ (* x (convert 0.7071)) (convert 1))))
+          (do (store-scalar (ptr+ dst (* i (size-of a))) y)
+              (recur (+ i 1) (+ s y))))
+        s))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (xa (cell (array 7 0.0))) (ya (cell (array 7 -9.0)))
+        (xb (cell (array 7 0.0f32))) (yb (cell (array 7 -9.0f32))))
+    (do (check c (= (width 1.0) 8))
+        (check c (= (width 1.0f32) 4))
+        (array-set! &xa 1 0.1) (array-set! &xa 2 3.7) (array-set! &xa 3 5.9) (array-set! &xa 4 -4.1) (array-set! &xa 5 7.7)
+        (array-set! &xb 1 0.1f32) (array-set! &xb 2 3.7f32) (array-set! &xb 3 5.9f32) (array-set! &xb 4 -4.1f32) (array-set! &xb 5 7.7f32)
+        (let ((sb: f32 (unsafe (kern (ptr+ (raw @xb) (+ 24 4)) (ptr+ (raw @yb) (+ 24 4)) 5)))
+              (sa: f64 (unsafe (kern (ptr+ (raw @xa) (+ 24 8)) (ptr+ (raw @ya) (+ 24 8)) 5))))
+          (do (check c (= (array-get @yb 1) (+ (* 0.1f32 0.7071f32) 1.0f32)))
+              (check c (= (array-get @yb 2) (+ (* 3.7f32 0.7071f32) 1.0f32)))
+              (check c (= (array-get @yb 3) (+ (* 5.9f32 0.7071f32) 1.0f32)))
+              (check c (= (array-get @yb 4) (+ (* -4.1f32 0.7071f32) 1.0f32)))
+              (check c (= (array-get @yb 5) (+ (* 7.7f32 0.7071f32) 1.0f32)))
+              (check c (= (array-get @yb 0) -9.0f32))
+              (check c (= (array-get @yb 6) -9.0f32))
+              (check c (= sb (+ (+ (+ (+ (+ (* 0.1f32 0.7071f32) 1.0f32) (+ (* 3.7f32 0.7071f32) 1.0f32)) (+ (* 5.9f32 0.7071f32) 1.0f32))
+                                      (+ (* -4.1f32 0.7071f32) 1.0f32)) (+ (* 7.7f32 0.7071f32) 1.0f32))))
+              (check c (= (array-get @ya 1) (+ (* 0.1 0.7071) 1.0)))
+              (check c (= (array-get @ya 2) (+ (* 3.7 0.7071) 1.0)))
+              (check c (= (array-get @ya 3) (+ (* 5.9 0.7071) 1.0)))
+              (check c (= (array-get @ya 4) (+ (* -4.1 0.7071) 1.0)))
+              (check c (= (array-get @ya 5) (+ (* 7.7 0.7071) 1.0)))
+              (check c (= (array-get @ya 0) -9.0))
+              (check c (= (array-get @ya 6) -9.0))
+              (check c (= sa (+ (+ (+ (+ (+ (* 0.1 0.7071) 1.0) (+ (* 3.7 0.7071) 1.0)) (+ (* 5.9 0.7071) 1.0))
+                                    (+ (* -4.1 0.7071) 1.0)) (+ (* 7.7 0.7071) 1.0))))
+              (check c (= (checks-made c) 18))
+              (checks-result c))))))
