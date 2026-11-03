@@ -142,6 +142,7 @@ Generated from the maintained [stage-2 table](../../compiler/types/builtins.fib)
 | `simd/min-num` | `(fn (t t) t)` | `((Float t))` | false |
 | `simd/max-num` | `(fn (t t) t)` | `((Float t))` | false |
 | `simd/convert` | `(fn ((Simd s n)) (Simd t n))` | `((Num s) (Num t))` | false |
+| `convert` | `(fn (s) t)` | `((Num s) (Num t))` | false |
 | `simd/reverse` | `(fn ((Simd t n)) (Simd t n))` | `` | false |
 | `simd/shuffle` | `(fn ((Simd t n) (Simd t n) (Simd i64 m)) (Simd t m))` | `` | false |
 | `simd-load` | `(fn ((Array t) i64) (Simd t n))` | `` | false |
