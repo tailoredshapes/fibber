@@ -1,0 +1,26 @@
+;; spec: spec/syntax.md (Width-generic scalar memory): in a function generic over `a` the instance at f64 and at f32 reads and writes as load-f64 / load-f32 do
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; `bump` reads the element at byte offset off, adds x and writes it back, for any Num type; the caller gives the stride (8 for f64, 4 for f32). The neighbours are left alone.
+(ns main (:use tl.check))
+
+(defun bump (p: ptr off: i64 x: a) -> a
+  (unsafe
+    (let ((q (ptr+ p off)) (v: a (+ (load-scalar q) x)))
+      (do (store-scalar q v) v))))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (cell (array 6 1.0))) (b (cell (array 6 1.0f32))))
+    (do (check c (= (unsafe (bump (ptr+ (raw @a) 24) 16 0.5)) 1.5))
+        (check c (= (unsafe (bump (ptr+ (raw @b) 24) 8 0.5f32)) 1.5f32))
+        (check c (= (array-get @a 2) 1.5))
+        (check c (= (array-get @b 2) 1.5f32))
+        (check c (= (array-get @a 1) 1.0))
+        (check c (= (array-get @a 3) 1.0))
+        (check c (= (array-get @b 1) 1.0f32))
+        (check c (= (array-get @b 3) 1.0f32))
+        (check c (= (checks-made c) 8))
+        (checks-result c))))

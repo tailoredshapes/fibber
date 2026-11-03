@@ -1,0 +1,41 @@
+;; spec: spec/syntax.md (Width-generic scalar memory): the integer types i8 i16 i32 i64 read and write through load-scalar and store-scalar, byte aligned, with their sign
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; One element of each integer width is stored through a raw pointer inside an array of sentinels and read back with array-get; a negative i8 reads back negative (sign extension) and
+;; leaves the byte after it alone; an array-set! value is read back with load-scalar. A store of the wrong width would change a neighbour.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a8 (cell (array 8 5i8))) (a16 (cell (array 8 5i16))) (a32 (cell (array 8 5i32))) (a64 (cell (array 8 5))))
+    (do (unsafe
+          (do (store-scalar (ptr+ (raw @a8) (+ 24 1)) -3i8)
+              (store-scalar (ptr+ (raw @a16) (+ 24 2)) -1234i16)
+              (store-scalar (ptr+ (raw @a32) (+ 24 4)) -123456i32)
+              (store-scalar (ptr+ (raw @a64) (+ 24 8)) -1234567890123)))
+        (check c (= (array-get @a8 1) -3i8))
+        (check c (= (array-get @a8 0) 5i8))
+        (check c (= (array-get @a8 2) 5i8))
+        (check c (= (array-get @a16 1) -1234i16))
+        (check c (= (array-get @a16 0) 5i16))
+        (check c (= (array-get @a16 2) 5i16))
+        (check c (= (array-get @a32 1) -123456i32))
+        (check c (= (array-get @a32 0) 5i32))
+        (check c (= (array-get @a32 2) 5i32))
+        (check c (= (array-get @a64 1) -1234567890123))
+        (check c (= (array-get @a64 0) 5))
+        (check c (= (array-get @a64 2) 5))
+        (array-set! &a8 4 -100i8)
+        (array-set! &a16 4 -30000i16)
+        (array-set! &a32 4 -2000000000i32)
+        (array-set! &a64 4 -9000000000000)
+        (unsafe
+          (do (let ((x: i8 (load-scalar (ptr+ (raw @a8) (+ 24 4))))) (check c (= x -100i8)))
+              (let ((x: i16 (load-scalar (ptr+ (raw @a16) (+ 24 8))))) (check c (= x -30000i16)))
+              (let ((x: i32 (load-scalar (ptr+ (raw @a32) (+ 24 16))))) (check c (= x -2000000000i32)))
+              (let ((x: i64 (load-scalar (ptr+ (raw @a64) (+ 24 32))))) (check c (= x -9000000000000)))
+              (check c (< (load-scalar (ptr+ (raw @a8) (+ 24 4))) 0i8))))
+        (check c (= (checks-made c) 17))
+        (checks-result c))))

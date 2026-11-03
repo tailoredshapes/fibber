@@ -1,0 +1,36 @@
+;; spec: spec/syntax.md (Width-generic scalar memory): `load-scalar p` and `store-scalar p v` read and write one scalar through a raw pointer at the type the context says, byte aligned; f32 and f64 here
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; Pointers one element past an array's payload start (so the f64 accesses are 8-byte-offset but the f32 ones sit at 4 mod 8 and are the unaligned case). A store-scalar is read back
+;; with array-get, an array-set! is read back with load-scalar, and the neighbours of each access keep their sentinel, so a store or load of the wrong width fails.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (cell (array 8 -1.0))) (b (cell (array 8 -1.0f32))))
+    (do (unsafe
+          (let ((pa (ptr+ (raw @a) (+ 24 8))) (pb (ptr+ (raw @b) (+ 24 4))))
+            (do (store-scalar pa 2.5)
+                (store-scalar (ptr+ pa 8) -0.125)
+                (store-scalar pb 1.5f32)
+                (store-scalar (ptr+ pb 4) -7.25f32))))
+        (check c (= (array-get @a 1) 2.5))
+        (check c (= (array-get @a 2) -0.125))
+        (check c (= (array-get @a 0) -1.0))
+        (check c (= (array-get @a 3) -1.0))
+        (check c (= (array-get @b 1) 1.5f32))
+        (check c (= (array-get @b 2) -7.25f32))
+        (check c (= (array-get @b 0) -1.0f32))
+        (check c (= (array-get @b 3) -1.0f32))
+        (array-set! &a 4 9.75)
+        (array-set! &b 5 3.5f32)
+        (unsafe
+          (let ((pa (ptr+ (raw @a) (+ 24 32))) (pb (ptr+ (raw @b) (+ 24 20))))
+            (do (let ((x: f64 (load-scalar pa))) (check c (= x 9.75)))
+                (let ((y: f32 (load-scalar pb))) (check c (= y 3.5f32)))
+                (check c (= (+ (load-scalar pa) 0.25) 10.0))
+                (check c (= (+ (load-scalar pb) 0.5f32) 4.0f32)))))
+        (check c (= (checks-made c) 12))
+        (checks-result c))))

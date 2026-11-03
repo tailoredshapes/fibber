@@ -58,10 +58,10 @@ to write down, not an edit).
   (mapv (fn (n: str) (Finding "compiler/types/builtins.fib" 1 (str n " is not named in " where)))
         (filterv (fn (n: str) (not (mentions? text n))) (builtin-names repo))))
 
-(rule "every builtin is named in the specification (spec/*.md), except the seven that are not yet"
+(rule "every builtin is named in the specification (spec/*.md), except the five that are not yet"
   (allowing (unnamed-in repo (joined-text repo ["spec/*.md"]) "spec/*.md")
-            ["compiler/types/builtins.fib:store-f32" "compiler/types/builtins.fib:store-f32x4" "compiler/types/builtins.fib:store-f32x8"
-             "compiler/types/builtins.fib:store-f64" "compiler/types/builtins.fib:store-f64x4" "compiler/types/builtins.fib:store-i16"
+            ["compiler/types/builtins.fib:store-f32x4" "compiler/types/builtins.fib:store-f32x8"
+             "compiler/types/builtins.fib:store-f64x4" "compiler/types/builtins.fib:store-i16"
              "compiler/types/builtins.fib:store-i32"])
   (plant "compiler/types/builtins.fib" "\n(def zz-row: i64 (BuiltinSig \"zz-plant-builtin\" \"(fn () unit)\" \"\" [] false))\n"))
 
